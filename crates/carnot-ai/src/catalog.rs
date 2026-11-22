@@ -355,6 +355,16 @@ impl Default for UsageMap {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelEntry {
+    /// Optional provider ID in `providers.json` that serves this model (enables automatic
+    /// multi-provider model routing in CLI & ACP model pickers).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional human-friendly display label (used by ACP model pickers such as T3 Code).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Optional ordering hint (lower appears first in ACP model pickers).
+    #[serde(default)]
+    pub order: Option<u32>,
     #[serde(default)]
     pub api: Option<String>,
     #[serde(default)]
@@ -410,9 +420,9 @@ fn is_model_prefix_match(model: &str, prefix: &str) -> bool {
     }
     match model.as_bytes().get(prefix.len()) {
         None => true,
-        // Require a real delimiter so e.g. `gpt-5.4` matches `gpt-5.4-20260901` (exact sub-variant
-        // `gpt-5.4-mini` wins via exact match or longer prefix) and never matches unrelated suffixes.
-        Some(b'-' | b'.' | b':' | b'@') => true,
+        // Require a real delimiter so e.g. `gpt-5.4` matches `gpt-5.4-20260901` and
+        // `opencode-go` matches `opencode-go/deepseek-v4.1-flash`.
+        Some(b'-' | b'.' | b':' | b'@' | b'/') => true,
         Some(_) => false,
     }
 }
@@ -573,6 +583,11 @@ impl ProviderCatalog {
                 .max_by_key(|(k, _)| k.len())
                 .map(|(_, v)| v)
         })
+    }
+
+    /// Resolves the target provider ID declared for `model` (exact or boundary-prefix match).
+    pub fn provider_for_model(&self, model: &str) -> Option<&str> {
+        self.find_model(model)?.provider.as_deref()
     }
 
     /// Resolves base_url, auth credentials, project_id, and model override for a provider.

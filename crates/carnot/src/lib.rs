@@ -42,7 +42,9 @@ pub use carnot_mcp::{
     ProtocolEra, StdioServerConfig, encode_mcp_header_value, load_mcp_configs,
 };
 pub use carnot_protocol::{
-    acp::serve_acp_stdio, http::serve_http, http::serve_http_with_token, rpc::serve_rpc_stdio,
+    acp::AcpHost, acp::AcpModelInfo, acp::ResolvedAcpModel, acp::serve_acp_stdio,
+    acp::serve_acp_stdio_with_host, http::serve_http, http::serve_http_with_token,
+    rpc::serve_rpc_stdio,
 };
 pub use carnot_tools::{Tool, ToolRegistry};
 

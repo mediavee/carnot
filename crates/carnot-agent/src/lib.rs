@@ -25,8 +25,9 @@ pub use subagent::SubagentModule;
 
 use carnot_ai::{Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, Message, Result, Role,
-    StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolResultBlock, Usage,
+    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, Message, ReasoningEffort,
+    Result, Role, StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolResultBlock,
+    Usage,
 };
 use carnot_ext::{
     BoundaryAction, Module, PermissionBroker, ToolGateDecision, TurnBoundarySnapshot,
@@ -49,11 +50,20 @@ pub struct RunOutcome {
     pub halted_reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveRuntime {
+    provider: Arc<dyn Provider>,
+    model: String,
+    effort: ReasoningEffort,
+    context_window: u64,
+    max_output_tokens: u32,
+}
+
 /// The Carnot Agent runtime holding one session, provider, tool registry, module chain, and `EventLog`.
 #[derive(Debug)]
 pub struct Agent {
     pub config: CarnotConfig,
-    provider: Arc<dyn Provider>,
+    runtime: Mutex<ActiveRuntime>,
     tools: Arc<ToolRegistry>,
     modules: Vec<Arc<dyn Module>>,
     session: Mutex<SessionStore>,
@@ -144,9 +154,17 @@ impl Agent {
             prefix_hash: session.prefix_hash.clone(),
         });
 
+        let runtime = ActiveRuntime {
+            provider,
+            model: config.model.clone(),
+            effort: config.effort,
+            context_window: config.context_window,
+            max_output_tokens: config.max_output_tokens,
+        };
+
         Ok(Self {
             config,
-            provider,
+            runtime: Mutex::new(runtime),
             tools: Arc::new(tools),
             modules,
             session: Mutex::new(session),
@@ -232,6 +250,62 @@ impl Agent {
         }
     }
 
+    /// Switches the active model & provider on this live session (used by ACP `session/set_config_option`).
+    pub async fn set_model(
+        &self,
+        model: String,
+        provider: Arc<dyn Provider>,
+        context_window: Option<u64>,
+        max_output_tokens: Option<u32>,
+    ) -> Result<()> {
+        let Ok(_guard) = self.run_lock.try_lock() else {
+            return Err(CarnotError::Session(
+                "cannot switch model while a prompt is running; cancel first".into(),
+            ));
+        };
+        let mut rt = self.runtime.lock().await;
+        rt.model = model;
+        rt.provider = provider;
+        if let Some(cw) = context_window {
+            rt.context_window = cw;
+        }
+        if let Some(mo) = max_output_tokens {
+            rt.max_output_tokens = mo;
+        }
+        Ok(())
+    }
+
+    /// Updates the reasoning effort for subsequent turns on this session.
+    pub async fn set_effort(&self, effort: ReasoningEffort) {
+        self.runtime.lock().await.effort = effort;
+    }
+
+    pub async fn current_model(&self) -> String {
+        self.runtime.lock().await.model.clone()
+    }
+
+    pub async fn current_effort(&self) -> ReasoningEffort {
+        self.runtime.lock().await.effort
+    }
+
+    pub async fn current_context_window(&self) -> u64 {
+        self.runtime.lock().await.context_window
+    }
+
+    pub async fn current_context_tokens(&self) -> u64 {
+        self.session.lock().await.effective_context_tokens()
+    }
+
+    async fn effective_config_and_provider(&self) -> (CarnotConfig, Arc<dyn Provider>) {
+        let rt = self.runtime.lock().await;
+        let mut cfg = self.config.clone();
+        cfg.model = rt.model.clone();
+        cfg.effort = rt.effort;
+        cfg.context_window = rt.context_window;
+        cfg.max_output_tokens = rt.max_output_tokens;
+        (cfg, Arc::clone(&rt.provider))
+    }
+
     pub async fn session_id(&self) -> String {
         self.session.lock().await.session_id.clone()
     }
@@ -264,11 +338,12 @@ impl Agent {
     /// (e.g. `/compact preserve SQL migration schema and failing test output`).
     pub async fn compact_now_with_focus(&self, focus: Option<&str>) -> Result<(u64, u64, bool)> {
         let _run_guard = self.run_lock.lock().await;
+        let (eff_cfg, eff_provider) = self.effective_config_and_provider().await;
         let seg = SegmentTracker::default();
         execute_compaction(
             CompactionMode::Manual,
-            &self.config,
-            &self.provider,
+            &eff_cfg,
+            &eff_provider,
             &self.tools,
             &self.modules,
             &self.session,
@@ -433,19 +508,19 @@ impl Agent {
                 return Err(CarnotError::Cancelled);
             }
 
+            let (eff_cfg, active_provider) = self.effective_config_and_provider().await;
+
             // Proactive cache-warm thermodynamic compaction (provider-grounded token count + cooldown)
-            if self.config.modules.compaction {
+            if eff_cfg.modules.compaction {
                 let (pre_est, msg_count) = {
                     let s = self.session.lock().await;
                     (s.effective_context_tokens(), s.active_messages().len())
                 };
                 let current_turns = self.metrics.lock().await.turns;
                 let cooldown_ok = last_compaction_turn
-                    .map(|t| {
-                        current_turns.saturating_sub(t) >= self.config.compaction_cooldown_turns
-                    })
+                    .map(|t| current_turns.saturating_sub(t) >= eff_cfg.compaction_cooldown_turns)
                     .unwrap_or(true);
-                let trigger = effective_proactive_trigger(&self.config);
+                let trigger = effective_proactive_trigger(&eff_cfg);
                 if trigger > 0 && msg_count >= 10 && cooldown_ok && pre_est >= trigger {
                     last_compaction_turn = Some(current_turns);
                     self.compact_with_mode(CompactionMode::Soft, &seg, cancel.clone())
@@ -463,16 +538,16 @@ impl Agent {
                 m.requests += 1;
                 let turn_num = m.turns;
                 let req = ProviderRequest {
-                    model: self.config.model.clone(),
+                    model: eff_cfg.model.clone(),
                     static_system_prompt: proj.static_system_prompt,
                     tools: proj.tools,
                     prefix_hash: proj.prefix_hash,
                     session_id: s.session_id.clone(),
                     messages: proj.messages,
                     checkpoint_index: proj.checkpoint_index,
-                    cache_ttl: self.config.cache_ttl,
-                    effort: self.config.effort,
-                    max_output_tokens: self.config.max_output_tokens,
+                    cache_ttl: eff_cfg.cache_ttl,
+                    effort: eff_cfg.effort,
+                    max_output_tokens: eff_cfg.max_output_tokens,
                     skip_tail_cache_write: false,
                 };
                 (req, turn_num, ctx_est)
@@ -484,7 +559,7 @@ impl Agent {
             });
 
             // Stream provider response, starting gate-verified eager read-only tools mid-stream!
-            let mut rx = match self.provider.stream(req, cancel.clone()).await {
+            let mut rx = match active_provider.stream(req, cancel.clone()).await {
                 Ok(r) => r,
                 Err(CarnotError::ContextOverflow(_))
                     if self.config.modules.compaction && consecutive_emergency_compactions < 1 =>
@@ -620,7 +695,7 @@ impl Agent {
                         (1u64 << (consecutive_stream_retries - 1)).min(16),
                     );
                     tracing::warn!(
-                        provider = %self.provider.name(),
+                        provider = %active_provider.name(),
                         attempt = consecutive_stream_retries,
                         delay_ms = delay.as_millis() as u64,
                         error = %err,
@@ -633,7 +708,7 @@ impl Agent {
                     continue;
                 }
                 return Err(CarnotError::Provider {
-                    provider: self.provider.name().into(),
+                    provider: active_provider.name().into(),
                     message: err,
                     retryable,
                     retry_after_ms: None,
@@ -669,7 +744,7 @@ impl Agent {
                 tracing::info!(
                     target: "carnot::cache",
                     turn = turn_num,
-                    model = %self.config.model,
+                    model = %eff_cfg.model,
                     cache_read = usage.cache_read_tokens,
                     cache_write_5m = usage.cache_write_5m_tokens,
                     cache_write_1h = usage.cache_write_1h_tokens,
@@ -1244,10 +1319,11 @@ impl Agent {
         seg: &SegmentTracker,
         cancel: CancellationToken,
     ) -> Result<()> {
+        let (eff_cfg, eff_provider) = self.effective_config_and_provider().await;
         let _ = execute_compaction(
             mode,
-            &self.config,
-            &self.provider,
+            &eff_cfg,
+            &eff_provider,
             &self.tools,
             &self.modules,
             &self.session,

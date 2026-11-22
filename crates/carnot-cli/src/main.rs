@@ -7,9 +7,9 @@ mod bench;
 mod repl;
 
 use carnot::{
-    AgentEvent, CacheTtl, CarnotBuilder, CasStore, McpManager, Profile, ProviderRegistry,
-    ReasoningEffort, assert_prefix_invariance, load_mcp_configs, serve_acp_stdio, serve_http,
-    serve_rpc_stdio,
+    AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, McpManager, Profile,
+    ProviderRegistry, ReasoningEffort, ResolvedAcpModel, assert_prefix_invariance,
+    load_mcp_configs, serve_acp_stdio_with_host, serve_http, serve_rpc_stdio,
 };
 use carnot_ext::microskills::discover_agent_skills;
 use carnot_ext::prefix_guard::static_system_prompt;
@@ -67,7 +67,7 @@ impl From<CliEffort> for ReasoningEffort {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "carnot",
     version,
@@ -182,7 +182,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum Commands {
     /// Start embedded HTTP/1.1 + SSE API server (Bearer auth + CSRF protection)
     Serve {
@@ -213,7 +213,7 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum McpCommands {
     /// List configured MCP servers & tool counts (uses zero-cold-start schema cache when warm)
     List,
@@ -364,13 +364,16 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
     };
 
     let code = match cli.mode {
-        Mode::Acp => match serve_acp_stdio(agent).await {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("acp error: {e}");
-                1
+        Mode::Acp => {
+            let host = Arc::new(CliAcpHost { cli: cli.clone() });
+            match serve_acp_stdio_with_host(agent, host).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("acp error: {e}");
+                    1
+                }
             }
-        },
+        }
         Mode::Rpc => match serve_rpc_stdio(agent).await {
             Ok(()) => 0,
             Err(e) => {
@@ -637,6 +640,95 @@ async fn run_mcp_cmd(cli: &Cli, cwd: &std::path::Path, action: &McpCommands) -> 
     Ok(())
 }
 
+#[derive(Debug)]
+struct CliAcpHost {
+    cli: Cli,
+}
+
+impl AcpHost for CliAcpHost {
+    fn available_models(&self) -> Vec<AcpModelInfo> {
+        let Ok(reg) = ProviderRegistry::load_default(&self.cli.provider_configs) else {
+            return Vec::new();
+        };
+        let cat = reg.catalog();
+        let has_labeled = cat
+            .models
+            .values()
+            .any(|e| e.provider.is_some() && e.label.is_some());
+        // Advertise models that explicitly declare a provider (skipping unlabeled catch-all prefix
+        // entries when labeled models are present), ordered by optional `order` then ID.
+        let mut items: Vec<(u32, AcpModelInfo)> = cat
+            .models
+            .iter()
+            .filter_map(|(id, entry)| {
+                let prov_id = entry.provider.as_deref()?;
+                if has_labeled && entry.label.is_none() {
+                    return None;
+                }
+                // Only advertise models whose declared provider exists in the catalog
+                let (_, prov_entry) = cat.find_provider(prov_id)?;
+                let name = entry.label.clone().unwrap_or_else(|| id.clone());
+                let desc = if !prov_entry.description.is_empty() {
+                    Some(prov_entry.description.clone())
+                } else {
+                    Some(prov_id.to_string())
+                };
+                Some((
+                    entry.order.unwrap_or(500),
+                    AcpModelInfo {
+                        id: id.clone(),
+                        name,
+                        description: desc,
+                    },
+                ))
+            })
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+        items.into_iter().map(|(_, info)| info).collect()
+    }
+
+    fn resolve_model(&self, model_id: &str) -> carnot::Result<ResolvedAcpModel> {
+        let reg = ProviderRegistry::load_default(&self.cli.provider_configs)?;
+        let prov_id = reg
+            .catalog()
+            .provider_for_model(model_id)
+            .unwrap_or(&self.cli.provider);
+        let provider = reg.build_provider(prov_id, Some(model_id))?;
+        let context_window = reg.context_window_for_model(model_id);
+        let max_output_tokens = reg.max_output_tokens_for_model(model_id);
+        Ok(ResolvedAcpModel {
+            provider,
+            context_window,
+            max_output_tokens,
+        })
+    }
+
+    fn create_agent_for_cwd(
+        &self,
+        cwd: PathBuf,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+    ) -> carnot_ext::BoxFuture<'_, carnot::Result<Arc<carnot::Agent>>> {
+        let mut eff_cli = self.cli.clone();
+        if let Some(m) = model {
+            eff_cli.model = Some(m);
+        }
+        if let Some(e) = effort {
+            eff_cli.effort = match e {
+                ReasoningEffort::Low => CliEffort::Low,
+                ReasoningEffort::Medium => CliEffort::Medium,
+                ReasoningEffort::High => CliEffort::High,
+                ReasoningEffort::Xhigh => CliEffort::Xhigh,
+                ReasoningEffort::Max => CliEffort::Max,
+            };
+        }
+        Box::pin(async move {
+            let (agent, _mcp) = build_agent(&eff_cli, cwd).await?;
+            Ok(agent)
+        })
+    }
+}
+
 async fn build_agent(
     cli: &Cli,
     cwd: PathBuf,
@@ -646,11 +738,20 @@ async fn build_agent(
         "1h" | "long" => CacheTtl::Long1h,
         _ => CacheTtl::Hybrid,
     };
+    let effective_provider = if let Some(ref m) = cli.model
+        && cli.provider == "anthropic"
+        && let Ok(reg) = ProviderRegistry::load_default(&cli.provider_configs)
+        && let Some(routed) = reg.catalog().provider_for_model(m)
+    {
+        routed.to_string()
+    } else {
+        cli.provider.clone()
+    };
     let mut b = CarnotBuilder::new(cwd.clone())
         .profile(cli.profile.into())
         .model_opt(cli.model.clone())
         .effort(cli.effort.into())
-        .provider_name(cli.provider.clone())
+        .provider_name(effective_provider)
         .cache_ttl(ttl)
         .persist_session(!cli.no_session)
         .autonomous_gates(cli.gates.clone())

@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 carnot-agent.workspace = true
+carnot-ai.workspace = true
 carnot-core.workspace = true
 carnot-ext.workspace = true
 serde.workspace = true
@@ -18,6 +19,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-carnot-ai.workspace = true
 carnot-cas.workspace = true
 carnot-tools.workspace = true
