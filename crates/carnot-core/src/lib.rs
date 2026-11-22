@@ -1075,7 +1075,7 @@ fn default_compaction_cooldown_turns() -> u64 {
 }
 
 fn default_compaction_tail_budget_tokens() -> u64 {
-    24_000
+    8_000
 }
 
 impl CarnotConfig {

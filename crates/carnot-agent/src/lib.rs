@@ -15,6 +15,7 @@ pub mod tool_search;
 
 use crate::compaction::{
     CompactionMode, clip_anchor_text, effective_proactive_trigger, execute_compaction,
+    hydrate_anchors_from_session,
 };
 use crate::scheduler::{ActiveEager, EagerLaunch, ScheduledCall, partition_conflict_free_waves};
 use crate::segment::SegmentTracker;
@@ -133,6 +134,8 @@ impl Agent {
         session: SessionStore,
         turn1_already_injected: bool,
     ) -> Result<Self> {
+        let (hydrated_goal, hydrated_followups) =
+            hydrate_anchors_from_session(session.active_messages());
         let events = Arc::new(EventLog::new());
         events.push(AgentEvent::SessionStarted {
             session_id: session.session_id.clone(),
@@ -151,8 +154,8 @@ impl Agent {
             run_lock: Mutex::new(()),
             cancel_current: Mutex::new(CancellationToken::new()),
             turn1_injected: Mutex::new(turn1_already_injected),
-            raw_user_goal: Mutex::new(None),
-            user_instructions: Mutex::new(Vec::new()),
+            raw_user_goal: Mutex::new(hydrated_goal),
+            user_instructions: Mutex::new(hydrated_followups),
             pending_steers: Mutex::new(Vec::new()),
             permission_broker: Mutex::new(None),
         })
@@ -169,10 +172,12 @@ impl Agent {
         let loaded = SessionStore::load(session_path)?;
         let sid = loaded.session_id.clone();
         let has_msgs = !loaded.active_messages().is_empty();
+        let (hydrated_goal, hydrated_followups) =
+            hydrate_anchors_from_session(loaded.active_messages());
         *self.session.lock().await = loaded;
         *self.turn1_injected.lock().await = has_msgs;
-        *self.raw_user_goal.lock().await = None;
-        self.user_instructions.lock().await.clear();
+        *self.raw_user_goal.lock().await = hydrated_goal;
+        *self.user_instructions.lock().await = hydrated_followups;
         self.tools.reset_read_tracker();
         Ok(sid)
     }
@@ -366,7 +371,7 @@ impl Agent {
         let mut seg = SegmentTracker::default();
         let mut final_text = String::new();
         let mut halted_reason: Option<String> = None;
-        let mut consecutive_compactions: u32 = 0;
+        let mut consecutive_emergency_compactions: u32 = 0;
         let mut last_compaction_turn: Option<u64> = None;
         let mut consecutive_stream_retries: u32 = 0;
         let mut consecutive_max_tokens: u8 = 0;
@@ -377,7 +382,7 @@ impl Agent {
             }
 
             // Proactive cache-warm thermodynamic compaction (respects cooldown so prompt cache stays >96%)
-            if self.config.modules.compaction && consecutive_compactions < 1 {
+            if self.config.modules.compaction {
                 let (pre_est, msg_count) = {
                     let s = self.session.lock().await;
                     let proj = s.project_context();
@@ -391,7 +396,6 @@ impl Agent {
                     .unwrap_or(true);
                 let trigger = effective_proactive_trigger(&self.config);
                 if trigger > 0 && msg_count >= 10 && cooldown_ok && pre_est >= trigger {
-                    consecutive_compactions += 1;
                     last_compaction_turn = Some(current_turns);
                     self.compact_with_mode(CompactionMode::Soft, &seg, cancel.clone())
                         .await?;
@@ -416,6 +420,7 @@ impl Agent {
                     cache_ttl: self.config.cache_ttl,
                     effort: self.config.effort,
                     max_output_tokens: self.config.max_output_tokens,
+                    skip_tail_cache_write: false,
                 };
                 (req, turn_num, ctx_est)
             };
@@ -429,9 +434,9 @@ impl Agent {
             let mut rx = match self.provider.stream(req, cancel.clone()).await {
                 Ok(r) => r,
                 Err(CarnotError::ContextOverflow(_))
-                    if self.config.modules.compaction && consecutive_compactions < 1 =>
+                    if self.config.modules.compaction && consecutive_emergency_compactions < 1 =>
                 {
-                    consecutive_compactions += 1;
+                    consecutive_emergency_compactions += 1;
                     last_compaction_turn = Some(turn_num);
                     self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
                         .await?;
@@ -568,16 +573,16 @@ impl Agent {
             // Context window overflow reported as stop_reason -> abort eager & compact at most once (N10)
             if stop_reason == StopReason::ContextWindowExceeded
                 && self.config.modules.compaction
-                && consecutive_compactions < 1
+                && consecutive_emergency_compactions < 1
             {
-                consecutive_compactions += 1;
+                consecutive_emergency_compactions += 1;
                 last_compaction_turn = Some(turn_num);
                 self.discard_eager_launches(eager_launches);
                 self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
                     .await?;
                 continue;
             }
-            consecutive_compactions = 0;
+            consecutive_emergency_compactions = 0;
 
             // Record usage & live thermodynamic AUC + structured cache telemetry (Opus #1!)
             {

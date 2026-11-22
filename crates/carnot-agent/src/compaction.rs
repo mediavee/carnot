@@ -18,9 +18,7 @@
 
 use crate::segment::SegmentTracker;
 use carnot_ai::{Provider, ProviderRequest, StreamEvent};
-use carnot_core::{
-    AgentEvent, CarnotConfig, Message, ReasoningEffort, Result, Role, ThermodynamicMetrics, Usage,
-};
+use carnot_core::{AgentEvent, CarnotConfig, Message, Result, Role, ThermodynamicMetrics, Usage};
 use carnot_session::SessionStore;
 use carnot_tools::ToolRegistry;
 use std::sync::Arc;
@@ -30,7 +28,6 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_ANCHORED_GOAL_CHARS: usize = 24_000;
 const MAX_FOLLOWUP_INSTRUCTION_CHARS: usize = 4_000;
-const SEMANTIC_COMPACTION_MAX_OUTPUT_TOKENS: u32 = 6_144;
 const SEMANTIC_COMPACTION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +81,70 @@ pub fn clip_anchor_text(text: &str, max_chars: usize) -> String {
     format!("{head}\n[... middle clipped for anchor cap ...]\n{tail}")
 }
 
+fn extract_carnot_section<'a>(doc: &'a str, marker: &str) -> Option<&'a str> {
+    let start = doc.find(marker)? + marker.len();
+    let rest = doc[start..].strip_prefix('\n').unwrap_or(&doc[start..]);
+    let end = rest.find("\n[carnot:").unwrap_or(rest.len());
+    let body = rest[..end].trim();
+    (!body.is_empty()).then_some(body)
+}
+
+/// Rehydrates Tier-0 sacred user anchors (`raw_user_goal` + chronological follow-ups) directly
+/// from persisted `SessionStore::active_messages()`. Ensures `--resume`, ACP `session/load`,
+/// and multi-compaction chains NEVER lose Phase-1 constraints or follow-up corrections.
+pub fn hydrate_anchors_from_session(messages: &[Arc<Message>]) -> (Option<String>, Vec<String>) {
+    let mut goal: Option<String> = None;
+    let mut followups: Vec<String> = Vec::new();
+
+    for msg in messages {
+        let full_text = msg.text_concat();
+        let trimmed = full_text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Round-trip prior compaction anchors verbatim across multiple compactions & resumes
+        if trimmed.starts_with("[carnot:compaction ") {
+            if goal.is_none()
+                && let Some(obj) = extract_carnot_section(trimmed, "[carnot:anchored-objective]")
+            {
+                goal = Some(clip_anchor_text(obj, MAX_ANCHORED_GOAL_CHARS));
+            }
+            if let Some(fsec) = extract_carnot_section(trimmed, "[carnot:user-followups]") {
+                for chunk in fsec.split("### Follow-up ") {
+                    let c = chunk.trim();
+                    if c.is_empty() {
+                        continue;
+                    }
+                    let body = c.split_once('\n').map(|(_, rest)| rest.trim()).unwrap_or(c);
+                    if !body.is_empty() {
+                        followups.push(clip_anchor_text(body, MAX_FOLLOWUP_INSTRUCTION_CHARS));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if msg.role == Role::User && msg.has_text() && !trimmed.starts_with("[carnot:") {
+            if goal.is_none() {
+                goal = Some(clip_anchor_text(trimmed, MAX_ANCHORED_GOAL_CHARS));
+            } else {
+                let clipped = clip_anchor_text(trimmed, MAX_FOLLOWUP_INSTRUCTION_CHARS);
+                if followups.last().map(String::as_str) != Some(clipped.as_str())
+                    && goal.as_deref() != Some(clipped.as_str())
+                {
+                    followups.push(clipped);
+                    if followups.len() > 16 {
+                        followups.remove(0);
+                    }
+                }
+            }
+        }
+    }
+
+    (goal, followups)
+}
+
 /// Builds the concise, high-precision handoff prompt appended to the warm conversation prefix.
 fn build_semantic_compaction_prompt(has_prior_compaction: bool) -> String {
     let merge_note = if has_prior_compaction {
@@ -93,10 +154,10 @@ fn build_semantic_compaction_prompt(has_prior_compaction: bool) -> String {
     };
     format!(
         "[carnot:compaction-request]\n\
-Produce a dense, high-recall task handoff so work can continue seamlessly after older turns are folded. Do NOT call any tools.\n\
-Maximize recall over brevity: preserve exact numbers, identifiers, paths, error messages, decisions, and user corrections verbatim.\n\
+Produce an ultra-dense, high-recall task handoff (~400-1,000 words, crisp bullet points, zero narrative fluff) so work can continue seamlessly after older turns are folded. Do NOT call any tools.\n\
+Maximize exact recall: preserve every concrete number, constant, identifier, file path, schema/format rule, error message, decision, and user correction verbatim so no already-inspected file needs to be re-read.\n\
 {merge_note}\
-Structure your response with these exact 6 markdown headings (crisp, factual, zero fluff):\n\
+Use these exact 6 markdown headings:\n\
 ## 1. Exact Constraints & Edge Cases\n\
 Every concrete requirement, output artifact/path, format or schema rule, numerical tolerance, user correction, and edge case.\n\
 ## 2. Verified State, Artifacts & Measurements\n\
@@ -185,6 +246,9 @@ async fn try_semantic_llm_handoff(
             build_semantic_compaction_prompt(has_prior),
         )));
 
+        // CRITICAL CACHE INVARIANT: keep `effort`, `max_output_tokens`, `cache_ttl`, `tools`,
+        // `static_system_prompt`, and `messages` IDENTICAL to the active session so Anthropic/OpenAI
+        // serves ~98% of the compaction input from the warm prompt cache (0.05x input rate)!
         ProviderRequest {
             model: config.model.clone(),
             static_system_prompt: proj.static_system_prompt,
@@ -193,8 +257,9 @@ async fn try_semantic_llm_handoff(
             messages: msgs,
             checkpoint_index: proj.checkpoint_index,
             cache_ttl: config.cache_ttl,
-            effort: ReasoningEffort::Medium,
-            max_output_tokens: SEMANTIC_COMPACTION_MAX_OUTPUT_TOKENS.min(config.max_output_tokens),
+            effort: config.effort,
+            max_output_tokens: config.max_output_tokens,
+            skip_tail_cache_write: true,
         }
     };
 
@@ -332,7 +397,7 @@ pub(crate) async fn execute_compaction(
         summary.push_str("\n[carnot:user-followups]\n");
         for (idx, ins) in followups.iter().enumerate() {
             summary.push_str(&format!(
-                "{}. {}\n",
+                "### Follow-up {}\n{}\n",
                 idx + 1,
                 clip_anchor_text(ins, MAX_FOLLOWUP_INSTRUCTION_CHARS)
             ));
@@ -372,7 +437,7 @@ pub(crate) async fn execute_compaction(
             .map(String::as_str)
             .collect();
         summary.push_str(&format!(
-            "Recently inspected files (re-read if needed; read-tracker reset): {}\n",
+            "Previously inspected files (all key discoveries are already captured in [carnot:task-handoff] above; only re-read a file if you need to edit it or inspect an uncaptured detail): {}\n",
             recent_reads.join(", ")
         ));
     }
@@ -389,15 +454,29 @@ pub(crate) async fn execute_compaction(
         }
     }
     summary.push_str(
-        "Most recent turns follow verbatim below (thinking/images stripped; read-tracker reset).",
+        "Continue immediately from [carnot:task-handoff] without redundantly re-reading already-summarized files.",
     );
+
+    let last_is_fresh_user_prompt = s
+        .active_messages()
+        .last()
+        .is_some_and(|m| m.role == Role::User && m.has_text() && !m.has_tool_result());
 
     let (min_tail, max_tail, budget) = match mode {
         CompactionMode::EmergencyOverflow => {
-            (4, 6, config.compaction_tail_budget_tokens.min(12_000))
+            (2, 4, config.compaction_tail_budget_tokens.min(8_000))
         }
         CompactionMode::Soft | CompactionMode::Manual => {
-            (6, 14, config.compaction_tail_budget_tokens)
+            if used_semantic_llm {
+                // Semantic LLM just synthesized the full conversation including the latest tool
+                // outputs. Keep small recent turns up to `budget`, and always keep an active
+                // fresh user prompt (`min_tail = 1`), without dragging giant already-summarized
+                // tool blobs past compaction.
+                let min_t = usize::from(last_is_fresh_user_prompt);
+                (min_t, 6, config.compaction_tail_budget_tokens)
+            } else {
+                (2, 6, config.compaction_tail_budget_tokens)
+            }
         }
     };
 
@@ -448,5 +527,46 @@ mod tests {
         let clipped = clip_anchor_text(&giant, 300);
         assert!(clipped.starts_with("AAAA"));
         assert!(clipped.ends_with("FINAL_TOLERANCE=1e-9"));
+    }
+
+    #[test]
+    fn hydrate_anchors_survives_resume_and_double_compaction() {
+        let msgs = vec![
+            Arc::new(Message::user_text("Phase 1: engine_version=carnot-v4.2")),
+            Arc::new(Message::assistant_text("Done Phase 1")),
+            Arc::new(Message::user_text("Phase 2:\nLine A\nLine B")),
+        ];
+        let (goal, followups) = hydrate_anchors_from_session(&msgs);
+        assert_eq!(goal.as_deref(), Some("Phase 1: engine_version=carnot-v4.2"));
+        assert_eq!(followups, vec!["Phase 2:\nLine A\nLine B".to_string()]);
+
+        // Simulate resuming AFTER a prior compaction and adding Phase 3
+        let compacted = Message::system_note(
+            "[carnot:compaction mode=soft semantic_llm=true session=s1]\n\
+Older turns were compacted.\n\n\
+[carnot:anchored-objective]\n\
+Phase 1: engine_version=carnot-v4.2\n\n\
+[carnot:user-followups]\n\
+### Follow-up 1\n\
+Phase 2:\nLine A\nLine B\n\n\
+[carnot:task-handoff]\n\
+## 1. Exact Constraints\n- ok\n",
+        );
+        let after_msgs = vec![
+            Arc::new(compacted),
+            Arc::new(Message::user_text("Phase 3: export CSV")),
+        ];
+        let (goal2, followups2) = hydrate_anchors_from_session(&after_msgs);
+        assert_eq!(
+            goal2.as_deref(),
+            Some("Phase 1: engine_version=carnot-v4.2")
+        );
+        assert_eq!(
+            followups2,
+            vec![
+                "Phase 2:\nLine A\nLine B".to_string(),
+                "Phase 3: export CSV".to_string(),
+            ]
+        );
     }
 }

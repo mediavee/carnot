@@ -367,7 +367,8 @@ impl SessionStore {
         let n = self.active_messages.len();
         let mut tail_start = n.saturating_sub(requested_keep_tail);
         // S-1: Never start kept tail on a `tool_result` without its preceding `assistant(tool_use)`!
-        while tail_start > 0 && self.active_messages[tail_start].has_tool_result() {
+        while tail_start > 0 && tail_start < n && self.active_messages[tail_start].has_tool_result()
+        {
             tail_start -= 1;
         }
         let effective_keep_tail = n.saturating_sub(tail_start);
@@ -701,5 +702,30 @@ mod tests {
         let last_json = serde_json::to_string(msgs.last().expect("last").as_ref()).expect("ser");
         assert!(last_json.contains("bytes trimmed during compaction"));
         assert!(last_json.len() < 32_000);
+    }
+
+    #[test]
+    fn compaction_with_zero_tail_never_panics() {
+        let mut s = SessionStore::create(None, "claude-sonnet-5-5".into(), "STATIC".into(), vec![])
+            .expect("create");
+        s.push_message(Message::user_text("initial")).expect("u0");
+        s.push_message(Message::assistant_text("reply"))
+            .expect("a0");
+        s.push_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: vec![ToolResultBlock::text("X".repeat(50_000))],
+                is_error: false,
+            }],
+        })
+        .expect("tr");
+
+        let (before, after) = s
+            .apply_compaction_budgeted("DENSE HANDOFF".into(), 4_000, 0, 6)
+            .expect("zero-tail compaction must not panic");
+        assert!(after < before, "expected drop: {before} -> {after}");
+        assert_eq!(s.active_messages().len(), 1);
+        assert_eq!(s.active_messages()[0].text_concat(), "DENSE HANDOFF");
     }
 }

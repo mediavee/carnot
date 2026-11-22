@@ -412,16 +412,23 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
             };
 
             let is_json = matches!(cli.mode, Mode::Json);
-            let mut ev_stream = agent.subscribe();
+            let mut ev_stream = agent.subscribe_from(0);
             let ev_task = tokio::spawn(async move {
+                use std::io::Write as _;
                 loop {
                     let env = ev_stream.next().await;
                     if is_json {
-                        if let Ok(line) = serde_json::to_string(&env) {
-                            println!("{line}");
+                        if let Ok(line) = serde_json::to_string(&env)
+                            && writeln!(std::io::stdout(), "{line}").is_err()
+                        {
+                            break;
                         }
                     } else if let AgentEvent::TextDelta { delta } = &env.event {
-                        print!("{delta}");
+                        let mut out = std::io::stdout();
+                        if write!(out, "{delta}").is_err() {
+                            break;
+                        }
+                        let _ = out.flush();
                     }
                     if matches!(
                         env.event,

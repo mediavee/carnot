@@ -276,11 +276,20 @@ impl AnthropicProvider {
         }
 
         let last_idx = wire_messages.len().saturating_sub(1);
+        let rolling_bp_idx = if req.skip_tail_cache_write {
+            // One-shot compaction call: hit the warm prefix cached on the previous turn
+            // (`last_idx - 2`) without paying a 1.25x/2.0x cache-write surcharge on the
+            // discarded tail + compaction prompt.
+            last_idx.checked_sub(2)
+        } else {
+            Some(last_idx)
+        };
         let final_messages: Vec<Value> = wire_messages
             .into_iter()
             .enumerate()
             .map(|(idx, (role, mut blocks, is_cp))| {
-                let want_bp = (is_cp && idx != last_idx) || idx == last_idx;
+                let want_bp = (is_cp && Some(idx) != rolling_bp_idx && idx != last_idx)
+                    || Some(idx) == rolling_bp_idx;
                 if want_bp {
                     // A9: attach cache_control ONLY to the last NON-thinking block!
                     if let Some(target) = blocks.iter_mut().rev().find(|b| {
@@ -972,6 +981,7 @@ mod tests {
             cache_ttl: CacheTtl::Long1h,
             effort: ReasoningEffort::High,
             max_output_tokens: 32_768,
+            skip_tail_cache_write: false,
         };
         let body = p.build_body(&req);
         assert!(body.pointer("/tools/0/cache_control").is_some());
@@ -987,6 +997,42 @@ mod tests {
         assert_eq!(
             body.pointer("/messages/1/role").and_then(Value::as_str),
             Some("system")
+        );
+    }
+
+    #[test]
+    fn skip_tail_cache_write_keeps_warm_prefix_without_writing_dead_tail() {
+        let p = AnthropicProvider::new("test-key".into());
+        let req = ProviderRequest {
+            model: "claude-sonnet-5-5".into(),
+            static_system_prompt: "STATIC".into(),
+            tools: vec![],
+            prefix_hash: "abc".into(),
+            messages: vec![
+                Arc::new(Message::user_text("u0")),
+                Arc::new(Message::assistant_text("a0")),
+                Arc::new(Message::user_text("u1_warm")),
+                Arc::new(Message::assistant_text("a1_new")),
+                Arc::new(Message::user_text("u2_compact_prompt")),
+            ],
+            checkpoint_index: Some(0),
+            cache_ttl: CacheTtl::Hybrid,
+            effort: ReasoningEffort::Low,
+            max_output_tokens: 64_000,
+            skip_tail_cache_write: true,
+        };
+        let body = p.build_body(&req);
+        assert!(
+            body.pointer("/messages/0/content/0/cache_control")
+                .is_some()
+        );
+        assert!(
+            body.pointer("/messages/2/content/0/cache_control")
+                .is_some()
+        );
+        assert!(
+            body.pointer("/messages/4/content/0/cache_control")
+                .is_none()
         );
     }
 

@@ -75,6 +75,10 @@ pub struct ProviderRequest {
     pub cache_ttl: CacheTtl,
     pub effort: ReasoningEffort,
     pub max_output_tokens: u32,
+    /// When `true` (used by one-shot cache-warm compaction calls), reuse the warm prompt cache
+    /// up to the previous turn's boundary without paying a `1.25x`/`2.0x` cache-write surcharge
+    /// on the discarded tail + compaction prompt.
+    pub skip_tail_cache_write: bool,
 }
 
 /// Incremental streaming event from any model provider.

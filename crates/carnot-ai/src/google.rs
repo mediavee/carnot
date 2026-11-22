@@ -395,8 +395,10 @@ impl GoogleProvider {
                 let b = base.trim_end_matches('/');
                 if self.cloudcode_envelope {
                     format!("{b}/v1internal:streamGenerateContent?alt=sse")
-                } else {
+                } else if b.ends_with("/v1beta") || b.ends_with("/v1") || b.ends_with("/v1alpha") {
                     format!("{b}/models/{model}:streamGenerateContent?alt=sse")
+                } else {
+                    format!("{b}/v1beta/models/{model}:streamGenerateContent?alt=sse")
                 }
             })
             .collect()
@@ -755,5 +757,52 @@ impl Provider for GoogleProvider {
 
             Ok(rx)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{CompatFlags, ResolvedAuth, UsageMap};
+    use std::collections::BTreeMap;
+
+    fn make_spec(base_url: &str) -> ResolvedProviderSpec {
+        ResolvedProviderSpec {
+            provider_id: "gemini".into(),
+            api: "google-generative".into(),
+            base_url: base_url.into(),
+            fallback_base_urls: vec![],
+            project_id: None,
+            auth: ResolvedAuth::None,
+            headers: BTreeMap::new(),
+            betas: vec![],
+            cache_diagnosis_beta: None,
+            native_tool_search: false,
+            compat: CompatFlags::default(),
+            usage_map: UsageMap::default(),
+            body_patch: None,
+            subprocess: None,
+            catalog_models: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_normalizes_bare_host_and_preserves_v1beta() {
+        let p_bare = GoogleProvider::from_spec(make_spec("https://gateway.example.com"), false);
+        assert_eq!(
+            p_bare.endpoint_urls("gemini-3-pro"),
+            vec![
+                "https://gateway.example.com/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse"
+            ]
+        );
+
+        let p_v1beta =
+            GoogleProvider::from_spec(make_spec("https://api.example.com/v1beta/"), false);
+        assert_eq!(
+            p_v1beta.endpoint_urls("gemini-3-pro"),
+            vec![
+                "https://api.example.com/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse"
+            ]
+        );
     }
 }

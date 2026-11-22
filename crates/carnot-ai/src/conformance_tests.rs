@@ -131,6 +131,7 @@ fn sample_request(model: &str, messages: Vec<Message>) -> ProviderRequest {
         cache_ttl: CacheTtl::Hybrid,
         effort: ReasoningEffort::High,
         max_output_tokens: 4096,
+        skip_tail_cache_write: false,
     }
 }
 

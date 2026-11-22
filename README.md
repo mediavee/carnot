@@ -56,6 +56,19 @@ Measured on `41 / 62` CPU tasks (native Linux `x86_64`, dedicated 8 vCPU / 16 GB
 - Ties Unharnessed head-to-head on **Software (`7/11`)**, **Hardware (`3/4`)**, **Media (`3/3`)**, and **ML (`1/3`)** while costing **18.5% less than Claude Code** with **0 harness crashes**.
 - Full `62 / 62` CPU sweep at `effort=medium` (80m cap): `30 / 62` (`48.4%`), `97.00%` cache hit, `122 / 122` (`100%`) `Edit`, `$2.33` mean cost ([`results_tb4_carnot_v6_opus55.json`](benchmarks/results_tb4_carnot_v6_opus55.json)).
 
+### Two-Tier Cache-Warm Semantic Compaction A/B ([`results_compaction_ab_v9.json`](benchmarks/results_compaction_ab_v9.json))
+
+Controlled 4-phase resumed session (`--resume`, `claude-sonnet-5-5`, 240 KB of raw log shards with buried overrides & Phase-1 schema constraints, 14 strict assertions):
+
+| Metric | No Compaction (`--compact-at 0`) | Carnot Cache-Warm Compaction | Delta |
+| --- | ---: | ---: | ---: |
+| **Verification Score** | `14 / 14` | **`14 / 14`** | **0 amnesia (100% recall)** |
+| **Total Net Cost (USD)** | `$0.7475` | **`$0.5593`** | **`-25.2%` (incl. compaction call)** |
+| **Post-Compaction Cost (Phases 2–4)** | `$0.2196` | **`$0.0732`** | **`-66.7%` (3.0× cheaper)** |
+| **Total Context AUC (tokens)** | `2,660,304` | **`593,369`** | **`-77.7%`** |
+| **Context Compression** | `74,112` peak | **`68,775 → 3,059`** | **`-95.6%` (22.5×)** |
+| **Post-Phase1 Redundant `Read`s** | `1` | **`0`** | **0 re-reads** |
+
 ## Quick Start
 
 ```bash
