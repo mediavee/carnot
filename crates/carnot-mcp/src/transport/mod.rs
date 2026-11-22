@@ -121,6 +121,7 @@ struct ProtocolState {
     era: ProtocolEra,
     version: String,
     legacy_initialized: bool,
+    instructions: Option<String>,
 }
 
 /// Encodes an MCP `2026-07-28` HTTP header value (`Mcp-Name` or `Mcp-Param-*`) per `SEP-2243`.
@@ -264,6 +265,7 @@ impl McpClient {
                 era: init_era,
                 version: init_ver,
                 legacy_initialized: false,
+                instructions: None,
             }),
             legacy_init_lock: tokio::sync::Mutex::new(()),
             started_from_hint: has_hint.is_some(),
@@ -316,6 +318,7 @@ impl McpClient {
                     era: ProtocolEra::Legacy20251125,
                     version: "2024-11-05".to_string(),
                     legacy_initialized: false,
+                    instructions: None,
                 }),
                 legacy_init_lock: tokio::sync::Mutex::new(()),
                 started_from_hint: true,
@@ -348,6 +351,7 @@ impl McpClient {
                 era: init_era,
                 version: init_ver,
                 legacy_initialized: false,
+                instructions: None,
             }),
             legacy_init_lock: tokio::sync::Mutex::new(()),
             started_from_hint: has_hint.is_some(),
@@ -372,6 +376,35 @@ impl McpClient {
             .lock()
             .map(|p| p.version.clone())
             .unwrap_or_else(|_| MCP_PROTOCOL_VERSION.to_string())
+    }
+
+    /// Returns the first non-empty line of server instructions/description returned during handshake.
+    pub fn server_instructions(&self) -> Option<String> {
+        self.proto.lock().ok().and_then(|p| p.instructions.clone())
+    }
+
+    fn capture_server_instructions(&self, res: &Value) {
+        let raw = res.get("instructions").and_then(Value::as_str).or_else(|| {
+            res.get("serverInfo")
+                .and_then(|si| si.get("description"))
+                .and_then(Value::as_str)
+        });
+        if let Some(first_line) = raw
+            .and_then(|s| s.lines().map(str::trim).find(|l| !l.is_empty()))
+            .filter(|l| !l.is_empty())
+            && let Ok(mut p) = self.proto.lock()
+        {
+            let mut clipped = first_line.to_string();
+            if clipped.len() > 160 {
+                let mut end = 160;
+                while end > 0 && !clipped.is_char_boundary(end) {
+                    end -= 1;
+                }
+                clipped.truncate(end);
+                clipped.push('…');
+            }
+            p.instructions = Some(clipped);
+        }
     }
 
     fn set_protocol(&self, era: ProtocolEra, version: String, legacy_initialized: bool) {
@@ -402,6 +435,7 @@ impl McpClient {
             .await
         {
             Ok(res) => {
+                self.capture_server_instructions(&res);
                 let supported: Vec<String> = res
                     .get("supportedVersions")
                     .and_then(Value::as_array)
@@ -467,7 +501,8 @@ impl McpClient {
             )
             .await
         {
-            Ok(_) => {
+            Ok(res) => {
+                self.capture_server_instructions(&res);
                 self.set_protocol(ProtocolEra::Legacy20251125, init_version.to_string(), true);
                 let _ = self.notify("notifications/initialized", json!({})).await;
                 Ok(())

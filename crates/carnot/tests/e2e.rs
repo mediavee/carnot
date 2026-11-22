@@ -1093,3 +1093,84 @@ async fn e2e_before_compact_module_hook_adds_focus_and_can_cancel() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn e2e_deferred_directory_turn1_and_select_tool_search() {
+    use carnot::{Tool, ToolOutput, ToolSpec};
+
+    #[derive(Debug)]
+    struct DeferredPingTool;
+
+    impl Tool for DeferredPingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "mcp__t3-code__preview_status".into(),
+                description: "Inspect preview tab state".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                defer_loading: true,
+            }
+        }
+
+        fn execute(
+            &self,
+            _input: serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> carnot_tools::BoxFuture<'_, carnot::Result<ToolOutput>> {
+            Box::pin(async { Ok(ToolOutput::ok_text("preview-ready")) })
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("carnot-defdir-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).expect("mkdir");
+
+    let faux = Arc::new(FauxProvider::new(vec![
+        ScriptedTurn::tool_calls(vec![(
+            "ts1",
+            "ToolSearch",
+            json!({"query": "select:mcp__t3-code__preview_status"}),
+        )]),
+        ScriptedTurn::tool_calls(vec![(
+            "cd1",
+            "CallDeferredTool",
+            json!({"name": "mcp__t3-code__preview_status", "arguments": {}}),
+        )]),
+        ScriptedTurn::text("Preview checked."),
+    ]));
+
+    let agent = CarnotBuilder::new(dir.clone())
+        .sandbox(false)
+        .persist_session(false)
+        .provider(faux.clone())
+        .with_tool(Arc::new(DeferredPingTool))
+        .build()
+        .expect("build");
+
+    let mut descs = std::collections::BTreeMap::new();
+    descs.insert("t3-code".into(), "T3 Code workspace & preview tools".into());
+    agent.set_deferred_server_descriptions(descs);
+
+    let out = agent.prompt("Check preview").await.expect("run");
+    assert_eq!(out.final_text, "Preview checked.");
+
+    let reqs = faux.recorded_requests();
+    assert_eq!(reqs.len(), 3);
+    // Zero leak into static system prompt!
+    assert!(!reqs[0].static_system_prompt.contains("t3-code"));
+    assert!(
+        !reqs[0]
+            .static_system_prompt
+            .contains("available-deferred-tools")
+    );
+    // Turn-1 user message advertises the compact MCP server summary!
+    let turn1_txt = msgs_json(&reqs[0].messages);
+    assert!(
+        turn1_txt.contains("[available-deferred-tools]")
+            && turn1_txt.contains("MCP `t3-code` (1 tool): T3 Code workspace & preview tools"),
+        "expected Turn-1 deferred directory, got: {turn1_txt}"
+    );
+    // ToolSearch select: + CallDeferredTool succeeded!
+    let turn3_txt = msgs_json(&reqs[2].messages);
+    assert!(turn3_txt.contains("preview-ready"));
+
+    let _ = fs::remove_dir_all(&dir);
+}

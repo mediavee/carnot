@@ -54,12 +54,13 @@ pub trait AcpHost: Send + Sync + std::fmt::Debug {
     /// Resolves any requested model ID (advertised or custom) to its provider & window limits.
     fn resolve_model(&self, model_id: &str) -> Result<ResolvedAcpModel>;
 
-    /// Creates a fresh `Agent` rooted at `cwd` for `session/new`.
+    /// Creates a fresh `Agent` rooted at `cwd` for `session/new` (with optional ACP `mcpServers`).
     fn create_agent_for_cwd(
         &self,
         cwd: PathBuf,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        mcp_servers: Vec<Value>,
     ) -> BoxFuture<'_, Result<Arc<Agent>>>;
 }
 
@@ -539,6 +540,7 @@ async fn serve_acp_stdio_inner(
                     "agentCapabilities": {
                         "loadSession": true,
                         "permissionRequests": true,
+                        "mcpCapabilities": { "http": true, "sse": true },
                         "promptCapabilities": { "embeddedContext": true, "image": true },
                         "sessionCapabilities": { "list": {}, "resume": {} }
                     },
@@ -555,12 +557,23 @@ async fn serve_acp_stdio_inner(
                     .map(PathBuf::from)
                     .filter(|p| p.is_dir());
 
+                let req_mcp_servers: Vec<Value> = params
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+
                 if let Some(ref h) = host {
                     let target_cwd = req_cwd.unwrap_or_else(|| agent.config.workspace_root.clone());
                     let cur_model = agent.current_model().await;
                     let cur_effort = agent.current_effort().await;
                     match h
-                        .create_agent_for_cwd(target_cwd, Some(cur_model), Some(cur_effort))
+                        .create_agent_for_cwd(
+                            target_cwd,
+                            Some(cur_model),
+                            Some(cur_effort),
+                            req_mcp_servers,
+                        )
                         .await
                     {
                         Ok(new_agent) => {

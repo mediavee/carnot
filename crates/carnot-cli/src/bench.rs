@@ -502,6 +502,7 @@ async fn bench_http_mcp_once(
         enabled: true,
         trusted: true,
         lazy: prewarm_cache,
+        description: None,
         from_workspace: false,
     };
     let srv_cfg = McpServerConfig::Http(http_cfg.clone());
@@ -641,6 +642,7 @@ async fn bench_http_mcp_16_serial_vs_concurrent(delay_ms: u64) -> (f64, f64) {
         enabled: true,
         trusted: true,
         lazy: false,
+        description: None,
         from_workspace: false,
     });
     let mut cfgs = BTreeMap::new();

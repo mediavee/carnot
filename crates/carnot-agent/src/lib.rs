@@ -77,6 +77,7 @@ pub struct Agent {
     pending_steers: Mutex<Vec<String>>,
     pending_follow_ups: Mutex<VecDeque<String>>,
     permission_broker: Mutex<Option<Arc<dyn PermissionBroker>>>,
+    deferred_server_descriptions: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 impl Agent {
@@ -92,16 +93,19 @@ impl Agent {
                 tools.register(t);
             }
         }
-        // Cache-invariant universal ToolSearch fallback when provider lacks native tool search!
-        if !provider.supports_native_tool_search() {
-            let deferred = tools.deferred_tools();
-            if !deferred.is_empty() {
-                tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
-                tools.register(Arc::new(tool_search::CallDeferredTool::new(&deferred)));
-            }
+        // Always register universal `ToolSearch` + `CallDeferredTool` when deferred tools exist so
+        // live cross-provider model switching (Anthropic <-> OpenAI/Gemini/...) always works!
+        // `effective_tools_for_provider()` hides them on Anthropic's native tool-search requests.
+        let deferred = tools.deferred_tools();
+        if !deferred.is_empty() {
+            tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
+            tools.register(Arc::new(tool_search::CallDeferredTool::new(&deferred)));
         }
 
-        let tool_specs = tools.specs();
+        let tool_specs = tool_search::effective_tools_for_provider(
+            &tools.specs(),
+            provider.supports_native_tool_search(),
+        );
         let session_dir = persist_session.then_some(config.session_dir.as_path());
         let session = SessionStore::create(
             session_dir,
@@ -125,12 +129,10 @@ impl Agent {
                 tools.register(t);
             }
         }
-        if !provider.supports_native_tool_search() {
-            let deferred = tools.deferred_tools();
-            if !deferred.is_empty() {
-                tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
-                tools.register(Arc::new(tool_search::CallDeferredTool::new(&deferred)));
-            }
+        let deferred = tools.deferred_tools();
+        if !deferred.is_empty() {
+            tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
+            tools.register(Arc::new(tool_search::CallDeferredTool::new(&deferred)));
         }
         let session = SessionStore::load(session_path)?;
         let already_started = !session.active_messages().is_empty();
@@ -178,7 +180,19 @@ impl Agent {
             pending_steers: Mutex::new(Vec::new()),
             pending_follow_ups: Mutex::new(VecDeque::new()),
             permission_broker: Mutex::new(None),
+            deferred_server_descriptions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// Attaches one-line MCP server descriptions displayed in the Turn-1 `[available-deferred-tools]`
+    /// directory (zero impact on the static cached system prompt).
+    pub fn set_deferred_server_descriptions(
+        &self,
+        descriptions: std::collections::BTreeMap<String, String>,
+    ) {
+        if let Ok(mut guard) = self.deferred_server_descriptions.lock() {
+            *guard = descriptions;
+        }
     }
 
     /// Loads an existing session file into this running `Agent` (used by ACP `session/load`).
@@ -449,6 +463,17 @@ impl Agent {
                         turn1_blocks.push(ctx);
                     }
                 }
+                let deferred_descs = self
+                    .deferred_server_descriptions
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                if let Some(dir) = tool_search::format_deferred_tools_directory(
+                    &self.tools.deferred_tools(),
+                    &deferred_descs,
+                ) {
+                    turn1_blocks.push(dir);
+                }
                 if !turn1_blocks.is_empty() {
                     initial_text = format!("{}\n\n{initial_text}", turn1_blocks.join("\n\n"));
                 }
@@ -537,10 +562,14 @@ impl Agent {
                 m.turns += 1;
                 m.requests += 1;
                 let turn_num = m.turns;
+                let wire_tools = tool_search::effective_tools_for_provider(
+                    &self.tools.specs(),
+                    active_provider.supports_native_tool_search(),
+                );
                 let req = ProviderRequest {
                     model: eff_cfg.model.clone(),
                     static_system_prompt: proj.static_system_prompt,
-                    tools: proj.tools,
+                    tools: wire_tools,
                     prefix_hash: proj.prefix_hash,
                     session_id: s.session_id.clone(),
                     messages: proj.messages,

@@ -7,15 +7,17 @@ mod bench;
 mod repl;
 
 use carnot::{
-    AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, McpManager, Profile,
-    ProviderRegistry, ReasoningEffort, ResolvedAcpModel, assert_prefix_invariance,
-    load_mcp_configs, serve_acp_stdio_with_host, serve_http, serve_rpc_stdio,
+    AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, McpManager,
+    McpServerConfig, Profile, ProviderRegistry, ReasoningEffort, ResolvedAcpModel,
+    assert_prefix_invariance, load_mcp_configs, parse_acp_mcp_servers, serve_acp_stdio_with_host,
+    serve_http, serve_rpc_stdio,
 };
 use carnot_ext::microskills::discover_agent_skills;
 use carnot_ext::prefix_guard::static_system_prompt;
 use carnot_tools::canonical_tool_specs;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -365,14 +367,19 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
 
     let code = match cli.mode {
         Mode::Acp => {
-            let host = Arc::new(CliAcpHost { cli: cli.clone() });
-            match serve_acp_stdio_with_host(agent, host).await {
+            let host = Arc::new(CliAcpHost {
+                cli: cli.clone(),
+                session_mcps: tokio::sync::Mutex::new(Vec::new()),
+            });
+            let rc = match serve_acp_stdio_with_host(agent, host.clone()).await {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("acp error: {e}");
                     1
                 }
-            }
+            };
+            host.shutdown_session_mcps().await;
+            rc
         }
         Mode::Rpc => match serve_rpc_stdio(agent).await {
             Ok(()) => 0,
@@ -643,6 +650,19 @@ async fn run_mcp_cmd(cli: &Cli, cwd: &std::path::Path, action: &McpCommands) -> 
 #[derive(Debug)]
 struct CliAcpHost {
     cli: Cli,
+    session_mcps: tokio::sync::Mutex<Vec<Arc<McpManager>>>,
+}
+
+impl CliAcpHost {
+    async fn shutdown_session_mcps(&self) {
+        let managers: Vec<Arc<McpManager>> = {
+            let mut guard = self.session_mcps.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for mgr in managers {
+            mgr.shutdown_all().await;
+        }
+    }
 }
 
 impl AcpHost for CliAcpHost {
@@ -708,6 +728,7 @@ impl AcpHost for CliAcpHost {
         cwd: PathBuf,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> carnot_ext::BoxFuture<'_, carnot::Result<Arc<carnot::Agent>>> {
         let mut eff_cli = self.cli.clone();
         if let Some(m) = model {
@@ -723,7 +744,9 @@ impl AcpHost for CliAcpHost {
             };
         }
         Box::pin(async move {
-            let (agent, _mcp) = build_agent(&eff_cli, cwd).await?;
+            let extra_mcp = parse_acp_mcp_servers(&mcp_servers, &cwd);
+            let (agent, session_mcp) = build_agent_with_mcp(&eff_cli, cwd, extra_mcp).await?;
+            self.session_mcps.lock().await.push(session_mcp);
             Ok(agent)
         })
     }
@@ -732,6 +755,14 @@ impl AcpHost for CliAcpHost {
 async fn build_agent(
     cli: &Cli,
     cwd: PathBuf,
+) -> carnot::Result<(Arc<carnot::Agent>, Arc<McpManager>)> {
+    build_agent_with_mcp(cli, cwd, BTreeMap::new()).await
+}
+
+async fn build_agent_with_mcp(
+    cli: &Cli,
+    cwd: PathBuf,
+    extra_mcp: BTreeMap<String, McpServerConfig>,
 ) -> carnot::Result<(Arc<carnot::Agent>, Arc<McpManager>)> {
     let ttl = match cli.cache_ttl.to_ascii_lowercase().as_str() {
         "5m" | "short" => CacheTtl::Short5m,
@@ -776,6 +807,9 @@ async fn build_agent(
     }
     for p in &cli.mcp_configs {
         b = b.mcp_config(p.clone());
+    }
+    if !extra_mcp.is_empty() {
+        b = b.extra_mcp_servers(extra_mcp);
     }
     for d in &cli.skills_dirs {
         b = b.skills_dir(d.clone());

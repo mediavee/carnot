@@ -109,9 +109,26 @@ impl ToolRegistry {
             .with_seen_cas_hashes(seen_cas_hashes),
         ));
 
+        // Allow read-only access to configured `--skills-dir` and global `~/.carnot/skills`
+        // without granting write access to Edit/Write/Bash sandbox.
+        let mut extra_read_roots = config.extra_writable_roots.clone();
+        for dir in &config.skills_dirs {
+            if !extra_read_roots.iter().any(|r| r == dir) {
+                extra_read_roots.push(dir.clone());
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let global_skills = std::path::PathBuf::from(home)
+                .join(".carnot")
+                .join("skills");
+            if global_skills.is_dir() && !extra_read_roots.iter().any(|r| r == &global_skills) {
+                extra_read_roots.push(global_skills);
+            }
+        }
+
         reg.register(Arc::new(files::ReadTool::new(
             config.workspace_root.clone(),
-            config.extra_writable_roots.clone(),
+            extra_read_roots.clone(),
             read_tracker,
         )));
 
@@ -133,7 +150,7 @@ impl ToolRegistry {
 
         reg.register(Arc::new(grep::GrepTool::new(
             config.workspace_root.clone(),
-            config.extra_writable_roots.clone(),
+            extra_read_roots,
         )));
 
         reg

@@ -40,6 +40,7 @@ pub use carnot_mcp::{
     CachedServerSchema, CachedToolEntry, HttpServerConfig, MCP_LEGACY_PROTOCOL_VERSION,
     MCP_PROTOCOL_VERSION, McpClient, McpConfigFile, McpManager, McpServerConfig, McpServerSummary,
     ProtocolEra, StdioServerConfig, encode_mcp_header_value, load_mcp_configs,
+    parse_acp_mcp_servers,
 };
 pub use carnot_protocol::{
     acp::AcpHost, acp::AcpModelInfo, acp::ResolvedAcpModel, acp::serve_acp_stdio,
@@ -62,6 +63,7 @@ pub struct CarnotBuilder {
     extra_adapters: Vec<Arc<dyn ApiAdapter>>,
     extra_modules: Vec<Arc<dyn Module>>,
     extra_tools: Vec<Arc<dyn Tool>>,
+    extra_mcp_servers: std::collections::BTreeMap<String, McpServerConfig>,
     persist_session: bool,
     resume_session: Option<PathBuf>,
     policy_guard: bool,
@@ -76,6 +78,7 @@ impl CarnotBuilder {
             extra_adapters: Vec::new(),
             extra_modules: Vec::new(),
             extra_tools: Vec::new(),
+            extra_mcp_servers: std::collections::BTreeMap::new(),
             persist_session: true,
             resume_session: None,
             policy_guard: false,
@@ -164,6 +167,15 @@ impl CarnotBuilder {
         self
     }
 
+    /// Merges programmatically supplied MCP server configs (e.g. from ACP `session/new` `mcpServers`).
+    pub fn extra_mcp_servers(
+        mut self,
+        servers: std::collections::BTreeMap<String, McpServerConfig>,
+    ) -> Self {
+        self.extra_mcp_servers.extend(servers);
+        self
+    }
+
     pub fn skills_dir(mut self, path: PathBuf) -> Self {
         self.config.skills_dirs.push(path);
         self
@@ -239,11 +251,12 @@ impl CarnotBuilder {
     /// Async build loading all validated `.mcp.json` servers (with zero-cold-start lazy disk cache!).
     pub async fn build_async(self) -> Result<(Arc<Agent>, Arc<McpManager>)> {
         let cas = Arc::new(CasStore::open(&self.config.workspace_root)?);
-        let cfgs = load_mcp_configs(
+        let mut cfgs = load_mcp_configs(
             &self.config.workspace_root,
             &self.config.mcp_config_paths,
             self.config.trust_workspace_mcp,
         )?;
+        cfgs.extend(self.extra_mcp_servers.clone());
         let mcp = if cfgs.is_empty() {
             Arc::new(McpManager::empty())
         } else {
@@ -370,6 +383,10 @@ impl CarnotBuilder {
         } else {
             Agent::new(self.config, provider, tools, modules, self.persist_session)?
         };
+        let descs = mcp.server_descriptions();
+        if !descs.is_empty() {
+            agent.set_deferred_server_descriptions(descs);
+        }
         Ok(Arc::new(agent))
     }
 }

@@ -22,6 +22,7 @@ pub use cache::{
 };
 pub use config::{
     HttpServerConfig, McpConfigFile, McpServerConfig, StdioServerConfig, load_mcp_configs,
+    parse_acp_mcp_servers,
 };
 pub use transport::{ListToolsResponse, McpClient, ProgressCallback, encode_mcp_header_value};
 
@@ -114,6 +115,15 @@ impl LazyServerHandle {
     }
 }
 
+/// Internal result of loading one MCP server's schemas (cached or live).
+struct LoadedServerTools {
+    entries: Vec<CachedToolEntry>,
+    from_cache: bool,
+    era: ProtocolEra,
+    protocol_version: String,
+    description: Option<String>,
+}
+
 /// Summary of one registered MCP server (used by `carnot mcp list` and telemetry).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServerSummary {
@@ -125,6 +135,8 @@ pub struct McpServerSummary {
     pub loaded_from_cache: bool,
     pub lazy: bool,
     pub trusted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -177,6 +189,7 @@ impl McpManager {
                         };
                         let lazy = cfg.is_lazy();
                         let trusted = cfg.is_trusted();
+                        let cfg_desc = cfg.description().map(str::to_string);
 
                         let cached_opt = if lazy {
                             cache::load_cached_schema(&cache_key)
@@ -198,71 +211,93 @@ impl McpManager {
                         });
 
                         let mut refresh_handle: Option<tokio::task::JoinHandle<()>> = None;
-                        let load_res: Result<(Vec<CachedToolEntry>, bool, ProtocolEra, String)> =
-                            if let Some((cached, is_stale)) = cached_opt {
-                                if is_stale {
-                                    // Stale-while-revalidate for NEXT session only (never mutates current prompt prefix!)
-                                    // Clear era hint so a server upgraded from legacy -> 2026-07-28 re-negotiates (Opus #24!)
-                                    let h_bg = Arc::clone(&handle);
-                                    let nm_bg = name.clone();
-                                    let ck_bg = cache_key.clone();
-                                    refresh_handle = Some(tokio::spawn(async move {
-                                        *h_bg.hint_era.lock().await = None;
-                                        if let Ok(client) = h_bg.get_or_connect().await
-                                            && let Ok(resp) =
-                                                client.list_all_tools_with_meta().await
-                                        {
-                                            let parsed = parse_and_minify_tools(&nm_bg, resp.tools);
-                                            cache::save_cached_schema(
-                                                &ck_bg,
-                                                CachedServerSchema {
-                                                    format_version: 3,
-                                                    protocol_version: client.protocol_version(),
-                                                    era: client.protocol_era(),
-                                                    server_name: nm_bg,
-                                                    cache_scope: resp.cache_scope,
-                                                    ttl_ms: resp.ttl_ms,
-                                                    cached_at_ms: 0,
-                                                    tools: parsed,
-                                                },
-                                            );
-                                        }
-                                    }));
-                                }
-                                Ok((cached.tools, true, cached.era, cached.protocol_version))
-                            } else {
-                                match handle.get_or_connect().await {
-                                    Ok(client) => match client.list_all_tools_with_meta().await {
-                                        Ok(resp) => {
-                                            let era = client.protocol_era();
-                                            let ver = client.protocol_version();
-                                            let parsed = parse_and_minify_tools(&name, resp.tools);
-                                            cache::save_cached_schema(
-                                                &cache_key,
-                                                CachedServerSchema {
-                                                    format_version: 3,
-                                                    protocol_version: ver.clone(),
-                                                    era,
-                                                    server_name: name.clone(),
-                                                    cache_scope: resp.cache_scope,
-                                                    ttl_ms: resp.ttl_ms,
-                                                    cached_at_ms: 0,
-                                                    tools: parsed.clone(),
-                                                },
-                                            );
-                                            Ok((parsed, false, era, ver))
-                                        }
-                                        Err(e) => Err(e),
-                                    },
+                        let load_res: Result<LoadedServerTools> = if let Some((cached, is_stale)) =
+                            cached_opt
+                        {
+                            if is_stale {
+                                // Stale-while-revalidate for NEXT session only (never mutates current prompt prefix!)
+                                // Clear era hint so a server upgraded from legacy -> 2026-07-28 re-negotiates (Opus #24!)
+                                let h_bg = Arc::clone(&handle);
+                                let nm_bg = name.clone();
+                                let ck_bg = cache_key.clone();
+                                let desc_bg = cfg_desc.clone();
+                                refresh_handle = Some(tokio::spawn(async move {
+                                    *h_bg.hint_era.lock().await = None;
+                                    if let Ok(client) = h_bg.get_or_connect().await
+                                        && let Ok(resp) = client.list_all_tools_with_meta().await
+                                    {
+                                        let parsed = parse_and_minify_tools(&nm_bg, resp.tools);
+                                        let effective_desc =
+                                            desc_bg.or_else(|| client.server_instructions());
+                                        cache::save_cached_schema(
+                                            &ck_bg,
+                                            CachedServerSchema {
+                                                format_version: 3,
+                                                protocol_version: client.protocol_version(),
+                                                era: client.protocol_era(),
+                                                server_name: nm_bg,
+                                                cache_scope: resp.cache_scope,
+                                                ttl_ms: resp.ttl_ms,
+                                                cached_at_ms: 0,
+                                                description: effective_desc,
+                                                tools: parsed,
+                                            },
+                                        );
+                                    }
+                                }));
+                            }
+                            let effective_desc = cfg_desc.clone().or(cached.description);
+                            Ok(LoadedServerTools {
+                                entries: cached.tools,
+                                from_cache: true,
+                                era: cached.era,
+                                protocol_version: cached.protocol_version,
+                                description: effective_desc,
+                            })
+                        } else {
+                            match handle.get_or_connect().await {
+                                Ok(client) => match client.list_all_tools_with_meta().await {
+                                    Ok(resp) => {
+                                        let era = client.protocol_era();
+                                        let ver = client.protocol_version();
+                                        let parsed = parse_and_minify_tools(&name, resp.tools);
+                                        let effective_desc = cfg_desc
+                                            .clone()
+                                            .or_else(|| client.server_instructions());
+                                        cache::save_cached_schema(
+                                            &cache_key,
+                                            CachedServerSchema {
+                                                format_version: 3,
+                                                protocol_version: ver.clone(),
+                                                era,
+                                                server_name: name.clone(),
+                                                cache_scope: resp.cache_scope,
+                                                ttl_ms: resp.ttl_ms,
+                                                cached_at_ms: 0,
+                                                description: effective_desc.clone(),
+                                                tools: parsed.clone(),
+                                            },
+                                        );
+                                        Ok(LoadedServerTools {
+                                            entries: parsed,
+                                            from_cache: false,
+                                            era,
+                                            protocol_version: ver,
+                                            description: effective_desc,
+                                        })
+                                    }
                                     Err(e) => Err(e),
-                                }
-                            };
+                                },
+                                Err(e) => Err(e),
+                            }
+                        };
 
                         (
                             name,
                             transport_kind,
                             lazy,
                             trusted,
+                            cfg_desc,
                             handle,
                             load_res,
                             refresh_handle,
@@ -276,24 +311,26 @@ impl McpManager {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut refresh_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        for (name, transport, lazy, trusted, handle, load_res, refresh_handle) in results {
+        for (name, transport, lazy, trusted, cfg_desc, handle, load_res, refresh_handle) in results
+        {
             if let Some(jh) = refresh_handle {
                 refresh_handles.push(jh);
             }
             match load_res {
-                Ok((entries, from_cache, era, protocol_version)) => {
+                Ok(loaded) => {
                     summaries.push(McpServerSummary {
                         name: name.clone(),
                         transport,
-                        protocol_version,
-                        era,
-                        tools_count: entries.len(),
-                        loaded_from_cache: from_cache,
+                        protocol_version: loaded.protocol_version,
+                        era: loaded.era,
+                        tools_count: loaded.entries.len(),
+                        loaded_from_cache: loaded.from_cache,
                         lazy,
                         trusted,
+                        description: loaded.description,
                         error: None,
                     });
-                    for entry in entries {
+                    for entry in loaded.entries {
                         tools.push(Arc::new(McpToolProxy {
                             server: Arc::clone(&handle),
                             entry,
@@ -318,6 +355,7 @@ impl McpManager {
                         loaded_from_cache: false,
                         lazy,
                         trusted,
+                        description: cfg_desc,
                         error: Some(e.to_string()),
                     });
                 }
@@ -341,6 +379,21 @@ impl McpManager {
 
     pub fn summaries(&self) -> &[McpServerSummary] {
         &self.summaries
+    }
+
+    /// Map of connected MCP server name -> one-line description (for Turn-1 deferred-tools directory).
+    pub fn server_descriptions(&self) -> BTreeMap<String, String> {
+        self.summaries
+            .iter()
+            .filter(|s| s.error.is_none())
+            .filter_map(|s| {
+                s.description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(|d| (s.name.clone(), d.to_string()))
+            })
+            .collect()
     }
 
     pub async fn connect_server(&self, name: &str) -> Result<Arc<McpClient>> {
@@ -676,6 +729,7 @@ for line in sys.stdin:
             enabled: true,
             trusted: true,
             lazy: true,
+            description: None,
         });
         let mut cfgs = BTreeMap::new();
         cfgs.insert("m26".to_string(), srv_cfg.clone());
@@ -868,6 +922,7 @@ for line in sys.stdin:
             enabled: true,
             trusted: false,
             lazy: false,
+            description: None,
             from_workspace: false,
         });
         let mut cfgs = BTreeMap::new();
@@ -975,6 +1030,7 @@ for line in sys.stdin:
             enabled: true,
             trusted: false,
             lazy: false,
+            description: None,
             from_workspace: false,
         };
         let client = McpClient::connect_http(
@@ -1065,6 +1121,7 @@ for line in sys.stdin:
             enabled: true,
             trusted: false,
             lazy: false,
+            description: None,
             from_workspace: false,
         };
         let client = McpClient::connect_http(

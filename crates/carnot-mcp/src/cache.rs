@@ -78,6 +78,9 @@ pub struct CachedServerSchema {
     pub ttl_ms: Option<u64>,
     #[serde(default)]
     pub cached_at_ms: u64,
+    /// Optional one-line server description / first line of `initialize.instructions`.
+    #[serde(default)]
+    pub description: Option<String>,
     pub tools: Vec<CachedToolEntry>,
 }
 

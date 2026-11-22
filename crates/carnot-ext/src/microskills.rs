@@ -201,15 +201,18 @@ fn parse_skill_frontmatter(raw: &str) -> (Option<String>, Option<String>) {
     (name, desc)
 }
 
-/// Discovers open Agent Skills (`<dir>/<skill>/SKILL.md`) in standard workspace paths
 /// Discovers Agent Skills (`<skill>/SKILL.md`) under workspace directories
-/// (`.agents/skills`, `.claude/skills`) and any explicit `--skills-dir` directories.
+/// (`.agents/skills`, `.claude/skills`), user-global `~/.carnot/skills`, and any explicit
+/// `--skills-dir` directories.
 /// Returns `(name, display_path, description)` tuples in deterministic sorted order.
 pub fn discover_agent_skills(root: &Path, extra_dirs: &[PathBuf]) -> Vec<(String, String, String)> {
     let mut search_roots: Vec<(PathBuf, bool)> = vec![
         (root.join(".agents").join("skills"), false),
         (root.join(".claude").join("skills"), false),
     ];
+    if let Some(home) = std::env::var_os("HOME") {
+        search_roots.push((PathBuf::from(home).join(".carnot").join("skills"), true));
+    }
     for d in extra_dirs {
         search_roots.push((d.clone(), true));
     }
@@ -283,7 +286,7 @@ fn load_agent_skills(root: &Path, extra_dirs: &[PathBuf]) -> Option<String> {
             .map(|(name, disp_path, desc)| format!("- {name} ({disp_path}): {desc}"))
             .collect();
         Some(format!(
-            "[agent-skills]\nRead a skill's SKILL.md with `Read` when relevant:\n{}",
+            "[agent-skills]\nRead a skill's SKILL.md with `Read` when relevant; resolve relative paths inside a skill against that skill's directory:\n{}",
             entries.join("\n")
         ))
     }

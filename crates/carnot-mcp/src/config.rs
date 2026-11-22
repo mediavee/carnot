@@ -59,6 +59,9 @@ pub struct StdioServerConfig {
     /// When true (default), server is only spawned on first `tools/call` if disk schema cache is warm.
     #[serde(default = "default_true")]
     pub lazy: bool,
+    /// Optional one-line summary advertised in the Turn-1 deferred-tools directory.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +81,9 @@ pub struct HttpServerConfig {
     pub trusted: bool,
     #[serde(default = "default_true")]
     pub lazy: bool,
+    /// Optional one-line summary advertised in the Turn-1 deferred-tools directory.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Set automatically when loaded from a workspace `.mcp.json` (enforces SSRF per server — fixes Opus #5!).
     #[serde(skip)]
     pub from_workspace: bool,
@@ -129,6 +135,14 @@ impl McpServerConfig {
             Self::Stdio(s) => s.timeout_ms.clamp(1_000, 600_000),
             Self::Http(h) => h.timeout_ms.clamp(1_000, 600_000),
         }
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        let raw = match self {
+            Self::Stdio(s) => s.description.as_deref(),
+            Self::Http(h) => h.description.as_deref(),
+        };
+        raw.map(str::trim).filter(|s| !s.is_empty())
     }
 
     /// Canonical BLAKE3 fingerprint of this server config (used for MCPoison trust-pinning & schema cache).
@@ -364,6 +378,136 @@ fn merge_file(
     Ok(())
 }
 
+fn parse_acp_kv_pairs(val: Option<&serde_json::Value>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(v) = val else {
+        return out;
+    };
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            let Some(k) = item
+                .get("name")
+                .or_else(|| item.get("key"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if let Some(val_s) = item.get("value").and_then(serde_json::Value::as_str) {
+                out.insert(k.to_string(), val_s.to_string());
+            }
+        }
+    } else if let Some(obj) = v.as_object() {
+        for (k, val_v) in obj {
+            if let Some(val_s) = val_v.as_str() {
+                out.insert(k.clone(), val_s.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Parses ACP `session/new` / `session/load` `mcpServers` wire entries into validated Carnot
+/// [`McpServerConfig`] entries (supports `stdio`, `http`/`streamable-http`, and `sse`).
+/// Invalid entries are logged and skipped so one bad entry never breaks session startup.
+pub fn parse_acp_mcp_servers(
+    entries: &[serde_json::Value],
+    session_cwd: &Path,
+) -> BTreeMap<String, McpServerConfig> {
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let Some(name) = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let description = entry
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let kind = entry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase);
+
+        let mut cfg = if let Some(url) = entry
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && !matches!(kind.as_deref(), Some("stdio"))
+        {
+            let transport = match kind.as_deref() {
+                Some("sse") => Some("sse".to_string()),
+                Some("http" | "streamable-http" | "streamable_http") => Some("http".to_string()),
+                _ => None,
+            };
+            McpServerConfig::Http(HttpServerConfig {
+                url: url.to_string(),
+                transport,
+                headers: parse_acp_kv_pairs(entry.get("headers")),
+                timeout_ms: default_timeout_ms(),
+                enabled: true,
+                trusted: true,
+                lazy: true,
+                description,
+                from_workspace: false,
+            })
+        } else if let Some(command) = entry
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let args: Vec<String> = entry
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cwd = entry
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| Some(session_cwd.to_path_buf()));
+            McpServerConfig::Stdio(StdioServerConfig {
+                command: command.to_string(),
+                args,
+                env: parse_acp_kv_pairs(entry.get("env")),
+                cwd,
+                timeout_ms: default_timeout_ms(),
+                enabled: true,
+                trusted: true,
+                lazy: true,
+                description,
+            })
+        } else {
+            tracing::warn!(server = %name, "ignoring ACP mcpServers entry missing command/url");
+            continue;
+        };
+
+        if let Err(e) = validate_server_config(name, &mut cfg, false) {
+            tracing::warn!(server = %name, error = %e, "ignoring invalid ACP mcpServers entry");
+            continue;
+        }
+        out.insert(name.to_string(), cfg);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +523,7 @@ mod tests {
             enabled: true,
             trusted: false,
             lazy: true,
+            description: None,
         });
         assert!(validate_server_config("evil", &mut rel, true).is_err());
 
@@ -393,7 +538,51 @@ mod tests {
             enabled: true,
             trusted: false,
             lazy: true,
+            description: None,
         });
         assert!(validate_server_config("dyld", &mut dyld, false).is_err());
+    }
+
+    #[test]
+    fn parse_acp_mcp_servers_handles_stdio_and_http_wire_shapes() {
+        let entries = vec![
+            serde_json::json!({
+                "name": "t3-code",
+                "type": "http",
+                "url": "http://127.0.0.1:4123/mcp",
+                "headers": [{"name": "Authorization", "value": "Bearer tok"}],
+                "description": "T3 Code workspace tools"
+            }),
+            serde_json::json!({
+                "name": "local-tool",
+                "command": "node",
+                "args": ["server.js"],
+                "env": [{"name": "FOO", "value": "bar"}]
+            }),
+            serde_json::json!({ "name": "broken" }),
+        ];
+        let parsed = parse_acp_mcp_servers(&entries, Path::new("/tmp/ws"));
+        assert_eq!(parsed.len(), 2);
+        match parsed.get("t3-code").expect("t3-code server") {
+            McpServerConfig::Http(h) => {
+                assert_eq!(h.url, "http://127.0.0.1:4123/mcp");
+                assert_eq!(
+                    h.headers.get("Authorization").map(String::as_str),
+                    Some("Bearer tok")
+                );
+                assert_eq!(h.description.as_deref(), Some("T3 Code workspace tools"));
+                assert!(!h.from_workspace);
+            }
+            _ => panic!("expected http"),
+        }
+        match parsed.get("local-tool").expect("local-tool server") {
+            McpServerConfig::Stdio(s) => {
+                assert_eq!(s.command, "node");
+                assert_eq!(s.args, vec!["server.js"]);
+                assert_eq!(s.env.get("FOO").map(String::as_str), Some("bar"));
+                assert_eq!(s.cwd.as_deref(), Some(Path::new("/tmp/ws")));
+            }
+            _ => panic!("expected stdio"),
+        }
     }
 }

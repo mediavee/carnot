@@ -349,6 +349,7 @@ async fn collect_git_facts(ws: std::path::PathBuf) -> WorkspaceGitFacts {
 async fn try_semantic_llm_handoff(
     config: &CarnotConfig,
     provider: &Arc<dyn Provider>,
+    tools: &ToolRegistry,
     session: &Mutex<SessionStore>,
     custom_focus: Option<&str>,
     cancel: CancellationToken,
@@ -381,10 +382,14 @@ async fn try_semantic_llm_handoff(
         // Reuse the warm conversation prefix verbatim (`system`, `tools`, `messages`, `cache_ttl`)
         // with `skip_tail_cache_write: true` so the existing prefix hits at 0.05x while the
         // discarded tail + compaction request pays 1.0x instead of 1.25x/2.0x cache-write.
+        let wire_tools = crate::tool_search::effective_tools_for_provider(
+            &tools.specs(),
+            provider.supports_native_tool_search(),
+        );
         ProviderRequest {
             model: config.model.clone(),
             static_system_prompt: proj.static_system_prompt,
-            tools: proj.tools,
+            tools: wire_tools,
             prefix_hash: proj.prefix_hash,
             session_id: s.session_id.clone(),
             messages: msgs,
@@ -558,6 +563,7 @@ pub(crate) async fn execute_compaction(
         if let Some((text, usage)) = try_semantic_llm_handoff(
             config,
             provider,
+            tools,
             session,
             effective_focus.as_deref(),
             cancel,
