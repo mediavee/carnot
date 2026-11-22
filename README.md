@@ -23,10 +23,10 @@
 ## Why Carnot
 
 - **Fastest wire-to-wire startup & lowest footprint** — `7.4 ms` median to first HTTP request (`9.5 ms` p95), `10.3 MiB` peak RSS, `13.0 MB` stripped binary.
-- **97.0% prompt cache hit at scale** — byte-identical static prefix (`carnot audit-prefix`), Hybrid `1h`/`5m` cache breakpoints, and Turn-1-only workspace/skills injection (`AGENTS.md`, `CLAUDE.md`, `SKILL.md`).
-- **5 surgical tools, zero context bloat** — `Read` (multimodal images, tree-sitter symbols/outlines, diff-on-reread), `Edit` (atomic line-range + 4-tier resilient patch + CAS undo + tree-sitter syntax guard), `Write`, `Grep`, and `Bash` (adaptive-yield job registry, lazy zero-I/O CAS spill, semantic compressors with 100% diagnostic recall).
+- **97.6%+ prompt cache hit & two-tier cache-warm compaction** — byte-identical static prefix (`carnot audit-prefix`), Hybrid `1h`/`5m` cache breakpoints, Turn-1-only workspace/skills injection (`AGENTS.md`, `CLAUDE.md`, `SKILL.md`), and high-recall semantic compaction that preserves the verbatim user objective, recent tail, CAS handles, and verified workspace state while reusing the warm prompt cache.
+- **5 surgical tools, zero context bloat** — `Read` (multimodal images, tree-sitter symbols/outlines, diff-on-reread), `Edit` (atomic line-range + 4-tier resilient patch + CAS undo + tree-sitter syntax guard), `Write`, `Grep`, and `Bash` (confined `cwd`, adaptive-yield job registry, lazy zero-I/O CAS spill, semantic compressors with 100% diagnostic recall).
 - **Zero-hardcode modular providers** — protocol adapters (`anthropic-messages`, `openai-completions`, `openai-responses`, `google-generative`, `google-cloudcode`, `subprocess-jsonl`, `faux`) driven purely by [`providers.json`](crates/carnot-ai/catalog/providers.json) + `webpki-root-certs` TLS fallback.
-- **Full MCP & production surfaces** — MCP `2026-07-28`, `2025-11-25`, and Legacy HTTP+SSE `2024-11-05` (`defer_loading: true` = 0 static tokens), fail-closed macOS Seatbelt / Linux `bwrap`, ACP stdio, Host RPC, Bearer-auth HTTP/SSE server, `carnot doctor`, `SIGINT`/`SIGTERM` cleanup, and `--max-turns` / `--max-cost-usd` / `--timeout` guardrails.
+- **Interactive REPL, full MCP & production surfaces** — interactive terminal REPL (`/compact`, `/undo`, `/cost`, Ctrl+C turn abort), MCP `2026-07-28` / `2025-11-25` / Legacy HTTP+SSE `2024-11-05` (`defer_loading: true` = 0 static tokens), fail-closed macOS Seatbelt / Linux `bwrap`, ACP stdio, Host RPC, Bearer-auth HTTP/SSE server, `carnot doctor`, `SIGINT`/`SIGTERM` cleanup, and `--max-turns` / `--max-cost-usd` / `--compact-at` / `--timeout` guardrails.
 
 ## Benchmarks
 
@@ -43,10 +43,18 @@
 | Pi (TS/Node) | 462.5 ms | 530.2 ms | 488.9 ms | 159.4 MiB | 238.1 MB | 1 399 tok | No | 18.42 KB |
 | OpenCode (Bun/TS) | 545.9 ms | 586.0 ms | 652.7 ms | 528.7 MiB | 215.3 MB | 9 644 tok | No | 18.40 KB |
 
-### Terminal-Bench 4 (`62 / 63` CPU tasks · `claude-opus-5-5` · `effort=medium` · [`results_tb4_carnot_v6_opus55.json`](benchmarks/results_tb4_carnot_v6_opus55.json))
+### Terminal-Bench 4 (`claude-opus-5-5` · official `1.0x` timeout · `effort=max` · [`results_tb4_carnot_v8_opus55_max.json`](benchmarks/results_tb4_carnot_v8_opus55_max.json))
 
-- **Pass rate:** `30 / 62` (`48.39%`, 80m cap; **Media `75%`**, **ML `62.5%`**, **Hardware `60%`**, **Software `58.8%`**)
-- **Efficiency:** **`97.00%` aggregate prompt cache hit** (`228.1M / 235.1M` tokens), **`122 / 122` (`100%`) first-try `Edit` accuracy**, **`$2.33` mean cost/task**, **`0` harness crashes**.
+Measured on `41 / 62` CPU tasks (native Linux `x86_64`, dedicated 8 vCPU / 16 GB RAM per task, identical `effort=max` & `1.0x` timeout vs public [Unharnessed](https://unharnessed.dev/run) & Claude Code baselines on the same tasks):
+
+| Harness (`Opus 5.5` · `effort=max`) | Raw (41 tasks) | Ex-gateway Turn-1 refusals (38 tasks) | Mean Cost | Prompt Cache Hit | First-Try `Edit` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Carnot** | **24 / 41 (58.5%)** | **24 / 38 (63.2%)** | **$9.56** | **97.63%** | **258 / 258 (100%)** |
+| Unharnessed (public) | 27 / 41 (65.9%) | 25 / 38 (65.8%) | $9.64 | — | — |
+| Claude Code (public) | — | — | $11.73 | 96.91% | — |
+
+- Ties Unharnessed head-to-head on **Software (`7/11`)**, **Hardware (`3/4`)**, **Media (`3/3`)**, and **ML (`1/3`)** while costing **18.5% less than Claude Code** with **0 harness crashes**.
+- Full `62 / 62` CPU sweep at `effort=medium` (80m cap): `30 / 62` (`48.4%`), `97.00%` cache hit, `122 / 122` (`100%`) `Edit`, `$2.33` mean cost ([`results_tb4_carnot_v6_opus55.json`](benchmarks/results_tb4_carnot_v6_opus55.json)).
 
 ## Quick Start
 
@@ -56,9 +64,12 @@ cargo build --release --bin carnot
 ./target/release/carnot doctor
 ./target/release/carnot audit-prefix
 
+# Interactive terminal REPL (`/compact`, `/undo`, `/cost`, `/exit`)
+ANTHROPIC_API_KEY=... carnot --model claude-opus-5-5 --effort high
+
 # One-shot with production guardrails
 ANTHROPIC_API_KEY=... carnot --model claude-opus-5-5 --effort medium \
-  --max-turns 80 --max-cost-usd 5.0 --timeout 1800 \
+  --max-turns 80 --max-cost-usd 5.0 --compact-at 220000 --timeout 1800 \
   -p "Fix the failing integration tests"
 
 # Prompt from file (safe from /proc/<pid>/cmdline) or stdin
