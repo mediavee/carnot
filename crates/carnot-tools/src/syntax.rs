@@ -116,7 +116,7 @@ fn collect_outline_items(
     depth: usize,
     out: &mut Vec<String>,
 ) {
-    if depth > 2 || out.len() >= 250 {
+    if depth > 3 || out.len() >= 250 {
         return;
     }
     let kind = node.kind();
@@ -171,10 +171,12 @@ pub fn find_symbol_ranges(path: &Path, src: &str, query: &str) -> Vec<(usize, us
     let Some(tree) = parser.parse(src, None) else {
         return Vec::new();
     };
-    let (want_parent, want_leaf) = if let Some((p, m)) = query.split_once("::") {
-        (Some(p.trim()), m.trim())
-    } else if let Some((p, m)) = query.split_once('.') {
-        (Some(p.trim()), m.trim())
+    let (want_parent, want_leaf) = if let Some((p, m)) = query.rsplit_once("::") {
+        let parent = p.rsplit("::").next().unwrap_or(p).trim();
+        (Some(parent), m.trim())
+    } else if let Some((p, m)) = query.rsplit_once('.') {
+        let parent = p.rsplit('.').next().unwrap_or(p).trim();
+        (Some(parent), m.trim())
     } else {
         (None, query.trim())
     };

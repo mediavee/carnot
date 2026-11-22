@@ -28,6 +28,10 @@ pub fn strict_test_runner_regex() -> &'static Regex {
 }
 
 pub fn is_verified_test_command(cmd: &str) -> bool {
+    let low = cmd.to_ascii_lowercase();
+    if low.contains("--no-run") || low.contains("--collect-only") {
+        return false;
+    }
     strict_test_runner_regex().is_match(cmd)
 }
 
@@ -72,18 +76,6 @@ impl RewindReceiptModule {
             assumed_reread_frac,
             rewinds_applied: AtomicU32::new(0),
         }
-    }
-
-    fn git_diff_stat(&self) -> Option<String> {
-        let out = carnot_sandbox::host_safe_git_command(&self.workspace_root)
-            .args(["diff", "--stat"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
     }
 
     /// Assembles a 100% deterministic, zero-LLM-cost receipt containing everything the model
@@ -167,7 +159,21 @@ impl Module for RewindReceiptModule {
                 return Ok(BoundaryAction::Continue);
             }
 
-            let diff_stat = self.git_diff_stat();
+            let ws = self.workspace_root.clone();
+            let diff_stat = tokio::task::spawn_blocking(move || {
+                let out = carnot_sandbox::host_safe_git_command(&ws)
+                    .args(["diff", "--stat"])
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            })
+            .await
+            .ok()
+            .flatten();
             // Require non-empty diff (either git diff or explicit edited files outside git)
             if diff_stat.is_none() && snap.files_edited_in_segment.is_empty() {
                 return Ok(BoundaryAction::Continue);

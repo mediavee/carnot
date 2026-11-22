@@ -70,6 +70,9 @@ pub struct ProviderRequest {
     pub static_system_prompt: String,
     pub tools: Vec<ToolSpec>,
     pub prefix_hash: String,
+    /// Stable session identifier used to isolate per-session provider cache keys (`prompt_cache_key`,
+    /// `session_id_header`) so concurrent sessions with the same static prefix never collide.
+    pub session_id: String,
     pub messages: Vec<Arc<Message>>,
     pub checkpoint_index: Option<usize>,
     pub cache_ttl: CacheTtl,
@@ -102,6 +105,8 @@ pub enum StreamEvent {
         message: String,
         retryable: bool,
     },
+    /// Mid-stream context-window overflow signaled over SSE (routed directly to emergency compaction).
+    ContextOverflow(String),
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

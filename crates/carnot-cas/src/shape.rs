@@ -259,7 +259,9 @@ fn compress_cargo(cleaned: &str) -> Option<(String, &'static str)> {
             in_diag_block = false;
             continue;
         }
-        if trim.starts_with("test ") && trim.ends_with("... ok") && !in_failures_section {
+        if ((trim.starts_with("test ") && trim.ends_with("... ok")) || trim.starts_with("PASS ["))
+            && !in_failures_section
+        {
             passed_tests += 1;
             in_diag_block = false;
             continue;
@@ -271,7 +273,7 @@ fn compress_cargo(cleaned: &str) -> Option<(String, &'static str)> {
             kept_priority.push(line);
             continue;
         }
-        if trim.starts_with("test result:") {
+        if trim.starts_with("test result:") || trim.starts_with("Summary [") {
             in_failures_section = false;
             in_diag_block = false;
             kept_priority.push(line);
@@ -283,6 +285,7 @@ fn compress_cargo(cleaned: &str) -> Option<(String, &'static str)> {
         }
         if trim.starts_with("error")
             || trim.starts_with("FAILED")
+            || trim.starts_with("FAIL [")
             || (trim.starts_with("test ") && trim.contains("FAILED"))
         {
             in_diag_block = true;
@@ -525,15 +528,27 @@ pub fn shape_command_output(
     let raw_bytes = raw.len();
     let cleaned = clean_terminal_noise(raw);
 
-    // Without a CAS backing store, NEVER perform lossy compression or aggressive truncation (Opus #15!)
+    // Without a CAS backing store, keep head + tail (8 KiB + 24 KiB) so failure diagnostics at
+    // the end of long build/test logs are preserved cleanly (Opus #15).
     let Some(cas) = store else {
         const NO_CAS_WIRE_CAP: usize = 32 * 1024;
+        const NO_CAS_HEAD: usize = 8 * 1024;
+        const NO_CAS_TAIL: usize = 24 * 1024;
         let out = if cleaned.len() > NO_CAS_WIRE_CAP {
-            let mut end = NO_CAS_WIRE_CAP;
-            while end > 0 && !cleaned.is_char_boundary(end) {
-                end -= 1;
+            let mut h = NO_CAS_HEAD.min(cleaned.len());
+            while h > 0 && !cleaned.is_char_boundary(h) {
+                h -= 1;
             }
-            format!("{}\n[truncated at 32 KiB (CAS disabled)]", &cleaned[..end])
+            let mut t = cleaned.len().saturating_sub(NO_CAS_TAIL);
+            while t < cleaned.len() && !cleaned.is_char_boundary(t) {
+                t += 1;
+            }
+            let omitted = t.saturating_sub(h);
+            format!(
+                "{}\n[... {omitted} bytes omitted (CAS disabled; keeping head + tail) ...]\n{}",
+                &cleaned[..h],
+                &cleaned[t..]
+            )
         } else {
             cleaned
         };

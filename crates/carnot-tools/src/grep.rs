@@ -64,7 +64,7 @@ impl Tool for GrepTool {
     fn execute(
         &self,
         input: Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<ToolOutput>> {
         let ws = self.workspace_root.clone();
         let extra = self.extra_roots.clone();
@@ -130,6 +130,7 @@ impl Tool for GrepTool {
                         &ws,
                         &extra,
                         ext_filter.as_deref(),
+                        &cancel,
                         &mut visited,
                         &mut visited_dirs,
                         &mut files,
@@ -137,11 +138,17 @@ impl Tool for GrepTool {
                 } else {
                     return Ok(ToolOutput::err_text(format!("Path not found: {raw_path}")));
                 }
+                if cancel.is_cancelled() {
+                    return Ok(ToolOutput::err_text("Grep cancelled"));
+                }
                 files.sort();
 
                 let mut matches: Vec<String> = Vec::new();
                 let mut truncated = false;
                 for file in &files {
+                    if cancel.is_cancelled() {
+                        return Ok(ToolOutput::err_text("Grep cancelled"));
+                    }
                     let Ok(meta) = fs::metadata(file) else {
                         continue;
                     };
@@ -182,11 +189,19 @@ impl Tool for GrepTool {
                     }
                 }
 
+                let scan_capped = visited >= MAX_FILES_VISITED;
                 if matches.is_empty() {
-                    return Ok(ToolOutput::ok_text(format!(
-                        "[no matches for `{pattern}` in {raw_path}]"
-                    ))
-                    .with_details(json!({"matches": 0, "files_scanned": files.len()})));
+                    let mut msg = format!("[no matches for `{pattern}` in {raw_path}]");
+                    if scan_capped {
+                        msg.push_str(&format!(
+                            "\n[warning: file scan capped at {MAX_FILES_VISITED} files — narrow `path` or `ext`]"
+                        ));
+                    }
+                    return Ok(ToolOutput::ok_text(msg).with_details(json!({
+                        "matches": 0,
+                        "files_scanned": files.len(),
+                        "scan_capped": scan_capped,
+                    })));
                 }
 
                 let mut out = matches.join("\n");
@@ -195,10 +210,16 @@ impl Tool for GrepTool {
                         "\n[truncated at {limit} matches — narrow `path`/`ext` or increase `limit`]"
                     ));
                 }
+                if scan_capped {
+                    out.push_str(&format!(
+                        "\n[warning: file scan capped at {MAX_FILES_VISITED} files — narrow `path` or `ext`]"
+                    ));
+                }
                 Ok(ToolOutput::ok_text(out).with_details(json!({
                     "matches": matches.len(),
                     "truncated": truncated,
                     "files_scanned": files.len(),
+                    "scan_capped": scan_capped,
                 })))
             })
             .await
@@ -210,16 +231,18 @@ impl Tool for GrepTool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_files(
     dir: &Path,
     ws: &Path,
     extra: &[PathBuf],
     ext_filter: Option<&str>,
+    cancel: &CancellationToken,
     visited: &mut usize,
     visited_dirs: &mut HashSet<PathBuf>,
     out: &mut Vec<PathBuf>,
 ) {
-    if *visited >= MAX_FILES_VISITED {
+    if *visited >= MAX_FILES_VISITED || cancel.is_cancelled() {
         return;
     }
     let canon_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -254,7 +277,16 @@ fn collect_files(
             if SKIP_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
-            collect_files(&path, ws, extra, ext_filter, visited, visited_dirs, out);
+            collect_files(
+                &path,
+                ws,
+                extra,
+                ext_filter,
+                cancel,
+                visited,
+                visited_dirs,
+                out,
+            );
         } else if is_file {
             *visited += 1;
             if let Some(want_ext) = ext_filter {

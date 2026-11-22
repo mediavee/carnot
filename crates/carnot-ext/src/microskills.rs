@@ -139,7 +139,8 @@ fn load_repo_instructions(root: &Path) -> Option<String> {
 fn parse_skill_frontmatter(raw: &str) -> (Option<String>, Option<String>) {
     let mut name: Option<String> = None;
     let mut desc: Option<String> = None;
-    let trimmed = raw.trim_start();
+    let normalized = raw.replace("\r\n", "\n");
+    let trimmed = normalized.trim_start();
     if let Some(rest) = trimmed.strip_prefix("---")
         && let Some(end) = rest.find("\n---")
     {
@@ -399,8 +400,12 @@ impl Module for ExecMicroSkillsModule {
 
                 let userland = if cfg!(target_os = "macos") {
                     "macOS (BSD userland: `sed -i ''`, no GNU-only flags)"
-                } else {
+                } else if cfg!(target_os = "windows") {
+                    "Windows"
+                } else if cfg!(target_os = "linux") {
                     "Linux (GNU userland)"
+                } else {
+                    std::env::consts::OS
                 };
                 facts.push(format!("platform: {userland}"));
 

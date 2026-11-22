@@ -9,12 +9,15 @@
 
 use crate::anthropic::find_sse_frame_end;
 use crate::catalog::ResolvedProviderSpec;
-use crate::compat::{can_replay_origin, is_retryable_status, parse_retry_after_ms};
+use crate::compat::{
+    can_replay_origin, is_context_overflow, is_retryable_status, parse_retry_after_ms, repair_json,
+    session_cache_key,
+};
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role, StopReason,
-    ToolResultBlock, Usage,
+    CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role,
+    StopReason, ToolResultBlock, Usage,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -217,15 +220,27 @@ impl OpenAiResponsesProvider {
             if compat.supports_prompt_cache_key.unwrap_or(true) {
                 m.insert(
                     "prompt_cache_key".into(),
-                    json!(&req.prefix_hash[..16.min(req.prefix_hash.len())]),
+                    json!(session_cache_key(&req.prefix_hash, &req.session_id)),
                 );
             }
+            if compat.supports_prompt_cache_retention.unwrap_or(false)
+                && matches!(req.cache_ttl, CacheTtl::Long1h | CacheTtl::Hybrid)
+            {
+                m.insert("prompt_cache_retention".into(), json!("24h"));
+            }
             if compat.supports_reasoning_effort.unwrap_or(true) {
+                let allow_xhigh = compat.supports_xhigh_reasoning.unwrap_or(false);
                 let effort_str = match req.effort {
                     ReasoningEffort::Low => "low",
                     ReasoningEffort::Medium => "medium",
                     ReasoningEffort::High => "high",
-                    ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
+                    ReasoningEffort::Xhigh | ReasoningEffort::Max => {
+                        if allow_xhigh {
+                            "xhigh"
+                        } else {
+                            "high"
+                        }
+                    }
                 };
                 m.insert("reasoning".into(), json!({ "effort": effort_str }));
             }
@@ -260,10 +275,11 @@ impl Provider for OpenAiResponsesProvider {
             for (k, v) in &self.spec.headers {
                 rb = rb.header(k.as_str(), v.as_str());
             }
-            if let Some(ref hdr) = self.spec.compat.session_id_header {
+            let compat = self.spec.effective_compat(&request.model);
+            if let Some(ref hdr) = compat.session_id_header {
                 rb = rb.header(
                     hdr.as_str(),
-                    &request.prefix_hash[..16.min(request.prefix_hash.len())],
+                    session_cache_key(&request.prefix_hash, &request.session_id),
                 );
             }
 
@@ -286,8 +302,7 @@ impl Provider for OpenAiResponsesProvider {
             if !status.is_success() {
                 let retry_after_ms = parse_retry_after_ms(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                let lower = text.to_ascii_lowercase();
-                if lower.contains("context_length_exceeded") || lower.contains("maximum context") {
+                if is_context_overflow(Some(status.as_u16()), &text) {
                     return Err(CarnotError::ContextOverflow(text));
                 }
                 return Err(CarnotError::Provider {
@@ -487,7 +502,15 @@ impl Provider for OpenAiResponsesProvider {
                                     if resp_obj.get("status").and_then(Value::as_str)
                                         == Some("incomplete")
                                     {
-                                        stop_reason = StopReason::MaxTokens;
+                                        let reason = resp_obj
+                                            .pointer("/incomplete_details/reason")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("");
+                                        stop_reason = if reason == "content_filter" {
+                                            StopReason::Refusal
+                                        } else {
+                                            StopReason::MaxTokens
+                                        };
                                     }
                                 }
                             }
@@ -502,6 +525,11 @@ impl Provider for OpenAiResponsesProvider {
                                     .or_else(|| v.pointer("/error/message"))
                                     .and_then(Value::as_str)
                                     .unwrap_or("responses stream error");
+                                let full_msg = format!("{code}: {msg}");
+                                if is_context_overflow(None, &full_msg) {
+                                    let _ = tx.send(StreamEvent::ContextOverflow(full_msg)).await;
+                                    return;
+                                }
                                 let retryable = !matches!(
                                     code,
                                     "invalid_request_error"
@@ -511,7 +539,7 @@ impl Provider for OpenAiResponsesProvider {
                                 );
                                 let _ = tx
                                     .send(StreamEvent::Error {
-                                        message: format!("{code}: {msg}"),
+                                        message: full_msg,
                                         retryable,
                                     })
                                     .await;
@@ -586,13 +614,16 @@ fn parse_tool_args_json(args: &str) -> (Value, Option<String>) {
     let trimmed = args.trim();
     if trimmed.is_empty() {
         (json!({}), None)
+    } else if let Some(v) = repair_json(trimmed) {
+        (v, None)
     } else {
-        match serde_json::from_str::<Value>(trimmed) {
-            Ok(v) => (v, None),
-            Err(e) => (
-                json!({}),
-                Some(format!("malformed tool JSON ({e}): {trimmed}")),
-            ),
-        }
+        let err = serde_json::from_str::<Value>(trimmed)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "invalid JSON".into());
+        (
+            json!({}),
+            Some(format!("malformed tool JSON ({err}): {trimmed}")),
+        )
     }
 }

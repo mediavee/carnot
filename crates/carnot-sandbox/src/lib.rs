@@ -164,8 +164,10 @@ pub fn build_sandboxed_shell_in_dir(
     let mut cmd = if policy.enabled {
         if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
             build_macos_seatbelt_command(policy, shell_cmd)
-        } else if cfg!(target_os = "linux") && Path::new("/usr/bin/bwrap").exists() {
-            build_linux_bwrap_command(policy, shell_cmd, cwd)
+        } else if cfg!(target_os = "linux")
+            && let Some(bwrap_bin) = resolve_bwrap_binary()
+        {
+            build_linux_bwrap_command(&bwrap_bin, policy, shell_cmd, cwd)
         } else {
             return Err(
                 "OS sandbox requested (`sandbox: true`) but no supported kernel sandbox (macOS sandbox-exec / Linux bwrap) is available on this host (pass `--no-sandbox` to explicitly disable)"
@@ -243,9 +245,12 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
            (subpath (param \"DENY_DOCKER\"))\n\
            (subpath (param \"DENY_KUBE\"))\n\
            (literal (param \"DENY_NETRC\"))\n\
+           (literal (param \"DENY_GIT_CREDS\"))\n\
            (literal (param \"DENY_NPMRC\"))\n\
            (literal (param \"DENY_CARGO_CREDS\"))\n\
-           (literal (param \"DENY_CARGO_CREDS_TOML\")))\n\
+           (literal (param \"DENY_CARGO_CREDS_TOML\"))\n\
+           (subpath (param \"DENY_GCLOUD\"))\n\
+           (literal (param \"DENY_CARNOT_TOKEN\")))\n\
          (allow file-write* (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
          (allow file-write* (require-all (subpath (param \"WORKSPACE\")) (require-not (subpath (param \"WS_DOT_GIT\")))))\n",
     );
@@ -293,6 +298,10 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
         .arg(format!("DENY_KUBE={}", home.join(".kube").display()));
     c.arg("-D")
         .arg(format!("DENY_NETRC={}", home.join(".netrc").display()));
+    c.arg("-D").arg(format!(
+        "DENY_GIT_CREDS={}",
+        home.join(".git-credentials").display()
+    ));
     c.arg("-D")
         .arg(format!("DENY_NPMRC={}", home.join(".npmrc").display()));
     c.arg("-D").arg(format!(
@@ -302,6 +311,14 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
     c.arg("-D").arg(format!(
         "DENY_CARGO_CREDS_TOML={}",
         home.join(".cargo/credentials.toml").display()
+    ));
+    c.arg("-D").arg(format!(
+        "DENY_GCLOUD={}",
+        home.join(".config/gcloud").display()
+    ));
+    c.arg("-D").arg(format!(
+        "DENY_CARNOT_TOKEN={}",
+        home.join(".carnot/server.token").display()
     ));
 
     for (idx, gdir) in policy.frozen_git_write_dirs.iter().enumerate() {
@@ -332,8 +349,27 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
 ///   - Fresh `--tmpfs /run`, `--tmpfs /tmp`, and `--tmpfs $XDG_RUNTIME_DIR`.
 ///   - Read-only `<ws>/.git` (C1), `--new-session` (blocks TIOCSTI), `--die-with-parent`, and
 ///     credential file/dir masking (`~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.cargo/credentials.toml`).
-fn build_linux_bwrap_command(policy: &SandboxPolicy, shell_cmd: &str, cwd: &Path) -> Command {
-    let mut c = Command::new("/usr/bin/bwrap");
+fn resolve_bwrap_binary() -> Option<PathBuf> {
+    for candidate in ["/usr/bin/bwrap", "/bin/bwrap"] {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("bwrap"))
+            .find(|p| p.is_file())
+    })
+}
+
+fn build_linux_bwrap_command(
+    bwrap_bin: &Path,
+    policy: &SandboxPolicy,
+    shell_cmd: &str,
+    cwd: &Path,
+) -> Command {
+    let mut c = Command::new(bwrap_bin);
     c.args(["--unshare-all", "--new-session", "--die-with-parent"]);
     if policy.allow_network {
         c.arg("--share-net");
@@ -353,6 +389,30 @@ fn build_linux_bwrap_command(policy: &SandboxPolicy, shell_cmd: &str, cwd: &Path
         }
     }
 
+    // Read-only language toolchain directories so `cargo`, `rustup`, `go`, `venv` work inside bwrap
+    // while keeping credentials strictly masked below.
+    let home_opt = std::env::var_os("HOME").map(PathBuf::from);
+    let mut ro_toolchains: Vec<PathBuf> = Vec::new();
+    for env_k in ["CARGO_HOME", "RUSTUP_HOME", "GOPATH", "VIRTUAL_ENV"] {
+        if let Some(v) = std::env::var_os(env_k)
+            && !v.is_empty()
+        {
+            ro_toolchains.push(PathBuf::from(v));
+        }
+    }
+    if let Some(ref home) = home_opt {
+        for rel in [".cargo", ".rustup"] {
+            ro_toolchains.push(home.join(rel));
+        }
+    }
+    let mut seen_ro = std::collections::HashSet::new();
+    for dir in ro_toolchains {
+        if dir.is_dir() && seen_ro.insert(dir.clone()) {
+            let s = dir.to_string_lossy().to_string();
+            c.args(["--ro-bind", &s, &s]);
+        }
+    }
+
     let ws = policy.workspace_root.to_string_lossy().to_string();
     c.args(["--bind", &ws, &ws]);
     let dot_git = policy.workspace_root.join(".git");
@@ -369,13 +429,14 @@ fn build_linux_bwrap_command(policy: &SandboxPolicy, shell_cmd: &str, cwd: &Path
         c.args(["--bind", &r, &r]);
     }
 
-    // Mask sensitive credential dirs & files under `$HOME` if `$HOME` is exposed via extra roots
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // Mask sensitive credential dirs & files under `$HOME` if `$HOME` or toolchains are exposed
+    if let Some(home) = home_opt {
         for rel in [
             ".ssh",
             ".aws",
             ".gnupg",
             ".config/gh",
+            ".config/gcloud",
             ".secrets",
             ".claude",
             ".codex",
@@ -394,6 +455,7 @@ fn build_linux_bwrap_command(policy: &SandboxPolicy, shell_cmd: &str, cwd: &Path
             ".npmrc",
             ".cargo/credentials.toml",
             ".cargo/credentials",
+            ".carnot/server.token",
             ".zshenv",
             ".zshrc",
         ] {

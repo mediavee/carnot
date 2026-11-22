@@ -100,7 +100,18 @@ impl Tool for SubagentTool {
             if let Some(m) = input.get("model").and_then(Value::as_str)
                 && !m.trim().is_empty()
             {
-                child_cfg.model = m.trim().to_string();
+                let overridden = m.trim().to_string();
+                if let Ok(cat) = carnot_ai::catalog::ProviderCatalog::embedded()
+                    && let Some(entry) = cat.find_model(&overridden)
+                {
+                    if let Some(cw) = entry.context_window {
+                        child_cfg.context_window = cw;
+                    }
+                    if let Some(mo) = entry.max_output_tokens {
+                        child_cfg.max_output_tokens = mo;
+                    }
+                }
+                child_cfg.model = overridden;
             }
 
             let mut fork_guard: Option<IsolatedForkWorktree> = None;
@@ -208,6 +219,11 @@ fn export_isolated_diff_to_parent_cas(
     child_ws: &std::path::Path,
     parent_ws: &std::path::Path,
 ) -> Option<String> {
+    // Stage intent-to-add inside this disposable worktree so newly created untracked files are
+    // included in `git diff --binary` before the worktree is removed!
+    let _ = carnot_sandbox::host_safe_git_command(child_ws)
+        .args(["add", "-N", "."])
+        .output();
     let out = carnot_sandbox::host_safe_git_command(child_ws)
         .args(["diff", "--binary"])
         .output()

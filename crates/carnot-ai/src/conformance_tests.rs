@@ -126,6 +126,7 @@ fn sample_request(model: &str, messages: Vec<Message>) -> ProviderRequest {
             defer_loading: false,
         }],
         prefix_hash: "0123456789abcdef0123456789abcdef".into(),
+        session_id: "test-session-1".into(),
         messages: messages.into_iter().map(Arc::new).collect(),
         checkpoint_index: Some(0),
         cache_ttl: CacheTtl::Hybrid,

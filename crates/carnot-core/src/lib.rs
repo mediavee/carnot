@@ -667,6 +667,38 @@ impl ModelPricing {
             Self::SONNET_5_5
         } else if m.contains("gpt-6") {
             Self::GPT_6_2_SOL
+        } else if m.contains("gpt-5") || m.contains("o3") || m.contains("o4") {
+            Self {
+                input_per_mtok: 2.50,
+                output_per_mtok: 10.0,
+                cache_read_mult: 0.10,
+                cache_write_5m_mult: 1.0,
+                cache_write_1h_mult: 1.0,
+            }
+        } else if m.contains("deepseek") {
+            Self {
+                input_per_mtok: 0.55,
+                output_per_mtok: 2.19,
+                cache_read_mult: 0.25,
+                cache_write_5m_mult: 1.0,
+                cache_write_1h_mult: 1.0,
+            }
+        } else if m.contains("grok") {
+            Self {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+                cache_read_mult: 0.25,
+                cache_write_5m_mult: 1.0,
+                cache_write_1h_mult: 1.0,
+            }
+        } else if m.contains("llama") {
+            Self {
+                input_per_mtok: 0.25,
+                output_per_mtok: 0.75,
+                cache_read_mult: 0.25,
+                cache_write_5m_mult: 1.0,
+                cache_write_1h_mult: 1.0,
+            }
         } else if m.contains("gemini") {
             Self::GEMINI_4_NEON
         } else {

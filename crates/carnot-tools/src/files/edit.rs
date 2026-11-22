@@ -487,15 +487,23 @@ pub(super) fn apply_resilient_hunk(
         } else {
             new_s
         };
-        let file_lines: Vec<&str> = content
-            .split('\n')
-            .map(|l| l.trim_end_matches('\r'))
-            .collect();
+        let has_trailing_nl = content.ends_with('\n');
+        let content_body = content
+            .strip_suffix("\r\n")
+            .or_else(|| content.strip_suffix('\n'))
+            .unwrap_or(content);
+        let file_lines: Vec<&str> = if content_body.is_empty() {
+            Vec::new()
+        } else {
+            content_body
+                .split('\n')
+                .map(|l| l.trim_end_matches('\r'))
+                .collect()
+        };
         let needle_lines: Vec<&str> = trimmed_old
             .split('\n')
             .map(|l| l.trim_end_matches('\r'))
             .collect();
-        let has_trailing_nl = content.ends_with('\n');
         let n_len = needle_lines.len();
 
         if n_len > 0 && n_len <= file_lines.len() {
@@ -507,10 +515,14 @@ pub(super) fn apply_resilient_hunk(
                 .collect();
             if rstrip_hits.len() == 1 {
                 let start = rstrip_hits[0];
-                let repl_lines: Vec<String> = trimmed_new
-                    .split('\n')
-                    .map(|l| l.trim_end_matches('\r').to_string())
-                    .collect();
+                let repl_lines: Vec<String> = if new_s.is_empty() {
+                    Vec::new()
+                } else {
+                    trimmed_new
+                        .split('\n')
+                        .map(|l| l.trim_end_matches('\r').to_string())
+                        .collect()
+                };
                 let rebuilt = splice_lines(
                     &file_lines,
                     start,
@@ -532,11 +544,15 @@ pub(super) fn apply_resilient_hunk(
                     .collect();
                 if trim_hits.len() == 1 {
                     let start = trim_hits[0];
-                    let repl_lines = reindent_replacement(
-                        &file_lines[start..start + n_len],
-                        &needle_lines,
-                        trimmed_new,
-                    );
+                    let repl_lines = if new_s.is_empty() {
+                        Vec::new()
+                    } else {
+                        reindent_replacement(
+                            &file_lines[start..start + n_len],
+                            &needle_lines,
+                            trimmed_new,
+                        )
+                    };
                     let rebuilt = splice_lines(
                         &file_lines,
                         start,
@@ -571,7 +587,7 @@ fn splice_lines(
     end: usize,
     repl: &[String],
     eol: &str,
-    _had_trailing_nl: bool,
+    had_trailing_nl: bool,
 ) -> String {
     let mut out: Vec<&str> = Vec::with_capacity(file_lines.len() - (end - start) + repl.len());
     out.extend_from_slice(&file_lines[..start]);
@@ -579,7 +595,11 @@ fn splice_lines(
         out.push(r.as_str());
     }
     out.extend_from_slice(&file_lines[end..]);
-    out.join(eol)
+    let mut joined = out.join(eol);
+    if had_trailing_nl && !joined.is_empty() {
+        joined.push_str(eol);
+    }
+    joined
 }
 
 fn leading_ws(s: &str) -> &str {
@@ -588,10 +608,13 @@ fn leading_ws(s: &str) -> &str {
 }
 
 fn reindent_replacement(matched_slice: &[&str], needle_lines: &[&str], new_s: &str) -> Vec<String> {
+    // Anchor on the minimum-indented non-empty pair so outer closing braces / `else` lines
+    // also get re-indented cleanly instead of failing `strip_prefix`.
     let (file_indent, needle_indent) = matched_slice
         .iter()
         .zip(needle_lines.iter())
-        .find(|(f, n)| !f.trim().is_empty() && !n.trim().is_empty())
+        .filter(|(f, n)| !f.trim().is_empty() && !n.trim().is_empty())
+        .min_by_key(|(_, n)| leading_ws(n).len())
         .map(|(f, n)| (leading_ws(f), leading_ws(n)))
         .unwrap_or(("", ""));
 

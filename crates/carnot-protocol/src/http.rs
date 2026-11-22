@@ -97,11 +97,21 @@ fn default_token_path() -> Option<PathBuf> {
 }
 
 fn write_token_0600(path: &PathBuf, token: &str) -> std::io::Result<()> {
-    std::fs::write(path, format!("{token}\n"))?;
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(format!("{token}\n").as_bytes())?;
+    f.sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
 }

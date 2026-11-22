@@ -28,19 +28,244 @@ pub fn json_merge_patch(target: &mut Value, patch: &Value) {
     }
 }
 
-/// Parses standard HTTP `retry-after` header (integer seconds) into milliseconds.
+/// Parses `retry-after-ms` or standard HTTP `retry-after` (integer/float seconds) into milliseconds.
 pub fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        return Some(ms.ceil() as u64);
+    }
     headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|secs| secs.saturating_mul(1000))
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|secs| (secs * 1000.0).ceil() as u64)
 }
 
 /// True if an HTTP status code is transient and safe to retry with backoff.
 #[inline]
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Exhaustive multi-provider context-window overflow classifier (covers HTTP 413, combined
+/// input+output ceilings, and 20+ gateway/provider messages while excluding TPM/rate-limit errors).
+pub fn is_context_overflow(status: Option<u16>, body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    // Never misclassify rate-limit / TPM throttling as context overflow (would trigger destructive compaction!)
+    const NON_OVERFLOW: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "throttl",
+        "too many requests",
+        "tokens per minute",
+        "requests per minute",
+        "please wait",
+        "quota exceeded",
+    ];
+    if NON_OVERFLOW.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+    if status == Some(413) {
+        return true;
+    }
+    const PATTERNS: &[&str] = &[
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "prompt is too long",
+        "maximum context length",
+        "exceeds the context window",
+        "exceeds context window",
+        "input tokens exceed",
+        "input token count",
+        "token count exceeds",
+        "request payload size exceeds",
+        "request_too_large",
+        "payload too large",
+        "too many tokens",
+        "too many input tokens",
+        "reduce the input length",
+        "reduce the length of the messages",
+        "accepts at most",
+        "exceeds the maximum number of tokens",
+        "max_prompt_tokens",
+        "input is too long",
+        "prompt exceeds",
+        "context length",
+        "sequence length",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Attempts strict JSON parsing first, then repairs common LLM tool-argument glitches
+/// (raw newlines/tabs inside strings, invalid regex escapes like `\s`/`\d`, trailing commas).
+pub fn repair_json(raw: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        return Some(v);
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(serde_json::json!({}));
+    }
+
+    // Pass 1: escape raw control chars & invalid backslash escapes inside JSON strings
+    let mut fixed = String::with_capacity(trimmed.len() + 16);
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if !in_str {
+            if ch == '"' {
+                in_str = true;
+            }
+            fixed.push(ch);
+            i += 1;
+        } else if ch == '\\' {
+            if let Some(&next) = chars.get(i + 1) {
+                match next {
+                    '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {
+                        fixed.push('\\');
+                        fixed.push(next);
+                        i += 2;
+                    }
+                    'u' if i + 5 < chars.len()
+                        && chars[i + 2..i + 6].iter().all(|c| c.is_ascii_hexdigit()) =>
+                    {
+                        for &c in &chars[i..i + 6] {
+                            fixed.push(c);
+                        }
+                        i += 6;
+                    }
+                    _ => {
+                        // Invalid JSON escape (e.g. `\s`, `\d`, `\w`, `\.`) -> double backslash
+                        fixed.push('\\');
+                        fixed.push('\\');
+                        fixed.push(next);
+                        i += 2;
+                    }
+                }
+            } else {
+                fixed.push('\\');
+                fixed.push('\\');
+                i += 1;
+            }
+        } else if ch == '"' {
+            in_str = false;
+            fixed.push(ch);
+            i += 1;
+        } else if ch == '\n' {
+            fixed.push_str("\\n");
+            i += 1;
+        } else if ch == '\r' {
+            fixed.push_str("\\r");
+            i += 1;
+        } else if ch == '\t' {
+            fixed.push_str("\\t");
+            i += 1;
+        } else {
+            fixed.push(ch);
+            i += 1;
+        }
+    }
+
+    if let Ok(v) = serde_json::from_str::<Value>(&fixed) {
+        return Some(v);
+    }
+
+    // Pass 2: strip trailing commas before `}` or `]` outside strings
+    let mut no_trailing = String::with_capacity(fixed.len());
+    let fchars: Vec<char> = fixed.chars().collect();
+    let mut j = 0usize;
+    let mut in_s = false;
+    let mut esc = false;
+    while j < fchars.len() {
+        let ch = fchars[j];
+        if in_s {
+            no_trailing.push(ch);
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_s = false;
+            }
+            j += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_s = true;
+            no_trailing.push(ch);
+            j += 1;
+            continue;
+        }
+        if ch == ',' {
+            let mut k = j + 1;
+            while k < fchars.len() && fchars[k].is_whitespace() {
+                k += 1;
+            }
+            if matches!(fchars.get(k), Some('}' | ']')) {
+                j += 1;
+                continue;
+            }
+        }
+        no_trailing.push(ch);
+        j += 1;
+    }
+    serde_json::from_str::<Value>(&no_trailing).ok()
+}
+
+fn fnv1a_hex(parts: &[&[u8]]) -> String {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0xaf63_dc4c_8601_ec8c;
+    for part in parts {
+        for &b in *part {
+            h1 ^= u64::from(b);
+            h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+            h2 ^= u64::from(b).wrapping_add(17);
+            h2 = h2.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h1 ^= 0xff;
+        h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h1:016x}{h2:016x}")
+}
+
+/// Sanitizes foreign tool call IDs to `[a-zA-Z0-9_-]{1,64}` deterministically for cross-provider replay.
+pub fn normalize_tool_call_id(raw: &str) -> String {
+    if !raw.is_empty()
+        && raw.len() <= 64
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return raw.to_string();
+    }
+    let digest = fnv1a_hex(&[raw.as_bytes()]);
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(40)
+        .collect();
+    if clean.is_empty() {
+        format!("tc_{}", &digest[..24])
+    } else {
+        format!("{clean}_{}", &digest[..16])
+    }
+}
+
+/// Derives a collision-free per-session routing/cache key combining static `prefix_hash` + `session_id`.
+pub fn session_cache_key(prefix_hash: &str, session_id: &str) -> String {
+    if session_id.is_empty() {
+        let end = prefix_hash.len().min(24);
+        return format!("carnot-{}", &prefix_hash[..end]);
+    }
+    let hex = fnv1a_hex(&[prefix_hash.as_bytes(), session_id.as_bytes()]);
+    format!("carnot-{}", &hex[..24])
 }
 
 /// True if a `ContentOrigin` belongs to the exact current `(api, provider, model)` tuple.
@@ -222,5 +447,59 @@ fn gemini_type_name(raw: &str) -> &'static str {
         "number" => "NUMBER",
         "boolean" => "BOOLEAN",
         _ => "STRING",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_overflow_detects_413_and_excludes_rate_limits() {
+        assert!(is_context_overflow(Some(413), "payload too large"));
+        assert!(is_context_overflow(
+            Some(400),
+            "This model accepts at most 200000 combined input and output tokens"
+        ));
+        assert!(is_context_overflow(
+            Some(400),
+            "input token count exceeds the maximum number of tokens allowed"
+        ));
+        // TPM / rate-limit errors must NEVER trigger destructive emergency compaction
+        assert!(!is_context_overflow(
+            Some(429),
+            "Throttling error: Too many tokens per minute, please wait"
+        ));
+        assert!(!is_context_overflow(
+            Some(429),
+            "rate_limit_error: tokens per minute exceeded"
+        ));
+    }
+
+    #[test]
+    fn repair_json_fixes_regex_escapes_raw_newlines_and_trailing_commas() {
+        let broken = "{\n  \"pattern\": \"foo\\s+\\d+\",\n  \"text\": \"line1\nline2\",\n}";
+        let v = repair_json(broken).expect("repaired");
+        assert_eq!(v["pattern"], r"foo\s+\d+");
+        assert_eq!(v["text"], "line1\nline2");
+    }
+
+    #[test]
+    fn normalize_tool_call_id_sanitizes_and_bounds_foreign_ids() {
+        assert_eq!(normalize_tool_call_id("toolu_01Ab-9"), "toolu_01Ab-9");
+        let weird = normalize_tool_call_id("call:foo/bar baz!@#");
+        assert!(weird.len() <= 64);
+        assert!(
+            weird
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        );
+    }
+
+    #[test]
+    fn session_cache_key_isolates_concurrent_sessions() {
+        let a = session_cache_key("same_prefix_hash", "sess-a");
+        let b = session_cache_key("same_prefix_hash", "sess-b");
+        assert_ne!(a, b);
     }
 }

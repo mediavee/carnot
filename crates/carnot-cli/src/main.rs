@@ -469,15 +469,23 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
             sig_task.abort();
             let got_sig = sig_code.load(std::sync::atomic::Ordering::SeqCst);
             match run_res {
-                Ok(_outcome) => {
+                Ok(outcome) => {
                     let _ = tokio::time::timeout(Duration::from_millis(250), ev_task).await;
                     if !is_json {
                         println!();
                     }
-                    if got_sig != 0 { got_sig } else { 0 }
+                    if got_sig != 0 {
+                        got_sig
+                    } else if let Some(ref reason) = outcome.halted_reason {
+                        eprintln!("halted: {reason}");
+                        3
+                    } else {
+                        0
+                    }
                 }
                 Err(e) => {
-                    ev_task.abort();
+                    // Allow JSON event printer to flush `AgentEvent::Error` before exiting!
+                    let _ = tokio::time::timeout(Duration::from_millis(250), ev_task).await;
                     if got_sig != 0 {
                         eprintln!("interrupted (signal exit {got_sig})");
                         got_sig
@@ -523,10 +531,15 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
     let reg = ProviderRegistry::load_default(&cli.provider_configs);
     let (provider_status, selected_model, context_window) = match &reg {
         Ok(r) => {
+            let canonical_id = r
+                .catalog()
+                .find_provider(&cli.provider)
+                .map(|(id, _)| id.to_string())
+                .unwrap_or_else(|| cli.provider.clone());
             let summary = r
                 .summaries()
                 .into_iter()
-                .find(|s| s.id.eq_ignore_ascii_case(&cli.provider));
+                .find(|s| s.id.eq_ignore_ascii_case(&canonical_id));
             let model = cli.model.clone().unwrap_or_else(|| {
                 r.catalog()
                     .find_provider(&cli.provider)

@@ -215,10 +215,15 @@ impl StreamableHttpTransport {
         if content_type.contains("text/event-stream") {
             self.read_sse_response(resp, id, on_progress, cancel).await
         } else {
-            // Bounded JSON body read (16 MiB cap — Opus #13!)
+            // Bounded JSON body read (16 MiB cap — Opus #13!) with cancellation support
             let mut stream = resp.bytes_stream();
             let mut body_bytes = Vec::with_capacity(4096);
-            while let Some(chunk_res) = stream.next().await {
+            loop {
+                let next_chunk = tokio::select! {
+                    _ = cancel.cancelled() => return Err(TransportError::Other(CarnotError::Cancelled)),
+                    c = stream.next() => c,
+                };
+                let Some(chunk_res) = next_chunk else { break };
                 let chunk = chunk_res.map_err(|e| {
                     TransportError::Other(CarnotError::Tool {
                         tool: format!("mcp:{}", self.server_name),

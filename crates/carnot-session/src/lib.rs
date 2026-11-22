@@ -377,9 +377,11 @@ impl SessionStore {
             tail_start -= 1;
         }
         let effective_keep_tail = n.saturating_sub(tail_start);
+        // Emit as Role::User so `summary -> kept_assistant_tail` obeys strict role alternation
+        // across ALL providers (Anthropic, OpenAI, DeepSeek, Grok, Gemini).
         let entry = SessionEntry::Compaction {
             id: uuid::Uuid::now_v7().to_string(),
-            summary_message: Message::system_note(summary),
+            summary_message: Message::user_text(summary),
             kept_tail_count: effective_keep_tail,
             strip_thinking_from_tail: true,
             timestamp_unix_ms: now_unix_ms(),
@@ -498,8 +500,9 @@ impl SessionStore {
                     self.last_usage_anchor = Some((self.active_messages.len(), billed));
                 }
             }
-            SessionEntry::Message { message, .. } => {
+            SessionEntry::Message { id, message, .. } => {
                 self.active_messages.push(Arc::new(message.clone()));
+                self.last_message_id = Some(id.clone());
             }
             SessionEntry::Checkpoint { message_index, .. } => {
                 if *message_index < self.active_messages.len() {
@@ -527,13 +530,16 @@ impl SessionStore {
                 let tail_start = n.saturating_sub(*kept_tail_count);
                 let tail: Vec<Arc<Message>> = self.active_messages[tail_start..]
                     .iter()
-                    .map(|m| {
+                    .filter_map(|m| {
                         let base = if *strip_thinking_from_tail {
                             m.without_thinking()
                         } else {
                             (**m).clone()
                         };
-                        Arc::new(trim_oversized_tail_blocks(base))
+                        if base.content.is_empty() {
+                            return None;
+                        }
+                        Some(Arc::new(trim_oversized_tail_blocks(base)))
                     })
                     .collect();
                 self.active_messages.clear();

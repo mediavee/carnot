@@ -107,8 +107,29 @@ impl WorktreeHasher {
             .into_iter()
             .filter_map(|d| dir_mtime_ns(&d).map(|m| (d, m)))
             .collect();
-        let idx = repo_root.join(".git").join("index");
-        if idx.is_file() {
+        let dot_git = repo_root.join(".git");
+        let idx = if dot_git.is_file() {
+            fs::read_to_string(&dot_git)
+                .ok()
+                .and_then(|s| {
+                    s.trim()
+                        .strip_prefix("gitdir:")
+                        .map(|p| p.trim().to_string())
+                })
+                .map(|rel| {
+                    let p = PathBuf::from(rel);
+                    if p.is_absolute() {
+                        p.join("index")
+                    } else {
+                        repo_root.join(p).join("index")
+                    }
+                })
+        } else {
+            Some(dot_git.join("index"))
+        };
+        if let Some(idx) = idx
+            && idx.is_file()
+        {
             self.git_index_mtime = dir_mtime_ns(&idx);
             self.git_index_path = Some(idx);
         } else {

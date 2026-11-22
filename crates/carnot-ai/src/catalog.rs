@@ -212,6 +212,18 @@ pub struct CompatFlags {
     pub requires_reasoning_content_on_assistant_messages: Option<bool>,
     #[serde(default)]
     pub supports_prompt_cache_key: Option<bool>,
+    /// OpenAI 24-hour prompt cache retention (`"prompt_cache_retention": "24h"`).
+    #[serde(default)]
+    pub supports_prompt_cache_retention: Option<bool>,
+    /// OpenAI / Responses `xhigh` reasoning effort support.
+    #[serde(default)]
+    pub supports_xhigh_reasoning: Option<bool>,
+    /// Anthropic `eager_input_streaming: true` on `Edit`/`Write` (default true on official Anthropic).
+    #[serde(default)]
+    pub supports_eager_input_streaming: Option<bool>,
+    /// Anthropic signed-thinking requirement (default true on Claude; set false on unsigned gateways).
+    #[serde(default)]
+    pub requires_thinking_signature: Option<bool>,
     #[serde(default)]
     pub send_stream_options: Option<bool>,
     #[serde(default)]
@@ -253,6 +265,18 @@ impl CompatFlags {
             supports_prompt_cache_key: ov
                 .supports_prompt_cache_key
                 .or(self.supports_prompt_cache_key),
+            supports_prompt_cache_retention: ov
+                .supports_prompt_cache_retention
+                .or(self.supports_prompt_cache_retention),
+            supports_xhigh_reasoning: ov
+                .supports_xhigh_reasoning
+                .or(self.supports_xhigh_reasoning),
+            supports_eager_input_streaming: ov
+                .supports_eager_input_streaming
+                .or(self.supports_eager_input_streaming),
+            requires_thinking_signature: ov
+                .requires_thinking_signature
+                .or(self.requires_thinking_signature),
             send_stream_options: ov.send_stream_options.or(self.send_stream_options),
             session_id_header: ov
                 .session_id_header
@@ -380,13 +404,26 @@ pub struct ResolvedProviderSpec {
     pub catalog_models: BTreeMap<String, ModelEntry>,
 }
 
+fn is_model_prefix_match(model: &str, prefix: &str) -> bool {
+    if !model.starts_with(prefix) {
+        return false;
+    }
+    match model.as_bytes().get(prefix.len()) {
+        None => true,
+        // Require a real delimiter so e.g. `gpt-5.4` matches `gpt-5.4-20260901` (exact sub-variant
+        // `gpt-5.4-mini` wins via exact match or longer prefix) and never matches unrelated suffixes.
+        Some(b'-' | b'.' | b':' | b'@') => true,
+        Some(_) => false,
+    }
+}
+
 impl ResolvedProviderSpec {
     pub fn model_entry(&self, model: &str) -> Option<&ModelEntry> {
         self.catalog_models.get(model).or_else(|| {
-            // Prefix match (e.g. `claude-sonnet-5-5-20260901` matches `claude-sonnet-5-5`)
+            // Boundary-aware prefix match (e.g. `claude-sonnet-5-5-20260901` matches `claude-sonnet-5-5`)
             self.catalog_models
                 .iter()
-                .filter(|(k, _)| model.starts_with(k.as_str()))
+                .filter(|(k, _)| is_model_prefix_match(model, k.as_str()))
                 .max_by_key(|(k, _)| k.len())
                 .map(|(_, v)| v)
         })
@@ -527,12 +564,12 @@ impl ProviderCatalog {
         None
     }
 
-    /// Prefix-aware model lookup matching `ResolvedProviderSpec::model_entry`.
+    /// Boundary-aware prefix model lookup matching `ResolvedProviderSpec::model_entry`.
     pub fn find_model(&self, model: &str) -> Option<&ModelEntry> {
         self.models.get(model).or_else(|| {
             self.models
                 .iter()
-                .filter(|(k, _)| model.starts_with(k.as_str()))
+                .filter(|(k, _)| is_model_prefix_match(model, k.as_str()))
                 .max_by_key(|(k, _)| k.len())
                 .map(|(_, v)| v)
         })

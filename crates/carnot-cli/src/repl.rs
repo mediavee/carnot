@@ -17,12 +17,10 @@ pub async fn run_repl(agent: Arc<Agent>) -> i32 {
     );
     eprintln!("\x1b[2mType a prompt or /help, /compact, /undo, /cost, /exit\x1b[0m");
 
-    let mut line = String::new();
     loop {
         eprint!("\n\x1b[1;36m>\x1b[0m ");
         let _ = io::stderr().flush();
 
-        line.clear();
         let read_res = tokio::task::spawn_blocking(move || {
             let mut buf = String::new();
             let stdin = io::stdin();

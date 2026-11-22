@@ -54,13 +54,20 @@ impl CompactionMode {
     }
 }
 
-/// Computes the effective proactive compaction trigger (clamped safely below `context_window`).
+/// Computes the effective proactive compaction trigger, clamped safely below combined
+/// `context_window - max_output_tokens - compaction_reserve_tokens` (with an anti-thrash floor).
 pub fn effective_proactive_trigger(config: &CarnotConfig) -> u64 {
+    let output_headroom = u64::from(config.max_output_tokens).min(config.context_window / 2);
     let hard_trigger = config
         .context_window
+        .saturating_sub(output_headroom)
         .saturating_sub(config.compaction_reserve_tokens);
+    let floor = config
+        .compaction_tail_budget_tokens
+        .saturating_add(config.compaction_reserve_tokens)
+        .min(hard_trigger);
     match config.soft_compaction_tokens {
-        Some(soft) if soft > 0 => soft.min(hard_trigger),
+        Some(soft) if soft > 0 => soft.min(hard_trigger).max(floor),
         _ => hard_trigger,
     }
 }
@@ -129,7 +136,11 @@ pub fn hydrate_anchors_from_session(messages: &[Arc<Message>]) -> (Option<String
             continue;
         }
 
-        if msg.role == Role::User && msg.has_text() && !trimmed.starts_with("[carnot:") {
+        if msg.role == Role::User
+            && msg.has_text()
+            && !trimmed.starts_with("[carnot:")
+            && !trimmed.starts_with("[autonomous-gate ")
+        {
             if goal.is_none() {
                 goal = Some(clip_anchor_text(trimmed, MAX_ANCHORED_GOAL_CHARS));
             } else {
@@ -374,11 +385,12 @@ async fn try_semantic_llm_handoff(
             static_system_prompt: proj.static_system_prompt,
             tools: proj.tools,
             prefix_hash: proj.prefix_hash,
+            session_id: s.session_id.clone(),
             messages: msgs,
             checkpoint_index: proj.checkpoint_index,
             cache_ttl: config.cache_ttl,
             effort: compaction_effort,
-            max_output_tokens: config.max_output_tokens,
+            max_output_tokens: config.max_output_tokens.min(16_384),
             skip_tail_cache_write: true,
         }
     };
@@ -670,15 +682,18 @@ mod tests {
     fn effective_proactive_trigger_clamps_to_model_window() {
         let mut cfg = CarnotConfig::new(std::path::PathBuf::from("/tmp"));
         cfg.context_window = 1_000_000;
+        cfg.max_output_tokens = 64_000;
         cfg.compaction_reserve_tokens = 16_384;
         cfg.soft_compaction_tokens = Some(220_000);
         assert_eq!(effective_proactive_trigger(&cfg), 220_000);
 
         cfg.context_window = 200_000;
-        assert_eq!(effective_proactive_trigger(&cfg), 183_616);
+        cfg.max_output_tokens = 32_768;
+        // 200_000 - 32_768 - 16_384 = 150_848
+        assert_eq!(effective_proactive_trigger(&cfg), 150_848);
 
         cfg.soft_compaction_tokens = None;
-        assert_eq!(effective_proactive_trigger(&cfg), 183_616);
+        assert_eq!(effective_proactive_trigger(&cfg), 150_848);
     }
 
     #[test]

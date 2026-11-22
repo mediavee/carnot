@@ -19,7 +19,8 @@
 use crate::anthropic::find_sse_frame_end;
 use crate::catalog::ResolvedProviderSpec;
 use crate::compat::{
-    can_replay_origin, is_retryable_status, parse_retry_after_ms, sanitize_gemini_schema,
+    can_replay_origin, is_context_overflow, is_retryable_status, parse_retry_after_ms,
+    sanitize_gemini_schema,
 };
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
@@ -324,12 +325,14 @@ impl GoogleProvider {
                     );
                 }
                 Some("budget") => {
-                    let budget: u32 = match req.effort {
+                    let desired: u32 = match req.effort {
                         ReasoningEffort::Low => 2_048,
                         ReasoningEffort::Medium => 8_192,
                         ReasoningEffort::High => 16_384,
                         ReasoningEffort::Xhigh | ReasoningEffort::Max => 24_576,
                     };
+                    let max_budget = req.max_output_tokens.saturating_sub(1_024).max(1_024);
+                    let budget = desired.min(max_budget);
                     gc.insert(
                         "thinkingConfig".into(),
                         json!({
@@ -487,10 +490,7 @@ impl Provider for GoogleProvider {
                 }
                 let retry_after_ms = parse_retry_after_ms(send_res.headers());
                 let text = send_res.text().await.unwrap_or_default();
-                let lower = text.to_ascii_lowercase();
-                if lower.contains("exceeds the maximum number of tokens")
-                    || lower.contains("context length")
-                {
+                if is_context_overflow(Some(status.as_u16()), &text) {
                     return Err(CarnotError::ContextOverflow(text));
                 }
 
@@ -594,11 +594,16 @@ impl Provider for GoogleProvider {
                             continue;
                         };
                         if let Some(err) = raw_v.get("error") {
+                            let err_str = err.to_string();
+                            if is_context_overflow(None, &err_str) {
+                                let _ = tx.send(StreamEvent::ContextOverflow(err_str)).await;
+                                return;
+                            }
                             let code = err.get("code").and_then(Value::as_u64).unwrap_or(500);
                             let retryable = is_retryable_status(code as u16);
                             let _ = tx
                                 .send(StreamEvent::Error {
-                                    message: err.to_string(),
+                                    message: err_str,
                                     retryable,
                                 })
                                 .await;
@@ -636,6 +641,16 @@ impl Provider for GoogleProvider {
                         if let Some(cand) = v.pointer("/candidates/0") {
                             saw_any_candidate = true;
                             if let Some(fr) = cand.get("finishReason").and_then(Value::as_str) {
+                                if fr == "MALFORMED_FUNCTION_CALL" {
+                                    let _ = tx
+                                        .send(StreamEvent::Error {
+                                            message: "provider returned MALFORMED_FUNCTION_CALL"
+                                                .into(),
+                                            retryable: true,
+                                        })
+                                        .await;
+                                    return;
+                                }
                                 stop_reason = match fr {
                                     "MAX_TOKENS" => StopReason::MaxTokens,
                                     "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT"
@@ -703,6 +718,10 @@ impl Provider for GoogleProvider {
                                                 .await;
                                         } else {
                                             text_acc.push_str(txt);
+                                            // Gemini 3 attaches thoughtSignature to the final text part on non-tool turns
+                                            if let Some(sig) = part_sig {
+                                                thinking_sig = Some(sig);
+                                            }
                                             let _ = tx
                                                 .send(StreamEvent::TextDelta(txt.to_string()))
                                                 .await;

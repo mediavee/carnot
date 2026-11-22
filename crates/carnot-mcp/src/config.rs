@@ -189,8 +189,10 @@ pub fn validate_server_config(
                 });
             }
             if from_workspace {
-                // Reject repo-relative executable paths (e.g. `./node_modules/.bin/x`, `../evil`)
-                if s.command.starts_with('.') || s.command.contains("..") {
+                // Reject repo-relative executable paths (e.g. `./node_modules/.bin/x`, `scripts/pwn.sh`, `../evil`)
+                let has_sep = s.command.contains('/') || s.command.contains('\\');
+                let is_abs = std::path::Path::new(&s.command).is_absolute();
+                if s.command.starts_with('.') || s.command.contains("..") || (has_sep && !is_abs) {
                     return Err(CarnotError::Sandbox(format!(
                         "MCPoison guard blocked relative executable `{}` in workspace MCP `{name}`",
                         s.command

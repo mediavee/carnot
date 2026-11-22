@@ -6,9 +6,9 @@ use carnot_cas::WorktreeHasher;
 use carnot_core::{Result, ToolOutput};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 fn path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -66,7 +66,6 @@ struct DaemonState {
     tree_history: Vec<[u8; 32]>,
     seen_trees: HashMap<[u8; 32], usize>,
     error_counts: HashMap<String, u32>,
-    failing_test_streak: (String, u32, HashSet<[u8; 32]>),
     idle_turn_streak: u32,
     /// S4: counts consecutive passing shell-only turns after a green test without intervening edits.
     seen_verified_green: bool,
@@ -82,7 +81,7 @@ struct DaemonState {
 pub struct MaxwellDaemonModule {
     workspace_root: PathBuf,
     idle_limit: u32,
-    state: Mutex<DaemonState>,
+    state: Arc<Mutex<DaemonState>>,
 }
 
 impl MaxwellDaemonModule {
@@ -90,12 +89,11 @@ impl MaxwellDaemonModule {
         Self {
             workspace_root,
             idle_limit,
-            state: Mutex::new(DaemonState {
+            state: Arc::new(Mutex::new(DaemonState {
                 hasher: WorktreeHasher::new(),
                 tree_history: Vec::new(),
                 seen_trees: HashMap::new(),
                 error_counts: HashMap::new(),
-                failing_test_streak: (String::new(), 0, HashSet::new()),
                 idle_turn_streak: 0,
                 seen_verified_green: false,
                 consecutive_passing_bash_turns: 0,
@@ -103,7 +101,7 @@ impl MaxwellDaemonModule {
                 saw_edit_this_turn: false,
                 pending_advisory: None,
                 recent_failures: Vec::new(),
-            }),
+            })),
         }
     }
 
@@ -152,7 +150,7 @@ impl Module for MaxwellDaemonModule {
                             st.recent_failures.remove(0);
                         }
                     }
-                    if count == 3 || (count > 3 && count % 3 == 0) {
+                    if count == 3 || count == 6 {
                         st.pending_advisory = Some((
                             "S3:error_cluster".into(),
                             format!(
@@ -171,82 +169,102 @@ impl Module for MaxwellDaemonModule {
         snap: &'a TurnBoundarySnapshot,
     ) -> BoxFuture<'a, Result<BoundaryAction>> {
         Box::pin(async move {
-            let Ok(mut st) = self.state.lock() else {
-                return Ok(BoundaryAction::Continue);
-            };
+            let (edited, halt_reason, mut pending) = {
+                let Ok(mut st) = self.state.lock() else {
+                    return Ok(BoundaryAction::Continue);
+                };
 
-            // Progress decay: a verified green test resets transient error/plateau counters!
-            if snap.verified_green_command.is_some() {
-                st.error_counts.clear();
-                st.failing_test_streak = (String::new(), 0, HashSet::new());
-                st.recent_failures.clear();
-                st.pending_advisory = None;
-                st.idle_turn_streak = 0;
-                st.seen_verified_green = true;
-            }
-
-            // S4: detect genuinely runaway post-green shell-only loops without prematurely nagging normal verification.
-            let edited = std::mem::take(&mut st.saw_edit_this_turn);
-            let bash_ok = std::mem::take(&mut st.saw_bash_ok_this_turn);
-            if edited {
-                st.seen_verified_green = false;
-                st.consecutive_passing_bash_turns = 0;
-            } else if st.seen_verified_green && bash_ok {
-                st.consecutive_passing_bash_turns += 1;
-                if st.consecutive_passing_bash_turns >= 8
-                    && st.consecutive_passing_bash_turns % 8 == 0
-                    && st.pending_advisory.is_none()
-                {
-                    st.pending_advisory = Some((
-                        "S4:over_verification".into(),
-                        format!(
-                            "[maxwell-daemon] {} consecutive passing shell-only turns since the last edit. If you are still validating edge cases, consider batching remaining checks into a single command.",
-                            st.consecutive_passing_bash_turns
-                        ),
-                    ));
+                // Progress decay: a verified green test resets transient error/plateau counters!
+                if snap.verified_green_command.is_some() {
+                    st.error_counts.clear();
+                    st.recent_failures.clear();
+                    st.pending_advisory = None;
+                    st.idle_turn_streak = 0;
+                    st.seen_verified_green = true;
                 }
-            } else {
-                st.consecutive_passing_bash_turns = 0;
-            }
 
-            // 3-idle-turn circuit breaker (prevents runaway autonomous/goal loops)
-            if !snap.had_tool_call_in_turn {
-                st.idle_turn_streak += 1;
-                if self.idle_limit > 0 && st.idle_turn_streak >= self.idle_limit {
-                    return Ok(BoundaryAction::Halt {
-                        reason: format!(
+                // S4: detect genuinely runaway post-green shell-only loops (capped at 2 advisories)
+                let edited = std::mem::take(&mut st.saw_edit_this_turn);
+                let bash_ok = std::mem::take(&mut st.saw_bash_ok_this_turn);
+                if edited {
+                    st.seen_verified_green = false;
+                    st.consecutive_passing_bash_turns = 0;
+                } else if st.seen_verified_green && bash_ok {
+                    st.consecutive_passing_bash_turns += 1;
+                    if matches!(st.consecutive_passing_bash_turns, 8 | 16)
+                        && st.pending_advisory.is_none()
+                    {
+                        st.pending_advisory = Some((
+                            "S4:over_verification".into(),
+                            format!(
+                                "[maxwell-daemon] {} consecutive passing shell-only turns since the last edit. If you are still validating edge cases, consider batching remaining checks into a single command.",
+                                st.consecutive_passing_bash_turns
+                            ),
+                        ));
+                    }
+                } else {
+                    st.consecutive_passing_bash_turns = 0;
+                }
+
+                // 3-idle-turn circuit breaker (prevents runaway autonomous/goal loops)
+                let halt_reason = if !snap.had_tool_call_in_turn {
+                    st.idle_turn_streak += 1;
+                    if self.idle_limit > 0 && st.idle_turn_streak >= self.idle_limit {
+                        Some(format!(
                             "idle circuit breaker triggered ({} consecutive turns without tool calls)",
                             st.idle_turn_streak
-                        ),
-                    });
-                }
-            } else {
-                st.idle_turn_streak = 0;
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    st.idle_turn_streak = 0;
+                    None
+                };
+
+                (edited, halt_reason, st.pending_advisory.take())
+            };
+
+            if let Some(reason) = halt_reason {
+                return Ok(BoundaryAction::Halt { reason });
             }
 
             // S1: Incremental path-inclusive BLAKE3 worktree tree-hash cycle detection
-            if snap.had_edit_in_segment {
-                let wt = st.hasher.snapshot(&self.workspace_root);
-                let idx = st.tree_history.len();
-                let cycle = st
-                    .seen_trees
-                    .get(&wt.tree_hash)
-                    .copied()
-                    .filter(|&prev| idx > prev + 1);
-                st.seen_trees.insert(wt.tree_hash, idx);
-                st.tree_history.push(wt.tree_hash);
-                if let Some(prev) = cycle {
-                    return Ok(BoundaryAction::AppendAdvisory {
-                        signal: "S1:tree_cycle".into(),
-                        message: format!(
+            // Only runs on turns that ACTUALLY edited files, offloaded to spawn_blocking!
+            if edited {
+                let state_arc = Arc::clone(&self.state);
+                let ws = self.workspace_root.clone();
+                let cycle_msg = tokio::task::spawn_blocking(move || -> Option<String> {
+                    let mut st = state_arc.lock().ok()?;
+                    let wt = st.hasher.snapshot(&ws);
+                    let idx = st.tree_history.len();
+                    let cycle = st
+                        .seen_trees
+                        .get(&wt.tree_hash)
+                        .copied()
+                        .filter(|&prev| idx > prev + 1);
+                    st.seen_trees.insert(wt.tree_hash, idx);
+                    st.tree_history.push(wt.tree_hash);
+                    cycle.map(|prev| {
+                        format!(
                             "[maxwell-daemon] Worktree returned to an identical file-tree hash seen {} edits ago (A->B->A cycle). Verify whether you are oscillating between two broken states.",
                             idx - prev
-                        ),
+                        )
+                    })
+                })
+                .await
+                .ok()
+                .flatten();
+
+                if let Some(message) = cycle_msg {
+                    return Ok(BoundaryAction::AppendAdvisory {
+                        signal: "S1:tree_cycle".into(),
+                        message,
                     });
                 }
             }
 
-            if let Some((sig, msg)) = st.pending_advisory.take() {
+            if let Some((sig, msg)) = pending.take() {
                 return Ok(BoundaryAction::AppendAdvisory {
                     signal: sig,
                     message: msg,

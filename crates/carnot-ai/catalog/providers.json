@@ -19,7 +19,9 @@
       "cache_diagnosis_beta": "cache-diagnosis-2026-04-07",
       "native_tool_search": true,
       "compat": {
-        "supports_prompt_cache_key": false
+        "supports_prompt_cache_key": false,
+        "supports_eager_input_streaming": true,
+        "requires_thinking_signature": true
       }
     },
     "openai": {
@@ -36,7 +38,9 @@
         "max_tokens_field": "max_completion_tokens",
         "supports_developer_role": true,
         "supports_reasoning_effort": true,
+        "supports_xhigh_reasoning": true,
         "supports_prompt_cache_key": true,
+        "supports_prompt_cache_retention": true,
         "send_stream_options": true
       },
       "usage_map": {
@@ -61,7 +65,9 @@
         "store": false,
         "include_encrypted_reasoning": true,
         "supports_reasoning_effort": true,
-        "supports_prompt_cache_key": true
+        "supports_xhigh_reasoning": true,
+        "supports_prompt_cache_key": true,
+        "supports_prompt_cache_retention": true
       }
     },
     "grok": {
@@ -278,6 +284,7 @@
     },
     "claude-opus-4-8": {
       "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
       "max_output_tokens": 64000,
       "supports_mid_system_role": true,
       "supports_effort": true,
@@ -286,6 +293,7 @@
     },
     "claude-opus-4-7": {
       "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
       "max_output_tokens": 64000,
       "supports_mid_system_role": false,
       "supports_effort": true,
@@ -294,14 +302,27 @@
     },
     "claude-opus-4-6": {
       "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
       "max_output_tokens": 64000,
       "supports_mid_system_role": false,
       "supports_effort": true,
       "supports_xhigh": false,
       "needs_adaptive_thinking": true
     },
+    "claude-opus-4-5": {
+      "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 200000,
+      "max_output_tokens": 32768,
+      "supports_mid_system_role": false,
+      "supports_effort": false,
+      "supports_xhigh": false,
+      "needs_adaptive_thinking": false,
+      "thinking_mode": "budget"
+    },
     "claude-sonnet-4-6": {
       "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
       "supports_mid_system_role": false,
       "supports_effort": true,
       "supports_xhigh": false,
@@ -309,6 +330,8 @@
     },
     "claude-sonnet-4-5": {
       "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 200000,
+      "max_output_tokens": 32768,
       "supports_mid_system_role": false,
       "supports_effort": false,
       "supports_xhigh": false,
@@ -317,6 +340,8 @@
     },
     "claude-haiku-4-5": {
       "pricing": { "input_per_mtok": 1.0, "output_per_mtok": 5.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 200000,
+      "max_output_tokens": 32768,
       "supports_mid_system_role": false,
       "supports_effort": false,
       "supports_xhigh": false,
@@ -325,6 +350,8 @@
     },
     "claude-fable-5-2": {
       "pricing": { "input_per_mtok": 8.0, "output_per_mtok": 40.0, "cache_read_mult": 0.025, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
       "supports_mid_system_role": true,
       "supports_effort": true,
       "supports_xhigh": true,
@@ -332,48 +359,118 @@
     },
     "grok-4": {
       "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 256000,
+      "max_output_tokens": 32768,
+      "compat_override": {
+        "supports_reasoning_effort": false
+      }
+    },
+    "grok-4-fast": {
+      "pricing": { "input_per_mtok": 0.20, "output_per_mtok": 0.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 2000000,
+      "max_output_tokens": 32768,
       "compat_override": {
         "supports_reasoning_effort": false
       }
     },
     "grok-3-mini": {
       "pricing": { "input_per_mtok": 0.30, "output_per_mtok": 0.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 131072,
+      "max_output_tokens": 16384,
       "compat_override": {
         "supports_reasoning_effort": true
       }
     },
     "gemini-2.5-pro": {
       "pricing": { "input_per_mtok": 1.25, "output_per_mtok": 10.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
       "compat_override": {
         "thinking_style": "budget"
       }
     },
     "gemini-2.5-flash": {
       "pricing": { "input_per_mtok": 0.30, "output_per_mtok": 2.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
       "compat_override": {
         "thinking_style": "budget"
       }
     },
     "gemini-3-pro-preview": {
       "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 12.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "compat_override": {
+        "thinking_style": "level"
+      }
+    },
+    "gemini-3-flash-preview": {
+      "pricing": { "input_per_mtok": 0.50, "output_per_mtok": 3.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
       "compat_override": {
         "thinking_style": "level"
       }
     },
     "gemini-3-pro-high": {
       "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 12.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
       "compat_override": {
         "thinking_style": "level"
       }
     },
     "gpt-5.4": {
-      "pricing": { "input_per_mtok": 2.50, "output_per_mtok": 10.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 }
+      "pricing": { "input_per_mtok": 2.50, "output_per_mtok": 10.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000
+    },
+    "gpt-5.4-mini": {
+      "pricing": { "input_per_mtok": 0.40, "output_per_mtok": 1.60, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 400000,
+      "max_output_tokens": 64000
+    },
+    "gpt-5.4-nano": {
+      "pricing": { "input_per_mtok": 0.10, "output_per_mtok": 0.40, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 400000,
+      "max_output_tokens": 32768
+    },
+    "o3": {
+      "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 8.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "compat_override": {
+        "supports_xhigh_reasoning": false
+      }
+    },
+    "o4-mini": {
+      "pricing": { "input_per_mtok": 1.10, "output_per_mtok": 4.40, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "compat_override": {
+        "supports_xhigh_reasoning": false
+      }
     },
     "deepseek-reasoner": {
-      "pricing": { "input_per_mtok": 0.55, "output_per_mtok": 2.19, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 }
+      "pricing": { "input_per_mtok": 0.55, "output_per_mtok": 2.19, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 128000,
+      "max_output_tokens": 32768
+    },
+    "deepseek-chat": {
+      "pricing": { "input_per_mtok": 0.27, "output_per_mtok": 1.10, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 128000,
+      "max_output_tokens": 8192
+    },
+    "qwen3-coder": {
+      "pricing": { "input_per_mtok": 0.0, "output_per_mtok": 0.0, "cache_read_mult": 1.0, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 65536,
+      "max_output_tokens": 16384
     },
     "Llama-4-Maverick-17B-128E-Instruct-FP8": {
-      "pricing": { "input_per_mtok": 0.25, "output_per_mtok": 0.75, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 }
+      "pricing": { "input_per_mtok": 0.25, "output_per_mtok": 0.75, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 32768
     }
   }
 }

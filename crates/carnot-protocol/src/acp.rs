@@ -53,7 +53,7 @@ impl PermissionBroker for AcpPermissionBroker {
         let input = input.clone();
         Box::pin(async move {
             // Pure local reads do not need interactive user prompts
-            if matches!(tool_name.as_str(), "Read" | "ToolSearch") {
+            if matches!(tool_name.as_str(), "Read" | "Grep" | "ToolSearch") {
                 return Ok(ToolGateDecision::Allow);
             }
             let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
@@ -154,11 +154,24 @@ pub async fn serve_acp_stdio(agent: Arc<Agent>) -> Result<()> {
             continue;
         }
 
+        let has_id = msg.get("id").is_some();
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
         if method == "session/prompt" {
+            prompt_tasks.retain(|h| !h.is_finished());
+            if agent.is_busy() {
+                if has_id {
+                    let busy_frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32001, "message": "agent is busy running a prompt; call session/steer or session/cancel first"}
+                    });
+                    write_frame(&stdout, &busy_frame).await?;
+                }
+                continue;
+            }
             let prompt_text = extract_acp_prompt(&params);
             let ag = agent.clone();
             let out = stdout.clone();
@@ -328,15 +341,17 @@ pub async fn serve_acp_stdio(agent: Arc<Agent>) -> Result<()> {
             _ => Err((-32601, format!("unsupported ACP method: {method}"))),
         };
 
-        let frame = match result {
-            Ok(res) => json!({"jsonrpc": "2.0", "id": id, "result": res}),
-            Err((code, message)) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": code, "message": message}
-            }),
-        };
-        write_frame(&stdout, &frame).await?;
+        if has_id {
+            let frame = match result {
+                Ok(res) => json!({"jsonrpc": "2.0", "id": id, "result": res}),
+                Err((code, message)) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": code, "message": message}
+                }),
+            };
+            write_frame(&stdout, &frame).await?;
+        }
     }
 
     for task in prompt_tasks {

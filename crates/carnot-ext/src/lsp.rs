@@ -175,7 +175,14 @@ impl LspConn {
                     let srv_id = v.get("id").cloned().unwrap_or(Value::Null);
                     let m = v.get("method").and_then(Value::as_str).unwrap_or("");
                     let result = match m {
-                        "workspace/configuration" => json!([{}]),
+                        "workspace/configuration" => {
+                            let count = v
+                                .pointer("/params/items")
+                                .and_then(Value::as_array)
+                                .map(|a| a.len().max(1))
+                                .unwrap_or(1);
+                            Value::Array(vec![json!({}); count])
+                        }
                         "client/registerCapability" | "window/workDoneProgress/create" => {
                             Value::Null
                         }
@@ -428,6 +435,8 @@ impl Module for LspDiagnosticsModule {
             };
 
             let notified = conn.diag_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let uri = conn.sync_document(&p, lang, &text).await;
 
             if is_read {

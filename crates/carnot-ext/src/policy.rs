@@ -27,16 +27,36 @@ fn secret_redaction_patterns() -> &'static [(Regex, &'static str)] {
                 "[REDACTED:ANTHROPIC_KEY]",
             ),
             (
+                Regex::new(r"sk-or-v1-[A-Za-z0-9]{24,}").expect("re"),
+                "[REDACTED:OPENROUTER_KEY]",
+            ),
+            (
                 Regex::new(r"sk-(?:proj-)?[A-Za-z0-9_-]{24,}").expect("re"),
                 "[REDACTED:API_KEY]",
+            ),
+            (
+                Regex::new(r"AIza[0-9A-Za-z_-]{35}").expect("re"),
+                "[REDACTED:GOOGLE_KEY]",
+            ),
+            (
+                Regex::new(r"xai-[A-Za-z0-9_-]{24,}").expect("re"),
+                "[REDACTED:XAI_KEY]",
             ),
             (
                 Regex::new(r"gh[pousr]_[A-Za-z0-9]{20,}").expect("re"),
                 "[REDACTED:GITHUB_TOKEN]",
             ),
             (
+                Regex::new(r"xox[baprs]-[A-Za-z0-9-]{20,}").expect("re"),
+                "[REDACTED:SLACK_TOKEN]",
+            ),
+            (
                 Regex::new(r"AKIA[0-9A-Z]{16}").expect("re"),
                 "[REDACTED:AWS_ACCESS_KEY]",
+            ),
+            (
+                Regex::new(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]{20,}").expect("re"),
+                "Authorization: Bearer [REDACTED:BEARER_TOKEN]",
             ),
             (
                 Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----")
@@ -150,17 +170,28 @@ impl Module for PolicyGuardModule {
         }
 
         if deny_reason.is_none()
-            && matches!(tool_name, "Read" | "Edit" | "Write")
-            && let Some(fp) = input.get("file_path").and_then(Value::as_str)
+            && matches!(tool_name, "Read" | "Edit" | "Write" | "Grep")
+            && let Some(fp) = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(Value::as_str)
         {
+            let norm = fp.replace('\\', "/").to_ascii_lowercase();
+            let norm_trimmed = norm.trim_start_matches("./").trim_start_matches('/');
             let file_name = std::path::Path::new(fp)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(fp)
                 .to_ascii_lowercase();
             for frag in &self.protected_path_fragments {
-                let fl = frag.to_ascii_lowercase();
-                if file_name == fl || file_name.starts_with(&format!("{fl}.")) {
+                let fl = frag.replace('\\', "/").to_ascii_lowercase();
+                let fl_dir = fl.trim_end_matches('/');
+                let is_dir_match = fl.ends_with('/')
+                    && (norm_trimmed == fl_dir
+                        || norm_trimmed.starts_with(&format!("{fl_dir}/"))
+                        || norm_trimmed.contains(&format!("/{fl_dir}/")));
+                let is_file_match = file_name == fl || file_name.starts_with(&format!("{fl}."));
+                if is_dir_match || is_file_match {
                     deny_reason = Some(format!(
                         "path `{fp}` is protected by PolicyGuard (`{frag}`)"
                     ));

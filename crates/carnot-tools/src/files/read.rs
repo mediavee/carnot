@@ -106,6 +106,14 @@ impl Tool for ReadTool {
                         "mode": "dir_outline",
                     })));
                 }
+                // Refuse non-regular files (FIFOs, named pipes, sockets, device nodes) so `fs::read`
+                // can NEVER hang `spawn_blocking` indefinitely.
+                if !meta.is_file() {
+                    return Ok(ToolOutput::err_text(format!(
+                        "Refusing to Read non-regular file {} (FIFO, socket, or special device).",
+                        raw_path
+                    )));
+                }
                 if meta.len() > MAX_READ_BYTES {
                     return Ok(ToolOutput::err_text(format!(
                         "File {} is {} bytes (exceeds 16 MiB Read cap); use Bash (`head`/`rg`/`sed`) to inspect slices.",
@@ -152,6 +160,16 @@ impl Tool for ReadTool {
                             "bytes": raw_bytes.len(),
                         }),
                     });
+                }
+
+                // Detect binary files (NUL bytes in first 8 KiB) before UTF-8 decode
+                let probe_len = raw_bytes.len().min(8_192);
+                if raw_bytes[..probe_len].contains(&0) {
+                    return Ok(ToolOutput::err_text(format!(
+                        "File {} appears to be binary ({} bytes); use Bash (`file`/`hexdump`/`strings`) to inspect.",
+                        raw_path,
+                        raw_bytes.len()
+                    )));
                 }
 
                 let content = match String::from_utf8(raw_bytes) {
@@ -257,11 +275,24 @@ impl Tool for ReadTool {
                     }
                 }
 
-                // Format compact `N\ttext` numbered lines (zero padding bloat!) — NEVER pass `Read` output through CAS spill (F1)!
+                // Format compact `N\ttext` numbered lines (zero padding bloat!) with per-line cap so
+                // 500 KB minified JS/JSON lines cannot blow the context window in one Read call.
+                const MAX_RENDERED_LINE_CHARS: usize = 2_000;
                 let mut rendered = slice_lines
                     .iter()
                     .enumerate()
-                    .map(|(i, l)| format!("{}\t{l}", start + i))
+                    .map(|(i, l)| {
+                        if l.chars().count() > MAX_RENDERED_LINE_CHARS {
+                            let head: String = l.chars().take(MAX_RENDERED_LINE_CHARS).collect();
+                            format!(
+                                "{}\t{head} [... line truncated; {} total chars]",
+                                start + i,
+                                l.chars().count()
+                            )
+                        } else {
+                            format!("{}\t{l}", start + i)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
 

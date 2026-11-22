@@ -61,7 +61,14 @@ impl CasStore {
             return Ok(loc);
         }
         let local_root = self.workspace_root.join(".carnot").join("h");
-        let probe = local_root.join(format!(".carnot-probe-{}", std::process::id()));
+        let probe_nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let probe = local_root.join(format!(
+            ".carnot-probe-{}-{probe_nonce}",
+            std::process::id()
+        ));
         let local_ok = fs::create_dir_all(&local_root).is_ok()
             && fs::File::create(&probe)
                 .map(|_| {
@@ -101,7 +108,8 @@ impl CasStore {
         let file_name = format!("{hash}.log");
         let path = loc.root.join(&file_name);
         let rel_path = format!("{}/{file_name}", loc.display_prefix);
-        let lines = bytes.iter().filter(|&&b| b == b'\n').count() + usize::from(!bytes.is_empty());
+        let lines = bytes.iter().filter(|&&b| b == b'\n').count()
+            + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
 
         if path.exists()
             && let Ok(existing) = fs::read(&path)

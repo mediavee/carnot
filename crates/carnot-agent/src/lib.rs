@@ -378,10 +378,12 @@ impl Agent {
         let mut seg = SegmentTracker::default();
         let mut final_text = String::new();
         let mut halted_reason: Option<String> = None;
+        let mut settled_normally = false;
         let mut consecutive_emergency_compactions: u32 = 0;
         let mut last_compaction_turn: Option<u64> = None;
         let mut consecutive_stream_retries: u32 = 0;
         let mut consecutive_max_tokens: u8 = 0;
+        let mut empty_reply_retried = false;
 
         for _step in 0..self.config.max_turns {
             if cancel.is_cancelled() {
@@ -405,6 +407,7 @@ impl Agent {
                     last_compaction_turn = Some(current_turns);
                     self.compact_with_mode(CompactionMode::Soft, &seg, cancel.clone())
                         .await?;
+                    seg.reset();
                 }
             }
 
@@ -421,6 +424,7 @@ impl Agent {
                     static_system_prompt: proj.static_system_prompt,
                     tools: proj.tools,
                     prefix_hash: proj.prefix_hash,
+                    session_id: s.session_id.clone(),
                     messages: proj.messages,
                     checkpoint_index: proj.checkpoint_index,
                     cache_ttl: self.config.cache_ttl,
@@ -446,6 +450,7 @@ impl Agent {
                     last_compaction_turn = Some(turn_num);
                     self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
                         .await?;
+                    seg.reset();
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -457,6 +462,7 @@ impl Agent {
             let mut usage = Usage::default();
             let mut stop_reason = StopReason::EndTurn;
             let mut stream_err: Option<(String, bool)> = None;
+            let mut stream_overflow: Option<String> = None;
 
             while let Some(ev) = rx.recv().await {
                 match ev {
@@ -544,7 +550,23 @@ impl Agent {
                     StreamEvent::Error { message, retryable } => {
                         stream_err = Some((message, retryable));
                     }
+                    StreamEvent::ContextOverflow(message) => {
+                        stream_overflow = Some(message);
+                    }
                 }
+            }
+
+            if let Some(ov_msg) = stream_overflow {
+                self.discard_eager_launches(eager_launches);
+                if self.config.modules.compaction && consecutive_emergency_compactions < 1 {
+                    consecutive_emergency_compactions += 1;
+                    last_compaction_turn = Some(turn_num);
+                    self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
+                        .await?;
+                    seg.reset();
+                    continue;
+                }
+                return Err(CarnotError::ContextOverflow(ov_msg));
             }
 
             if let Some((err, retryable)) = stream_err {
@@ -586,6 +608,7 @@ impl Agent {
                 self.discard_eager_launches(eager_launches);
                 self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
                     .await?;
+                seg.reset();
                 continue;
             }
             consecutive_emergency_compactions = 0;
@@ -648,7 +671,18 @@ impl Agent {
                     })
                     .collect();
 
+                // Enforce cost guardrails BEFORE MaxTokens continuation so caps can never be bypassed
+                let spent_now = self.metrics.lock().await.total_usage.cost_usd;
+                let cost_exceeded = self
+                    .config
+                    .max_cost_usd
+                    .is_some_and(|limit| spent_now >= limit)
+                    || (self.config.subagent_depth > 0
+                        && spent_now >= self.config.subagent_max_cost_usd);
+
                 if stop_reason == StopReason::MaxTokens
+                    && !cost_exceeded
+                    && !is_repetition_dominated(&last_text)
                     && consecutive_max_tokens < self.config.max_tokens_continuations
                 {
                     consecutive_max_tokens += 1;
@@ -759,8 +793,37 @@ impl Agent {
                         continue;
                     }
 
-                    let (effective_input, denied) =
-                        self.run_before_gates(call_id, tool_name, raw_input).await?;
+                    let (mut effective_input, mut denied) =
+                        match self.run_before_gates(call_id, tool_name, raw_input).await {
+                            Ok(pair) => pair,
+                            Err(e) => (raw_input.clone(), Some(format!("gate error: {e}"))),
+                        };
+                    // Never allow `CallDeferredTool` to bypass module/broker gates keyed on the real tool name!
+                    if denied.is_none()
+                        && tool_name == "CallDeferredTool"
+                        && let Some(inner_name) =
+                            effective_input.get("name").and_then(|v| v.as_str())
+                    {
+                        let inner_args = effective_input
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        match self
+                            .run_before_gates(call_id, inner_name, &inner_args)
+                            .await
+                        {
+                            Ok((rewritten, inner_denied)) => {
+                                if let Some(reason) = inner_denied {
+                                    denied = Some(reason);
+                                } else if let Some(obj) = effective_input.as_object_mut() {
+                                    obj.insert("arguments".into(), rewritten);
+                                }
+                            }
+                            Err(e) => {
+                                denied = Some(format!("inner gate error: {e}"));
+                            }
+                        }
+                    }
                     if let Some(reason) = denied {
                         outputs[idx] = Some((
                             effective_input,
@@ -1020,6 +1083,19 @@ impl Agent {
                     continue;
                 }
 
+                // Silent empty-reply guard (Prime/Hermes pattern): if the provider returned EndTurn
+                // with zero tool calls and empty visible text, retry once before settling empty.
+                if stop_reason == StopReason::EndTurn
+                    && final_text.trim().is_empty()
+                    && !empty_reply_retried
+                {
+                    empty_reply_retried = true;
+                    self.session.lock().await.push_message(Message::user_text(
+                        "Your previous response contained no visible text or tool calls. Please complete the task or provide your concise final answer.",
+                    ))?;
+                    continue;
+                }
+
                 // If a mid-turn steer arrived before settling, deliver it and continue!
                 let steers: Vec<String> = {
                     let mut q = self.pending_steers.lock().await;
@@ -1043,8 +1119,13 @@ impl Agent {
                         .push_message(Message::user_text(fail_msg))?;
                     continue;
                 }
+                settled_normally = true;
                 break;
             }
+        }
+
+        if !settled_normally && halted_reason.is_none() {
+            halted_reason = Some(format!("max_turns reached ({})", self.config.max_turns));
         }
 
         let metrics = self.metrics.lock().await.clone();
@@ -1067,6 +1148,14 @@ impl Agent {
         seg: &mut SegmentTracker,
     ) {
         let mut metrics = self.metrics.lock().await;
+        // Roll subagent spend into parent metrics so `--max-cost-usd` can never be bypassed!
+        if tool_name == "Subagent"
+            && let Some(child_cost) = out.details.get("cost_usd").and_then(|v| v.as_f64())
+            && child_cost.is_finite()
+            && child_cost > 0.0
+        {
+            metrics.total_usage.cost_usd += child_cost;
+        }
         seg.record_tool_outcome(tool_name, input, out, &mut metrics);
     }
 
@@ -1112,6 +1201,46 @@ impl Agent {
         .await?;
         Ok(())
     }
+}
+
+/// Conservative repetition-loop detector (inspired by Hermes `repetition_guard.py`):
+/// returns `true` if a long fragment (>=400 chars) is dominated by >=5 verbatim repeats of a single
+/// normalized line or 60-char chunk covering >=50% of the output, preventing `MaxTokens` auto-continue
+/// from stitching degenerate loops.
+fn is_repetition_dominated(text: &str) -> bool {
+    const MIN_LEN: usize = 400;
+    const MIN_REPEATS: usize = 5;
+    if text.len() < MIN_LEN {
+        return false;
+    }
+    let mut line_counts: HashMap<&str, usize> = HashMap::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.len() >= 24 {
+            let c = line_counts.entry(t).or_insert(0);
+            *c += 1;
+            if *c >= MIN_REPEATS && (*c * t.len()) * 2 >= text.len() {
+                return true;
+            }
+        }
+    }
+    // Check 60-char non-overlapping stride windows for single-line repetition loops
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() >= MIN_LEN {
+        let mut win_counts: HashMap<String, usize> = HashMap::new();
+        for chunk in chars.chunks(60) {
+            if chunk.len() < 60 {
+                continue;
+            }
+            let key: String = chunk.iter().collect();
+            let c = win_counts.entry(key).or_insert(0);
+            *c += 1;
+            if *c >= MIN_REPEATS && (*c * 60) * 2 >= chars.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Convenience helper returning a `ToolResultBlock` vector for external callers.

@@ -5,7 +5,10 @@
 //! `ResolvedProviderSpec` (`providers.json`).
 
 use crate::catalog::{ProviderCatalog, ResolvedAuth, ResolvedProviderSpec};
-use crate::compat::{can_replay_origin, is_retryable_status, parse_retry_after_ms};
+use crate::compat::{
+    can_replay_origin, is_context_overflow, is_retryable_status, normalize_tool_call_id,
+    parse_retry_after_ms, repair_json,
+};
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
@@ -178,6 +181,9 @@ impl AnthropicProvider {
                 "name": "tool_search_tool_regex",
             }));
         }
+        let compat = self.spec.effective_compat(&req.model);
+        let allow_eager = compat.supports_eager_input_streaming.unwrap_or(true);
+        let require_sig = compat.requires_thinking_signature.unwrap_or(true);
         for t in &req.tools {
             let mut obj = json!({
                 "name": t.name,
@@ -188,7 +194,7 @@ impl AnthropicProvider {
                 if t.defer_loading {
                     m.insert("defer_loading".into(), json!(true));
                 }
-                if matches!(t.name.as_str(), "Edit" | "Write") {
+                if allow_eager && matches!(t.name.as_str(), "Edit" | "Write") {
                     m.insert("eager_input_streaming".into(), json!(true));
                 }
             }
@@ -217,7 +223,12 @@ impl AnthropicProvider {
 
         for (idx, msg) in req.messages.iter().enumerate() {
             let is_cp = req.checkpoint_index == Some(idx);
-            let blocks = encode_blocks(&msg.content, &self.spec.provider_id, &req.model);
+            let blocks = encode_blocks(
+                &msg.content,
+                &self.spec.provider_id,
+                &req.model,
+                require_sig,
+            );
             if blocks.is_empty() {
                 continue;
             }
@@ -370,7 +381,12 @@ impl AnthropicProvider {
     }
 }
 
-fn encode_blocks(blocks: &[ContentBlock], provider_id: &str, model: &str) -> Vec<Value> {
+fn encode_blocks(
+    blocks: &[ContentBlock],
+    provider_id: &str,
+    model: &str,
+    require_thinking_signature: bool,
+) -> Vec<Value> {
     blocks
         .iter()
         .filter_map(|b| match b {
@@ -380,8 +396,12 @@ fn encode_blocks(blocks: &[ContentBlock], provider_id: &str, model: &str) -> Vec
                 signature,
                 origin,
             } => {
-                // Only replay signed thinking from THIS exact Anthropic `(api, provider, model)`
-                // (legacy untagged blocks with a signature are also allowed for session resume).
+                // Prevent HTTP 400 after MaxTokens mid-thinking truncation: Claude requires a
+                // cryptographic signature on every replayed thinking block, while unsigned
+                // Anthropic-compatible gateways can set `requires_thinking_signature: false`.
+                if require_thinking_signature && signature.is_none() {
+                    return None;
+                }
                 let ok = can_replay_origin(
                     origin.as_ref(),
                     API_ID,
@@ -404,7 +424,7 @@ fn encode_blocks(blocks: &[ContentBlock], provider_id: &str, model: &str) -> Vec
                 id, name, input, ..
             } => Some(json!({
                 "type": "tool_use",
-                "id": id,
+                "id": normalize_tool_call_id(id),
                 "name": name,
                 "input": input,
             })),
@@ -432,7 +452,7 @@ fn encode_blocks(blocks: &[ContentBlock], provider_id: &str, model: &str) -> Vec
                     .collect();
                 Some(json!({
                     "type": "tool_result",
-                    "tool_use_id": tool_use_id,
+                    "tool_use_id": normalize_tool_call_id(tool_use_id),
                     "content": inner,
                     "is_error": is_error,
                 }))
@@ -559,12 +579,7 @@ impl Provider for AnthropicProvider {
             if !status.is_success() {
                 let retry_after_ms = parse_retry_after_ms(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                let low = text.to_ascii_lowercase();
-                if low.contains("prompt is too long")
-                    || low.contains("context length")
-                    || low.contains("too many tokens")
-                    || low.contains("maximum context")
-                {
+                if is_context_overflow(Some(status.as_u16()), &text) {
                     return Err(CarnotError::ContextOverflow(text));
                 }
                 return Err(CarnotError::Provider {
@@ -626,14 +641,37 @@ impl Provider for AnthropicProvider {
                         if let Some((err_msg, retryable)) =
                             handle_sse_frame(&frame_str, &mut state, default_ttl, &tx).await
                         {
-                            let _ = tx
-                                .send(StreamEvent::Error {
+                            let ev = if is_context_overflow(None, &err_msg) {
+                                StreamEvent::ContextOverflow(err_msg)
+                            } else {
+                                StreamEvent::Error {
                                     message: err_msg,
                                     retryable,
-                                })
-                                .await;
+                                }
+                            };
+                            let _ = tx.send(ev).await;
                             return;
                         }
+                    }
+                }
+
+                // Flush any final SSE frame not terminated by trailing blank line on EOF
+                if !raw_buf.is_empty() {
+                    let tail = String::from_utf8_lossy(&raw_buf);
+                    if !tail.trim().is_empty()
+                        && let Some((err_msg, retryable)) =
+                            handle_sse_frame(&tail, &mut state, default_ttl, &tx).await
+                    {
+                        let ev = if is_context_overflow(None, &err_msg) {
+                            StreamEvent::ContextOverflow(err_msg)
+                        } else {
+                            StreamEvent::Error {
+                                message: err_msg,
+                                retryable,
+                            }
+                        };
+                        let _ = tx.send(ev).await;
+                        return;
                     }
                 }
 
@@ -715,14 +753,17 @@ impl BlockBuilder {
                 let trimmed = json_buf.trim();
                 let (input, invalid_json) = if trimmed.is_empty() {
                     (json!({}), None)
+                } else if let Some(v) = repair_json(trimmed) {
+                    (v, None)
                 } else {
-                    match serde_json::from_str::<Value>(trimmed) {
-                        Ok(v) => (v, None),
-                        Err(e) => (
-                            json!({}),
-                            Some(format!("malformed tool JSON ({e}): {trimmed}")),
-                        ),
-                    }
+                    let err = serde_json::from_str::<Value>(trimmed)
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "invalid JSON".into());
+                    (
+                        json!({}),
+                        Some(format!("malformed tool JSON ({err}): {trimmed}")),
+                    )
                 };
                 Some(ContentBlock::ToolUse {
                     id,
@@ -895,7 +936,7 @@ async fn handle_sse_frame(
                     }
                     (BlockBuilder::Thinking { sig, .. }, Some("signature_delta")) => {
                         if let Some(s) = delta.get("signature").and_then(Value::as_str) {
-                            *sig = Some(s.to_string());
+                            sig.get_or_insert_with(String::new).push_str(s);
                         }
                     }
                     (BlockBuilder::ToolUse { json_buf, .. }, Some("input_json_delta"))
@@ -914,14 +955,17 @@ async fn handle_sse_frame(
                 let trimmed = json_buf.trim();
                 let (input, invalid_json) = if trimmed.is_empty() {
                     (json!({}), None)
+                } else if let Some(val) = repair_json(trimmed) {
+                    (val, None)
                 } else {
-                    match serde_json::from_str::<Value>(trimmed) {
-                        Ok(val) => (val, None),
-                        Err(e) => (
-                            json!({}),
-                            Some(format!("malformed tool JSON ({e}): {trimmed}")),
-                        ),
-                    }
+                    let err = serde_json::from_str::<Value>(trimmed)
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "invalid JSON".into());
+                    (
+                        json!({}),
+                        Some(format!("malformed tool JSON ({err}): {trimmed}")),
+                    )
                 };
                 let _ = tx
                     .send(StreamEvent::ToolCallReady {
@@ -977,6 +1021,7 @@ mod tests {
                 defer_loading: false,
             }],
             prefix_hash: "abc".into(),
+            session_id: "sess-1".into(),
             messages: vec![
                 Arc::new(Message::user_text("cp")),
                 Arc::new(Message::system_note("receipt")),
@@ -1012,6 +1057,7 @@ mod tests {
             static_system_prompt: "STATIC".into(),
             tools: vec![],
             prefix_hash: "abc".into(),
+            session_id: "sess-1".into(),
             messages: vec![
                 Arc::new(Message::user_text("u0")),
                 Arc::new(Message::assistant_text("a0")),

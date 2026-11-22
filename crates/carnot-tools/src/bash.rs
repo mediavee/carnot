@@ -26,14 +26,14 @@ const MAX_RETAINED_JOBS: usize = 64;
 
 #[derive(Debug, Default)]
 struct BoundedOutput {
-    /// Raw unread byte ring (capped at `MAX_JOB_BUFFER_BYTES`, keeping latest tail bytes — fixes B3 & N15!)
-    pending_bytes: Vec<u8>,
+    /// Raw unread byte ring (O(1) front eviction capped at `MAX_JOB_BUFFER_BYTES` — fixes B3 & N15!)
+    pending_bytes: std::collections::VecDeque<u8>,
     omitted_bytes: usize,
 }
 
 impl BoundedOutput {
     fn push_bytes(&mut self, chunk: &[u8]) {
-        self.pending_bytes.extend_from_slice(chunk);
+        self.pending_bytes.extend(chunk);
         if self.pending_bytes.len() > MAX_JOB_BUFFER_BYTES {
             let excess = self.pending_bytes.len() - MAX_JOB_BUFFER_BYTES;
             self.pending_bytes.drain(..excess);
@@ -51,7 +51,7 @@ impl BoundedOutput {
             self.omitted_bytes = 0;
         }
         if !self.pending_bytes.is_empty() {
-            let bytes = std::mem::take(&mut self.pending_bytes);
+            let bytes: Vec<u8> = self.pending_bytes.drain(..).collect();
             s.push_str(&String::from_utf8_lossy(&bytes));
         }
         s
@@ -146,15 +146,19 @@ fn status_to_exit_code(status: std::process::ExitStatus) -> i32 {
 async fn kill_process_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
+        let kill_bin = ["/bin/kill", "/usr/bin/kill"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .unwrap_or("kill");
         let pgid = format!("-{pid}");
-        let _ = tokio::process::Command::new("/bin/kill")
+        let _ = tokio::process::Command::new(kill_bin)
             .args(["-TERM", &pgid])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .await;
         tokio::time::sleep(Duration::from_millis(80)).await;
-        let _ = tokio::process::Command::new("/bin/kill")
+        let _ = tokio::process::Command::new(kill_bin)
             .args(["-KILL", &pgid])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -265,11 +269,15 @@ impl Tool for BashTool {
 
                 let mut rx = job.exit_rx.clone();
                 if rx.borrow().is_none() {
-                    let _ = tokio::time::timeout(
-                        Duration::from_millis(wait_ms),
-                        rx.wait_for(|v| v.is_some()),
-                    )
-                    .await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            return Ok(ToolOutput::err_text(format!("Cancelled while polling {job_id}")));
+                        }
+                        _ = tokio::time::timeout(
+                            Duration::from_millis(wait_ms),
+                            rx.wait_for(|v| v.is_some()),
+                        ) => {}
+                    }
                 }
                 let exit = *rx.borrow();
                 let delta = job.output.lock().expect("lock").take_delta();

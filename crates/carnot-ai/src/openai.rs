@@ -15,13 +15,14 @@
 
 use crate::catalog::{ProviderCatalog, ResolvedAuth, ResolvedProviderSpec};
 use crate::compat::{
-    apply_usage_map, can_replay_origin, is_retryable_status, parse_retry_after_ms,
+    apply_usage_map, can_replay_origin, is_context_overflow, is_retryable_status,
+    parse_retry_after_ms, repair_json, session_cache_key,
 };
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role, StopReason,
-    ToolResultBlock, Usage,
+    CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role,
+    StopReason, ToolResultBlock, Usage,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -306,13 +307,26 @@ impl OpenAiProvider {
             if compat.supports_prompt_cache_key.unwrap_or(false) {
                 m.insert(
                     "prompt_cache_key".into(),
-                    json!(&req.prefix_hash[..16.min(req.prefix_hash.len())]),
+                    json!(session_cache_key(&req.prefix_hash, &req.session_id)),
                 );
             }
+            if compat.supports_prompt_cache_retention.unwrap_or(false)
+                && matches!(req.cache_ttl, CacheTtl::Long1h | CacheTtl::Hybrid)
+            {
+                m.insert("prompt_cache_retention".into(), json!("24h"));
+            }
+            let allow_xhigh = compat.supports_xhigh_reasoning.unwrap_or(false);
             let effort_str = match req.effort {
                 ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "medium",
-                ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
+                ReasoningEffort::High => "high",
+                ReasoningEffort::Xhigh | ReasoningEffort::Max => {
+                    if allow_xhigh {
+                        "xhigh"
+                    } else {
+                        "high"
+                    }
+                }
             };
             if compat.supports_reasoning_effort.unwrap_or(false) {
                 m.insert("reasoning_effort".into(), json!(effort_str));
@@ -358,7 +372,7 @@ impl Provider for OpenAiProvider {
             if let Some(ref hdr) = compat.session_id_header {
                 rb = rb.header(
                     hdr.as_str(),
-                    &request.prefix_hash[..16.min(request.prefix_hash.len())],
+                    session_cache_key(&request.prefix_hash, &request.session_id),
                 );
             }
 
@@ -381,11 +395,7 @@ impl Provider for OpenAiProvider {
             if !status.is_success() {
                 let retry_after_ms = parse_retry_after_ms(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                let lower = text.to_ascii_lowercase();
-                if lower.contains("context_length_exceeded")
-                    || lower.contains("maximum context length")
-                    || lower.contains("prompt is too long")
-                {
+                if is_context_overflow(Some(status.as_u16()), &text) {
                     return Err(CarnotError::ContextOverflow(text));
                 }
                 return Err(CarnotError::Provider {
@@ -439,6 +449,11 @@ impl Provider for OpenAiProvider {
                                 }
                                 let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
                                 if let Some(err) = v.get("error") {
+                                    let err_str = err.to_string();
+                                    if is_context_overflow(None, &err_str) {
+                                        let _ = tx.send(StreamEvent::ContextOverflow(err_str)).await;
+                                        return;
+                                    }
                                     let err_type = err
                                         .get("type")
                                         .or_else(|| err.get("code"))
@@ -453,7 +468,7 @@ impl Provider for OpenAiProvider {
                                             | "insufficient_quota"
                                     );
                                     let _ = tx.send(StreamEvent::Error {
-                                        message: err.to_string(),
+                                        message: err_str,
                                         retryable,
                                     }).await;
                                     return;
@@ -542,14 +557,17 @@ impl Provider for OpenAiProvider {
                     let trimmed = args.trim();
                     let (input, invalid_json) = if trimmed.is_empty() {
                         (json!({}), None)
+                    } else if let Some(v) = repair_json(trimmed) {
+                        (v, None)
                     } else {
-                        match serde_json::from_str::<Value>(trimmed) {
-                            Ok(v) => (v, None),
-                            Err(e) => (
-                                json!({}),
-                                Some(format!("malformed tool JSON ({e}): {trimmed}")),
-                            ),
-                        }
+                        let err = serde_json::from_str::<Value>(trimmed)
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "invalid JSON".into());
+                        (
+                            json!({}),
+                            Some(format!("malformed tool JSON ({err}): {trimmed}")),
+                        )
                     };
                     let _ = tx
                         .send(StreamEvent::ToolCallReady {

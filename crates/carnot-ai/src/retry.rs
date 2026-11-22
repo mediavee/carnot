@@ -44,12 +44,20 @@ impl Provider for ResilientProvider {
             .unwrap_or(false)
     }
 
+    fn effort_preserves_cache(&self, model: &str) -> bool {
+        self.providers
+            .first()
+            .map(|p| p.effort_preserves_cache(model))
+            .unwrap_or(false)
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<mpsc::Receiver<StreamEvent>>> {
         Box::pin(async move {
+            const MAX_RETRY_DELAY_MS: u64 = 60_000;
             let mut last_err: Option<CarnotError> = None;
             for provider in &self.providers {
                 for attempt in 0..self.max_attempts_per_provider {
@@ -64,19 +72,44 @@ impl Provider for ResilientProvider {
                             provider: prov,
                             message,
                         }) => {
+                            let is_last_attempt = attempt + 1 >= self.max_attempts_per_provider;
+                            // Fail fast if server explicitly demands a wait longer than our cap
+                            // (e.g. 1-hour quota block) instead of burning 5x60s retries.
+                            let exceeds_cap =
+                                retry_after_ms.is_some_and(|ms| ms > MAX_RETRY_DELAY_MS);
+                            last_err = Some(CarnotError::Provider {
+                                provider: prov.clone(),
+                                message: message.clone(),
+                                retryable: true,
+                                retry_after_ms,
+                            });
+                            if is_last_attempt || exceeds_cap {
+                                tracing::warn!(
+                                    provider = %prov,
+                                    attempt,
+                                    ?retry_after_ms,
+                                    %message,
+                                    "transient provider error exhausted retry budget or exceeded max delay; failing over"
+                                );
+                                break;
+                            }
                             let shift = 1u64.checked_shl(attempt.min(10)).unwrap_or(1024);
+                            let base_delay = retry_after_ms
+                                .unwrap_or_else(|| self.base_backoff_ms.saturating_mul(shift))
+                                .min(MAX_RETRY_DELAY_MS);
+                            // Proportional +-20% jitter desynchronizes 429 retry storms cleanly
                             let nanos = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.subsec_nanos() as u64)
                                 .unwrap_or(0);
-                            let jitter = (nanos ^ (attempt as u64).wrapping_mul(0x9e37_79b9)) % 400;
-                            let delay = retry_after_ms
-                                .unwrap_or_else(|| {
-                                    self.base_backoff_ms
-                                        .saturating_mul(shift)
-                                        .saturating_add(jitter)
-                                })
-                                .min(60_000);
+                            let jitter_band = (base_delay / 5).max(1);
+                            let jitter_offset = (nanos
+                                ^ (attempt as u64).wrapping_mul(0x9e37_79b9))
+                                % (jitter_band * 2);
+                            let delay = base_delay
+                                .saturating_sub(jitter_band)
+                                .saturating_add(jitter_offset)
+                                .clamp(100, MAX_RETRY_DELAY_MS);
                             tracing::warn!(
                                 provider = %prov,
                                 attempt,
@@ -84,12 +117,6 @@ impl Provider for ResilientProvider {
                                 %message,
                                 "transient provider error; retrying"
                             );
-                            last_err = Some(CarnotError::Provider {
-                                provider: prov,
-                                message,
-                                retryable: true,
-                                retry_after_ms,
-                            });
                             tokio::select! {
                                 _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
                                 _ = tokio::time::sleep(Duration::from_millis(delay)) => {}

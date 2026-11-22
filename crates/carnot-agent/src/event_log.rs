@@ -122,6 +122,10 @@ impl EventStream {
     pub async fn next(&mut self) -> EventEnvelope {
         loop {
             let notified = self.log.notify.notified();
+            tokio::pin!(notified);
+            // CRITICAL: register in Tokio's Notify waiter queue BEFORE locking `state` so a
+            // concurrent `notify_waiters()` between unlock and `.await` can NEVER be lost!
+            notified.as_mut().enable();
             {
                 let st = self.log.state.lock().expect("event_log lock");
                 if let Some(oldest) = st.ring.front() {
