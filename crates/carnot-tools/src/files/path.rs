@@ -37,8 +37,59 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
+/// Resolves a candidate path while following existing AND dangling symlinks up to 16 hops
+/// so a dangling symlink (`workspace/escape -> /etc/nonexistent`) can never bypass confinement.
+fn resolve_with_symlinks(candidate: &Path, depth: usize) -> std::result::Result<PathBuf, String> {
+    if depth > 16 {
+        return Err(format!(
+            "too many levels of symbolic links resolving `{}`",
+            candidate.display()
+        ));
+    }
+    let mut existing = candidate;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while existing.symlink_metadata().is_err() {
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                match existing.parent() {
+                    Some(parent) => existing = parent,
+                    None => break,
+                }
+            }
+            None => break,
+        }
+    }
+
+    let mut resolved = if let Ok(canon) = fs::canonicalize(existing) {
+        canon
+    } else if existing
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        let link_target = fs::read_link(existing)
+            .map_err(|e| format!("cannot read symlink `{}`: {e}", existing.display()))?;
+        let next = if link_target.is_absolute() {
+            normalize_lexical(&link_target)
+        } else {
+            let parent = existing.parent().unwrap_or_else(|| Path::new("/"));
+            normalize_lexical(&parent.join(link_target))
+        };
+        resolve_with_symlinks(&next, depth + 1)?
+    } else {
+        existing.to_path_buf()
+    };
+
+    for seg in tail.into_iter().rev() {
+        resolved.push(seg);
+    }
+    Ok(normalize_lexical(&resolved))
+}
+
 /// Resolves `raw` relative to `workspace_root` and enforces confinement within
-/// `workspace_root` or `extra_roots` (resolving symlinks on the longest existing ancestor).
+/// `workspace_root` or `extra_roots` (resolving symlinks, including dangling symlinks,
+/// on the longest existing ancestor).
 pub fn resolve_confined_path(
     workspace_root: &Path,
     extra_roots: &[PathBuf],
@@ -63,26 +114,7 @@ pub fn resolve_confined_path(
         }
     };
 
-    // Walk up to the longest existing ancestor and canonicalize it to defeat symlink escapes!
-    let mut existing = candidate.as_path();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    while !existing.exists() {
-        match existing.file_name() {
-            Some(name) => {
-                tail.push(name.to_os_string());
-                match existing.parent() {
-                    Some(parent) => existing = parent,
-                    None => break,
-                }
-            }
-            None => break,
-        }
-    }
-    let mut resolved = fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
-    for seg in tail.into_iter().rev() {
-        resolved.push(seg);
-    }
-    resolved = normalize_lexical(&resolved);
+    let resolved = resolve_with_symlinks(&candidate, 0)?;
 
     if allowed_roots.iter().any(|root| resolved.starts_with(root)) {
         Ok(resolved)

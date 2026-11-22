@@ -71,9 +71,39 @@ fn read_confined_markdown(root: &Path, path: &Path) -> Option<String> {
     fs::read_to_string(resolved).ok()
 }
 
+fn load_global_instructions(max_bytes: usize) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let p = PathBuf::from(home).join(".carnot").join("AGENTS.md");
+    let meta = fs::symlink_metadata(&p).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&p).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let slice = truncate_utf8(trimmed, max_bytes);
+    let suffix = if slice.len() < trimmed.len() {
+        "\n[... truncated at global 2 KiB budget ...]"
+    } else {
+        ""
+    };
+    Some(format!(
+        "[global-instructions:~/.carnot/AGENTS.md]\n{slice}{suffix}"
+    ))
+}
+
 fn load_repo_instructions(root: &Path) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut budget = MAX_INSTRUCTIONS_BYTES;
+
+    // Optional user-global instructions (~/.carnot/AGENTS.md), capped at 2 KiB so workspace
+    // instructions always retain at least 6 KiB of the Turn-1 budget (0 static prefix cost).
+    if let Some(global) = load_global_instructions(2048) {
+        budget = budget.saturating_sub(global.len().min(2048));
+        parts.push(global);
+    }
 
     for fname in ["AGENTS.md", "CLAUDE.md"] {
         if budget == 0 {

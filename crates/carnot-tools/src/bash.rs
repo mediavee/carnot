@@ -13,7 +13,7 @@ use carnot_cas::{CasStore, shape_command_output};
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
 use carnot_sandbox::{SandboxPolicy, annotate_sandbox_denial, build_sandboxed_shell_in_dir};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -169,12 +169,21 @@ async fn kill_process_group(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+struct FormattedBashOutput {
+    text: String,
+    handle: Option<String>,
+    bytes_saved: usize,
+    compressor: Option<&'static str>,
+    deduplicated: bool,
+}
+
 #[derive(Debug)]
 pub struct BashTool {
     workspace_root: PathBuf,
     sandbox: SandboxPolicy,
     cas: Arc<CasStore>,
     jobs: Arc<JobRegistry>,
+    seen_cas_hashes: Arc<Mutex<HashSet<String>>>,
     cas_enabled: bool,
     spill_threshold: usize,
     preview_max: usize,
@@ -202,6 +211,7 @@ impl BashTool {
             sandbox,
             cas,
             jobs,
+            seen_cas_hashes: Arc::new(Mutex::new(HashSet::new())),
             cas_enabled,
             spill_threshold,
             preview_max,
@@ -211,11 +221,19 @@ impl BashTool {
         }
     }
 
+    /// Attaches a shared CAS hash set (cleared on compaction/rewind by `ToolRegistry::reset_read_tracker`)
+    /// so repeated identical large command outputs collapse to a 1-line dedup receipt.
+    pub fn with_seen_cas_hashes(mut self, seen_cas_hashes: Arc<Mutex<HashSet<String>>>) -> Self {
+        self.seen_cas_hashes = seen_cas_hashes;
+        self
+    }
+
     fn format_output(
         &self,
         command: &str,
         raw: &str,
-    ) -> Result<(String, Option<String>, usize, Option<&'static str>)> {
+        allow_dedup: bool,
+    ) -> Result<FormattedBashOutput> {
         let shaped = shape_command_output(
             Some(command),
             raw,
@@ -223,9 +241,33 @@ impl BashTool {
             self.spill_threshold,
             self.preview_max,
         )?;
+        if allow_dedup
+            && let Some(ref handle) = shaped.spilled
+            && let Ok(mut seen) = self.seen_cas_hashes.lock()
+            && !seen.insert(handle.hash.clone())
+        {
+            let dedup_text = format!(
+                "[identical output to earlier run — {} B ({} lines) archived at {}; inspect with Read/Grep if needed]",
+                handle.bytes, handle.lines, handle.rel_path
+            );
+            let saved = shaped.raw_bytes.saturating_sub(dedup_text.len());
+            return Ok(FormattedBashOutput {
+                text: dedup_text,
+                handle: Some(handle.rel_path.clone()),
+                bytes_saved: saved,
+                compressor: shaped.compressor,
+                deduplicated: true,
+            });
+        }
         let saved = shaped.raw_bytes.saturating_sub(shaped.shaped_bytes);
         let handle_path = shaped.spilled.map(|h| h.rel_path);
-        Ok((shaped.text, handle_path, saved, shaped.compressor))
+        Ok(FormattedBashOutput {
+            text: shaped.text,
+            handle: handle_path,
+            bytes_saved: saved,
+            compressor: shaped.compressor,
+            deduplicated: false,
+        })
     }
 }
 
@@ -281,8 +323,13 @@ impl Tool for BashTool {
                 }
                 let exit = *rx.borrow();
                 let delta = job.output.lock().expect("lock").take_delta();
-                let (mut shaped, handle, bytes_saved, compressor) =
-                    self.format_output(&job.command, &delta)?;
+                let FormattedBashOutput {
+                    text: mut shaped,
+                    handle,
+                    bytes_saved,
+                    compressor,
+                    deduplicated,
+                } = self.format_output(&job.command, &delta, exit.is_some())?;
                 if let Some(code) = exit {
                     if code != 0
                         && let Some(note) = annotate_sandbox_denial(&delta, &self.sandbox)
@@ -316,6 +363,7 @@ impl Tool for BashTool {
                         "command": job.command,
                         "bytes_saved": bytes_saved,
                         "compressor": compressor,
+                        "deduplicated": deduplicated,
                     }),
                 });
             }
@@ -465,8 +513,13 @@ impl Tool for BashTool {
             if completed {
                 let exit = wait_rx.borrow().unwrap_or(-1);
                 let raw = job.output.lock().expect("lock").take_all();
-                let (mut shaped, handle, bytes_saved, compressor) =
-                    self.format_output(command, &raw)?;
+                let FormattedBashOutput {
+                    text: mut shaped,
+                    handle,
+                    bytes_saved,
+                    compressor,
+                    deduplicated,
+                } = self.format_output(command, &raw, true)?;
                 if exit != 0
                     && let Some(note) = annotate_sandbox_denial(&raw, &self.sandbox)
                 {
@@ -488,6 +541,7 @@ impl Tool for BashTool {
                         "handle": handle,
                         "bytes_saved": bytes_saved,
                         "compressor": compressor,
+                        "deduplicated": deduplicated,
                         "yielded": false,
                     }),
                 })
@@ -498,8 +552,8 @@ impl Tool for BashTool {
                 let header = if partial.is_empty() {
                     String::new()
                 } else {
-                    let (p_shaped, _, _, _) = self.format_output(command, &partial)?;
-                    format!("{p_shaped}\n")
+                    let p = self.format_output(command, &partial, false)?;
+                    format!("{}\n", p.text)
                 };
                 Ok(ToolOutput::ok_text(format!(
                     "{header}[yielded after {}ms -> {job_id} still running: `{command}` — call Bash{{\"job\":\"{job_id}\"}} to collect or {{\"job\":\"{job_id}\",\"kill\":true}} to stop]",
@@ -512,5 +566,56 @@ impl Tool for BashTool {
                 })))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repeated_spilled_bash_output_deduplicates_and_resets_after_clear() {
+        let dir = std::env::temp_dir().join(format!("carnot-bash-dedup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut cfg = carnot_core::CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        cfg.cas_spill_threshold_bytes = 256;
+        cfg.cas_preview_max_bytes = 128;
+
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let reg = crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let bash = reg.get("Bash").expect("Bash");
+
+        let cmd = "python3 -c \"print('\\n'.join(f'entry-{i:04d}-payload-abcdefghij' for i in range(40)))\"";
+        let first = bash
+            .execute(json!({"command": cmd}), CancellationToken::new())
+            .await
+            .expect("first run");
+        assert!(!first.is_error);
+        assert_eq!(first.details["deduplicated"], false);
+        assert!(first.text_only().contains(".carnot/h/"));
+
+        let second = bash
+            .execute(json!({"command": cmd}), CancellationToken::new())
+            .await
+            .expect("second run");
+        assert!(!second.is_error);
+        assert_eq!(second.details["deduplicated"], true);
+        assert!(
+            second
+                .text_only()
+                .contains("identical output to earlier run")
+        );
+        assert!(second.text_only().len() < first.text_only().len());
+
+        // Compaction / rewind calls `reset_read_tracker()` which must clear seen CAS hashes too!
+        reg.reset_read_tracker();
+        let third = bash
+            .execute(json!({"command": cmd}), CancellationToken::new())
+            .await
+            .expect("third run after reset");
+        assert_eq!(third.details["deduplicated"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -140,14 +140,26 @@ impl Resolve for SsrfSafeDnsResolver {
     }
 }
 
-/// Builds a `reqwest::Client` hardened against SSRF, DNS rebinding, and proxy bypasses.
+/// Builds a `reqwest::Client` hardened against SSRF, DNS rebinding, and proxy bypasses,
+/// with automatic `webpki-root-certs` fallback for minimal containers without OS CA bundles.
 pub fn build_ssrf_safe_client(timeout_secs: u64) -> std::result::Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(Arc::new(SsrfSafeDnsResolver))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(timeout_secs))
+    let make_builder = || {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(SsrfSafeDnsResolver))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+    };
+    if let Ok(client) = make_builder().build() {
+        return Ok(client);
+    }
+    let certs: Vec<reqwest::Certificate> = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok())
+        .collect();
+    make_builder()
+        .tls_certs_only(certs)
         .build()
         .map_err(|e| format!("failed to build SSRF-safe HTTP client: {e}"))
 }

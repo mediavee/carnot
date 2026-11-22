@@ -20,7 +20,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT_SECS: u64 = 15;
+const SSE_KEEPALIVE_SECS: u64 = 30;
 
 /// Starts the HTTP/SSE server using `CARNOT_HTTP_TOKEN` or a newly generated 256-bit token saved at
 /// `~/.carnot/server.token` (`0600`).
@@ -195,6 +197,7 @@ async fn handle_conn(
         let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
 
         let mut content_len: usize = 0;
+        let mut content_len_err: Option<(u16, &'static str)> = None;
         let mut last_event_id: Option<u64> = None;
         let mut auth_header: Option<String> = None;
         let mut content_type: Option<String> = None;
@@ -211,7 +214,15 @@ async fn handle_conn(
             if let Some((k, v)) = h.split_once(':') {
                 let val = v.trim();
                 if k.eq_ignore_ascii_case("content-length") {
-                    content_len = val.parse().unwrap_or(0).min(8 * 1024 * 1024);
+                    match val.parse::<usize>() {
+                        Ok(n) if n > MAX_BODY_BYTES => {
+                            content_len_err = Some((413, "payload exceeds 8 MiB limit"));
+                        }
+                        Ok(n) => content_len = n,
+                        Err(_) => {
+                            content_len_err = Some((400, "invalid Content-Length header"));
+                        }
+                    }
                 } else if k.eq_ignore_ascii_case("last-event-id") {
                     last_event_id = val.parse().ok();
                 } else if k.eq_ignore_ascii_case("authorization") {
@@ -226,13 +237,15 @@ async fn handle_conn(
             }
         }
 
-        let mut body = vec![0u8; content_len];
-        if content_len > 0 {
+        let mut body = Vec::new();
+        if content_len_err.is_none() && content_len > 0 {
+            body.resize(content_len, 0u8);
             reader.read_exact(&mut body).await?;
         }
         Ok::<_, std::io::Error>(Some((
             method,
             path,
+            content_len_err,
             last_event_id,
             auth_header,
             content_type,
@@ -243,11 +256,24 @@ async fn handle_conn(
     })
     .await;
 
-    let Ok(Ok(Some((method, path, last_event_id, auth_header, content_type, origin, host, body)))) =
-        req_head
+    let Ok(Ok(Some((
+        method,
+        path,
+        content_len_err,
+        last_event_id,
+        auth_header,
+        content_type,
+        origin,
+        host,
+        body,
+    )))) = req_head
     else {
         return Ok(());
     };
+
+    if let Some((status, msg)) = content_len_err {
+        return write_json(&mut write_half, status, &json!({"error": msg})).await;
+    }
 
     // Host & Origin anti-CSRF / anti-DNS-rebinding guards (C2)
     if let Some(ref h) = host
@@ -319,13 +345,27 @@ async fn handle_conn(
 
             let mut ev_stream = agent.subscribe_from(last_event_id.unwrap_or(0));
             loop {
-                let env = ev_stream.next().await;
-                if let Ok(line) = serde_json::to_string(&env) {
-                    let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
-                    if write_half.write_all(frame.as_bytes()).await.is_err() {
-                        break;
+                match tokio::time::timeout(
+                    Duration::from_secs(SSE_KEEPALIVE_SECS),
+                    ev_stream.next(),
+                )
+                .await
+                {
+                    Ok(env) => {
+                        if let Ok(line) = serde_json::to_string(&env) {
+                            let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
+                            if write_half.write_all(frame.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
                     }
-                    let _ = write_half.flush().await;
+                    Err(_) => {
+                        if write_half.write_all(b": keepalive\n\n").await.is_err() {
+                            break;
+                        }
+                        let _ = write_half.flush().await;
+                    }
                 }
             }
             Ok(())
@@ -338,6 +378,16 @@ async fn handle_conn(
                 .unwrap_or("")
                 .to_string();
             agent.steer(msg).await;
+            write_json(&mut write_half, 200, &json!({"queued": true})).await
+        }
+        ("POST", "/v1/follow-up") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let msg = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            agent.follow_up(msg).await;
             write_json(&mut write_half, 200, &json!({"queued": true})).await
         }
         ("POST", "/v1/abort") => {
@@ -393,20 +443,34 @@ async fn handle_conn(
                 let run_task = tokio::spawn(async move { ag_run.prompt(prompt).await });
 
                 loop {
-                    let env = ev_stream.next().await;
-                    let is_done = matches!(
-                        env.event,
-                        AgentEvent::RunSettled { .. } | AgentEvent::Error { .. }
-                    );
-                    if let Ok(line) = serde_json::to_string(&env) {
-                        let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
-                        if write_half.write_all(frame.as_bytes()).await.is_err() {
-                            break;
+                    match tokio::time::timeout(
+                        Duration::from_secs(SSE_KEEPALIVE_SECS),
+                        ev_stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(env) => {
+                            let is_done = matches!(
+                                env.event,
+                                AgentEvent::RunSettled { .. } | AgentEvent::Error { .. }
+                            );
+                            if let Ok(line) = serde_json::to_string(&env) {
+                                let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
+                                if write_half.write_all(frame.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                let _ = write_half.flush().await;
+                            }
+                            if is_done {
+                                break;
+                            }
                         }
-                        let _ = write_half.flush().await;
-                    }
-                    if is_done {
-                        break;
+                        Err(_) => {
+                            if write_half.write_all(b": keepalive\n\n").await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
                     }
                 }
                 let _ = run_task.await;
@@ -425,10 +489,12 @@ async fn write_json(
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         _ => "Internal Server Error",
     };
@@ -536,6 +602,27 @@ mod tests {
         assert!(sse.contains("text/event-stream"));
         assert!(sse.contains("hello from http"));
         assert!(sse.contains("id: "));
+
+        // 5. Invalid Content-Length -> 400 Bad Request, oversized Content-Length -> 413 Payload Too Large
+        let r400 = send_raw(
+            addr,
+            "POST /v1/steer HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\nContent-Type: application/json\r\nContent-Length: notanumber\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r400.starts_with("HTTP/1.1 400"),
+            "expected 400, got: {r400}"
+        );
+
+        let r413 = send_raw(
+            addr,
+            "POST /v1/steer HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\nContent-Type: application/json\r\nContent-Length: 99999999\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r413.starts_with("HTTP/1.1 413"),
+            "expected 413, got: {r413}"
+        );
 
         srv.abort();
         let _ = std::fs::remove_dir_all(&dir);

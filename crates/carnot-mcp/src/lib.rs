@@ -135,6 +135,7 @@ pub struct McpManager {
     servers: BTreeMap<String, Arc<LazyServerHandle>>,
     summaries: Vec<McpServerSummary>,
     tools: Vec<Arc<dyn Tool>>,
+    refresh_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl McpManager {
@@ -143,6 +144,7 @@ impl McpManager {
             servers: BTreeMap::new(),
             summaries: Vec::new(),
             tools: Vec::new(),
+            refresh_handles: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -195,6 +197,7 @@ impl McpManager {
                             conn: Mutex::new(None),
                         });
 
+                        let mut refresh_handle: Option<tokio::task::JoinHandle<()>> = None;
                         let load_res: Result<(Vec<CachedToolEntry>, bool, ProtocolEra, String)> =
                             if let Some((cached, is_stale)) = cached_opt {
                                 if is_stale {
@@ -203,7 +206,7 @@ impl McpManager {
                                     let h_bg = Arc::clone(&handle);
                                     let nm_bg = name.clone();
                                     let ck_bg = cache_key.clone();
-                                    tokio::spawn(async move {
+                                    refresh_handle = Some(tokio::spawn(async move {
                                         *h_bg.hint_era.lock().await = None;
                                         if let Ok(client) = h_bg.get_or_connect().await
                                             && let Ok(resp) =
@@ -224,7 +227,7 @@ impl McpManager {
                                                 },
                                             );
                                         }
-                                    });
+                                    }));
                                 }
                                 Ok((cached.tools, true, cached.era, cached.protocol_version))
                             } else {
@@ -255,7 +258,15 @@ impl McpManager {
                                 }
                             };
 
-                        (name, transport_kind, lazy, trusted, handle, load_res)
+                        (
+                            name,
+                            transport_kind,
+                            lazy,
+                            trusted,
+                            handle,
+                            load_res,
+                            refresh_handle,
+                        )
                     }
                 });
 
@@ -263,8 +274,12 @@ impl McpManager {
         let mut servers = BTreeMap::new();
         let mut summaries = Vec::new();
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut refresh_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        for (name, transport, lazy, trusted, handle, load_res) in results {
+        for (name, transport, lazy, trusted, handle, load_res, refresh_handle) in results {
+            if let Some(jh) = refresh_handle {
+                refresh_handles.push(jh);
+            }
             match load_res {
                 Ok((entries, from_cache, era, protocol_version)) => {
                     summaries.push(McpServerSummary {
@@ -316,6 +331,7 @@ impl McpManager {
             servers,
             summaries,
             tools,
+            refresh_handles: std::sync::Mutex::new(refresh_handles),
         })
     }
 
@@ -338,8 +354,23 @@ impl McpManager {
     }
 
     pub async fn shutdown_all(&self) {
+        if let Ok(mut handles) = self.refresh_handles.lock() {
+            for jh in handles.drain(..) {
+                jh.abort();
+            }
+        }
         for h in self.servers.values() {
             h.shutdown().await;
+        }
+    }
+}
+
+impl Drop for McpManager {
+    fn drop(&mut self) {
+        if let Ok(mut handles) = self.refresh_handles.lock() {
+            for jh in handles.drain(..) {
+                jh.abort();
+            }
         }
     }
 }

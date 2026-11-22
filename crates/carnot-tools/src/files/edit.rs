@@ -265,10 +265,20 @@ impl Tool for EditTool {
                 let mut fuzzy_notes: Vec<String> = Vec::new();
                 let mut fuzzy_count = 0usize;
 
-                let all_line_ranges = hunks
+                let has_line_range = hunks
                     .iter()
-                    .all(|h| matches!(h, EditHunk::LineRange { .. }));
-                if all_line_ranges {
+                    .any(|h| matches!(h, EditHunk::LineRange { .. }));
+                let has_text = hunks.iter().any(|h| matches!(h, EditHunk::Text { .. }));
+                if has_line_range && has_text {
+                    return Ok(ToolOutput::err_text(
+                        "Edit cannot mix `start_line`/`end_line` hunks with `old_string` hunks in the same `edits` array (line numbers would shift). Use either all line-range hunks or all `old_string` hunks.",
+                    )
+                    .with_details(json!({
+                        "file_path": raw_path,
+                        "edit_failed": true,
+                    })));
+                }
+                if has_line_range {
                     let ranges: Vec<(usize, usize, &str)> = hunks
                         .iter()
                         .map(|h| match h {
@@ -295,36 +305,7 @@ impl Tool for EditTool {
                 } else {
                     for (h_idx, hunk) in hunks.iter().enumerate() {
                         match hunk {
-                            EditHunk::LineRange {
-                                start_line,
-                                end_line,
-                                new_string,
-                            } => match apply_line_range_hunks(
-                                &current,
-                                &[(*start_line, *end_line, new_string.as_str())],
-                                &raw_path,
-                            ) {
-                                Ok(next) => {
-                                    current = next;
-                                    total_replacements += 1;
-                                }
-                                Err(diag_err) => {
-                                    let prefix = if hunks.len() > 1 {
-                                        format!(
-                                            "Atomic batch aborted at hunk #{}/{}: ",
-                                            h_idx + 1,
-                                            hunks.len()
-                                        )
-                                    } else {
-                                        String::new()
-                                    };
-                                    return Ok(ToolOutput::err_text(format!("{prefix}{diag_err}"))
-                                        .with_details(json!({
-                                            "file_path": raw_path,
-                                            "edit_failed": true,
-                                        })));
-                                }
-                            },
+                            EditHunk::LineRange { .. } => unreachable!(),
                             EditHunk::Text {
                                 old_string,
                                 new_string,

@@ -12,7 +12,7 @@ use carnot_cas::CasStore;
 use carnot_core::{CarnotConfig, Result, ToolEffects, ToolOutput, ToolSpec};
 use carnot_sandbox::SandboxPolicy;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,7 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
     pub read_tracker: Arc<Mutex<tracker::ReadTracker>>,
+    pub seen_cas_hashes: Arc<Mutex<HashSet<String>>>,
     pub job_registry: Arc<bash::JobRegistry>,
     pub undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
     cas: Option<Arc<CasStore>>,
@@ -67,6 +68,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn with_canonical_lid_tools(config: &CarnotConfig, cas: Arc<CasStore>) -> Self {
         let read_tracker = Arc::new(Mutex::new(tracker::ReadTracker::new()));
+        let seen_cas_hashes = Arc::new(Mutex::new(HashSet::new()));
         let job_registry = Arc::new(bash::JobRegistry::new());
         let undo_stack = Arc::new(Mutex::new(Vec::new()));
         let sandbox = SandboxPolicy::for_workspace(
@@ -81,27 +83,31 @@ impl ToolRegistry {
             tools: HashMap::new(),
             order: Vec::new(),
             read_tracker: read_tracker.clone(),
+            seen_cas_hashes: seen_cas_hashes.clone(),
             job_registry: job_registry.clone(),
             undo_stack: undo_stack.clone(),
             cas: Some(Arc::clone(&cas)),
         };
 
-        reg.register(Arc::new(bash::BashTool::new(
-            config.workspace_root.clone(),
-            sandbox,
-            Arc::clone(&cas),
-            job_registry,
-            config.modules.cas_handles,
-            config.cas_spill_threshold_bytes,
-            config.cas_preview_max_bytes,
-            if config.modules.adaptive_yield {
-                config.bash_yield_ms
-            } else {
-                config.bash_max_timeout_ms
-            },
-            config.bash_max_timeout_ms,
-            config.extra_env.clone(),
-        )));
+        reg.register(Arc::new(
+            bash::BashTool::new(
+                config.workspace_root.clone(),
+                sandbox,
+                Arc::clone(&cas),
+                job_registry,
+                config.modules.cas_handles,
+                config.cas_spill_threshold_bytes,
+                config.cas_preview_max_bytes,
+                if config.modules.adaptive_yield {
+                    config.bash_yield_ms
+                } else {
+                    config.bash_max_timeout_ms
+                },
+                config.bash_max_timeout_ms,
+                config.extra_env.clone(),
+            )
+            .with_seen_cas_hashes(seen_cas_hashes),
+        ));
 
         reg.register(Arc::new(files::ReadTool::new(
             config.workspace_root.clone(),
@@ -203,11 +209,15 @@ impl ToolRegistry {
         out
     }
 
-    /// Resets disk-read tracking (called automatically after `Rewind-Receipt` or compaction
-    /// so the model is never handed an "unchanged" stub for forgotten turns).
+    /// Resets disk-read tracking and seen CAS dedup hashes (called automatically after
+    /// `Rewind-Receipt`, compaction, cold-pruning, or `load_session` so the model is never
+    /// handed an "unchanged" or "identical output" stub for forgotten turns).
     pub fn reset_read_tracker(&self) {
         if let Ok(mut guard) = self.read_tracker.lock() {
             guard.clear();
+        }
+        if let Ok(mut seen) = self.seen_cas_hashes.lock() {
+            seen.clear();
         }
     }
 

@@ -25,8 +25,8 @@ pub use subagent::SubagentModule;
 
 use carnot_ai::{Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    AgentEvent, CarnotConfig, CarnotError, ContentBlock, Message, Result, Role, StopReason,
-    ThermodynamicMetrics, ToolEffects, ToolOutput, ToolResultBlock, Usage,
+    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, Message, Result, Role,
+    StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolResultBlock, Usage,
 };
 use carnot_ext::{
     BoundaryAction, Module, PermissionBroker, ToolGateDecision, TurnBoundarySnapshot,
@@ -34,10 +34,10 @@ use carnot_ext::{
 };
 use carnot_session::SessionStore;
 use carnot_tools::ToolRegistry;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -65,6 +65,7 @@ pub struct Agent {
     raw_user_goal: Mutex<Option<String>>,
     user_instructions: Mutex<Vec<String>>,
     pending_steers: Mutex<Vec<String>>,
+    pending_follow_ups: Mutex<VecDeque<String>>,
     permission_broker: Mutex<Option<Arc<dyn PermissionBroker>>>,
 }
 
@@ -157,6 +158,7 @@ impl Agent {
             raw_user_goal: Mutex::new(hydrated_goal),
             user_instructions: Mutex::new(hydrated_followups),
             pending_steers: Mutex::new(Vec::new()),
+            pending_follow_ups: Mutex::new(VecDeque::new()),
             permission_broker: Mutex::new(None),
         })
     }
@@ -218,6 +220,15 @@ impl Agent {
         let msg = message.into();
         if !msg.trim().is_empty() {
             self.pending_steers.lock().await.push(msg);
+        }
+    }
+
+    /// Queues a post-turn follow-up prompt delivered ONLY after the current turn settles
+    /// (unlike `steer()`, which interrupts mid-turn right after the next tool batch).
+    pub async fn follow_up(&self, message: impl Into<String>) {
+        let msg = message.into();
+        if !msg.trim().is_empty() {
+            self.pending_follow_ups.lock().await.push_back(msg);
         }
     }
 
@@ -365,6 +376,37 @@ impl Agent {
                 if !turn1_blocks.is_empty() {
                     initial_text = format!("{}\n\n{initial_text}", turn1_blocks.join("\n\n"));
                 }
+            }
+        }
+
+        // Cold-cache opportunistic tool-result pruning (inspired by Hermes):
+        // ONLY when the provider's rolling prompt cache is ALREADY expired (zero cache breaks,
+        // zero LLM calls), replace oversized stale tool results outside the last 4 messages
+        // with compact handle-preserving stubs before the cold cache rewrite!
+        if self.config.modules.compaction {
+            let ttl_ms = match self.config.cache_ttl {
+                CacheTtl::Long1h => 3_610_000u64,
+                CacheTtl::Short5m | CacheTtl::Hybrid => 310_000u64,
+            };
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let reclaimed = {
+                let mut s = self.session.lock().await;
+                let cache_expired = s
+                    .last_activity_unix_ms()
+                    .map(|last| now_ms.saturating_sub(last) >= ttl_ms)
+                    .unwrap_or(false);
+                if cache_expired && s.active_messages().len() >= 8 {
+                    s.prune_cold_tool_results(4, 2_000, 24_000)?
+                } else {
+                    0
+                }
+            };
+            if reclaimed > 0 {
+                self.tools.reset_read_tracker();
+                self.metrics.lock().await.heat_shed_tokens += (reclaimed as u64) / 4;
             }
         }
 
@@ -1119,6 +1161,23 @@ impl Agent {
                         .push_message(Message::user_text(fail_msg))?;
                     continue;
                 }
+
+                // Deliver next queued post-turn follow-up prompt (FIFO) only after current turn settled
+                let next_followup = self.pending_follow_ups.lock().await.pop_front();
+                if let Some(followup) = next_followup {
+                    {
+                        let mut followups = self.user_instructions.lock().await;
+                        followups.push(clip_anchor_text(&followup, 4_000));
+                        if followups.len() > 16 {
+                            followups.remove(0);
+                        }
+                    }
+                    let mut s = self.session.lock().await;
+                    s.push_message(Message::user_text(followup))?;
+                    s.mark_checkpoint("user_followup")?;
+                    continue;
+                }
+
                 settled_normally = true;
                 break;
             }
@@ -1246,4 +1305,56 @@ fn is_repetition_dominated(text: &str) -> bool {
 /// Convenience helper returning a `ToolResultBlock` vector for external callers.
 pub fn text_result(s: impl Into<String>) -> Vec<ToolResultBlock> {
     vec![ToolResultBlock::text(s)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carnot_ai::faux::{FauxProvider, ScriptedTurn};
+    use carnot_cas::CasStore;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn follow_up_waits_for_turn_settle_and_runs_in_fifo_order() {
+        let dir = std::env::temp_dir().join(format!("carnot-followup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("note.txt"), "hello").expect("write");
+        let mut cfg = CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let tools = ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let faux = Arc::new(FauxProvider::new(vec![
+            ScriptedTurn::tool_calls(vec![("c1", "Read", json!({"file_path": "note.txt"}))]),
+            ScriptedTurn::text("first done"),
+            ScriptedTurn::text("second done"),
+        ]));
+        let agent = Agent::new(cfg, faux, tools, Vec::new(), false).expect("agent");
+
+        agent.follow_up("now do follow-up task").await;
+        let out = agent.prompt("start main task").await.expect("prompt");
+        assert_eq!(out.final_text, "second done");
+        assert_eq!(out.metrics.turns, 3);
+
+        // Verify follow-up was NOT injected into the tool_result message (index 2),
+        // and instead arrived as its own User message AFTER "first done" (index 4)!
+        let msgs = agent.active_messages().await;
+        assert_eq!(msgs.len(), 6);
+        assert!(msgs[2].has_tool_result());
+        assert!(!msgs[2].text_concat().contains("now do follow-up task"));
+        assert_eq!(msgs[3].text_concat(), "first done");
+        assert_eq!(msgs[4].text_concat(), "now do follow-up task");
+        assert_eq!(msgs[5].text_concat(), "second done");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repetition_guard_catches_degenerate_loops_only() {
+        let loop_text = "This is a stuck repeated line in output.\n".repeat(20);
+        assert!(is_repetition_dominated(&loop_text));
+        let normal_text = (0..30)
+            .map(|i| format!("Unique diagnostic line number {i} with distinct payload {i:#x}\n"))
+            .collect::<String>();
+        assert!(!is_repetition_dominated(&normal_text));
+    }
 }

@@ -136,7 +136,8 @@ impl Resolve for WebSsrfResolver {
     }
 }
 
-/// Fast zero-dependency HTML-to-clean-text extractor (strips `<script>`/`<style>`/tags, collapses whitespace).
+/// Fast zero-dependency HTML-to-clean-text extractor (strips `<!-- comments -->`, `<script>`/`<style>`,
+/// HTML tags with exact tag-name boundary matching, decodes common entities, and collapses whitespace).
 pub fn html_to_clean_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
     let bytes = html.as_bytes();
@@ -146,21 +147,48 @@ pub fn html_to_clean_text(html: &str) -> String {
 
     while i < bytes.len() {
         if bytes[i] == b'<' {
+            // Skip HTML comments (`<!-- ... -->`) even when they contain `>` characters.
+            if html[i..].starts_with("<!--") {
+                i = html[i + 4..]
+                    .find("-->")
+                    .map(|r| i + 4 + r + 3)
+                    .unwrap_or(bytes.len());
+                continue;
+            }
             let close = html[i..].find('>').map(|r| i + r).unwrap_or(bytes.len());
-            let tag = html[i + 1..close].trim().to_ascii_lowercase();
-            if tag.starts_with("script") || tag.starts_with("style") {
+            let inner = html[i + 1..close].trim_start();
+            let (is_closing, rest) = match inner.strip_prefix('/') {
+                Some(r) => (true, r.trim_start()),
+                None => (false, inner),
+            };
+            let tag_name = rest
+                .split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            if !is_closing && matches!(tag_name.as_str(), "script" | "style") {
                 in_script_or_style = true;
-            } else if tag.starts_with("/script") || tag.starts_with("/style") {
+            } else if is_closing && matches!(tag_name.as_str(), "script" | "style") {
                 in_script_or_style = false;
             } else if !in_script_or_style
-                && (tag.starts_with("p")
-                    || tag.starts_with("br")
-                    || tag.starts_with("div")
-                    || tag.starts_with("li")
-                    || tag.starts_with("h1")
-                    || tag.starts_with("h2")
-                    || tag.starts_with("h3")
-                    || tag.starts_with("tr"))
+                && matches!(
+                    tag_name.as_str(),
+                    "p" | "br"
+                        | "div"
+                        | "li"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "tr"
+                        | "pre"
+                        | "blockquote"
+                        | "section"
+                        | "article"
+                )
                 && !out.ends_with('\n')
             {
                 out.push('\n');
@@ -185,11 +213,13 @@ pub fn html_to_clean_text(html: &str) -> String {
             i += 1;
         }
     }
-    out.replace("&amp;", "&")
+    out.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        .replace("&apos;", "'")
         .trim()
         .to_string()
 }
@@ -210,18 +240,32 @@ impl WebFetchTool {
         spill_threshold: usize,
         preview_max: usize,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(Arc::new(WebSsrfResolver))
-            .user_agent(concat!("carnot/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| CarnotError::Tool {
-                tool: "WebFetch".into(),
-                message: e.to_string(),
-            })?;
+        let make_builder = || {
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(WebSsrfResolver))
+                .user_agent(concat!("carnot/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+        };
+        let client = match make_builder().build() {
+            Ok(c) => c,
+            Err(_) => {
+                // Minimal containers (Alpine / distroless) may lack OS CA bundles; fall back to bundled Mozilla roots.
+                let certs: Vec<reqwest::Certificate> = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                    .iter()
+                    .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok())
+                    .collect();
+                make_builder()
+                    .tls_certs_only(certs)
+                    .build()
+                    .map_err(|e| CarnotError::Tool {
+                        tool: "WebFetch".into(),
+                        message: e.to_string(),
+                    })?
+            }
+        };
         Ok(Self {
             client,
             cas,
@@ -413,13 +457,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn html_extractor_strips_scripts_and_tags() {
-        let html = "<html><head><style>body{color:red}</style><script>alert(1)</script></head><body><h1>Hello</h1><p>Carnot &amp; Rust</p></body></html>";
+    fn html_extractor_strips_scripts_comments_and_respects_tag_boundaries() {
+        let html = "<html><head><style>body{color:red}</style><script>alert(1)</script></head><body><!-- hidden > comment --><h1>Hello</h1><p>Carnot&nbsp;&amp;&nbsp;Rust&apos;s <svg><path d=\"M0\"/>inline</svg> <track kind=\"sub\"/>ok</p></body></html>";
         let txt = html_to_clean_text(html);
         assert!(txt.contains("Hello"));
-        assert!(txt.contains("Carnot & Rust"));
+        assert!(txt.contains("Carnot & Rust's inline ok"), "got: {txt:?}");
         assert!(!txt.contains("alert(1)"));
         assert!(!txt.contains("color:red"));
+        assert!(!txt.contains("hidden"));
+        assert!(!txt.contains("comment"));
     }
 
     #[test]

@@ -63,6 +63,15 @@ pub enum SessionEntry {
         strip_thinking_from_tail: bool,
         timestamp_unix_ms: u64,
     },
+    /// Zero-LLM-cost cold-cache pruning (applied ONLY when the rolling provider cache has already
+    /// expired): replaces oversized stale `ToolResult` text blocks outside `keep_tail_count` with
+    /// compact pointers while preserving every `.carnot/h/` handle and the full JSONL audit trail.
+    ColdPrune {
+        id: String,
+        keep_tail_count: usize,
+        min_bytes: usize,
+        timestamp_unix_ms: u64,
+    },
 }
 
 /// Active view projected for the next provider request (`Arc<Message>` — zero image cloning).
@@ -142,6 +151,8 @@ pub struct SessionStore {
     /// Last valid provider-reported input token count anchored at `(active_messages.len(), tokens)`.
     /// Invalidated automatically by any compaction or rewind (inspired by Pi's `estimateProjectedContextTokens`).
     last_usage_anchor: Option<(usize, u64)>,
+    /// Unix timestamp (ms) of the most recent recorded session activity (used to detect cold provider caches).
+    last_activity_unix_ms: Option<u64>,
 }
 
 impl SessionStore {
@@ -176,6 +187,7 @@ impl SessionStore {
             checkpoint_index: None,
             last_message_id: None,
             last_usage_anchor: None,
+            last_activity_unix_ms: None,
         };
 
         store.append_entry(
@@ -276,6 +288,7 @@ impl SessionStore {
             checkpoint_index: None,
             last_message_id: None,
             last_usage_anchor: None,
+            last_activity_unix_ms: None,
         };
 
         for entry in entries {
@@ -437,6 +450,54 @@ impl SessionStore {
         &self.entries
     }
 
+    pub fn last_activity_unix_ms(&self) -> Option<u64> {
+        self.last_activity_unix_ms
+    }
+
+    /// Opportunistically prunes oversized stale `ToolResult` text blocks outside the last
+    /// `keep_tail_count` messages when the caller has confirmed the provider's rolling prompt cache
+    /// is already cold. Zero LLM calls, zero cache breaks, lossless JSONL durability.
+    /// Returns the total byte reduction (`0` if reclaimable bytes `< min_reclaimable_bytes`).
+    pub fn prune_cold_tool_results(
+        &mut self,
+        keep_tail_count: usize,
+        min_bytes: usize,
+        min_reclaimable_bytes: usize,
+    ) -> Result<usize> {
+        let cutoff = self.active_messages.len().saturating_sub(keep_tail_count);
+        if cutoff == 0 {
+            return Ok(0);
+        }
+        let mut reclaimable = 0usize;
+        for msg in &self.active_messages[..cutoff] {
+            for block in &msg.content {
+                if let carnot_core::ContentBlock::ToolResult { content, .. } = block {
+                    for tb in content {
+                        if let carnot_core::ToolResultBlock::Text { text } = tb
+                            && text.len() >= min_bytes
+                            && !text.starts_with("[pruned cold tool_result:")
+                        {
+                            let stub = build_cold_prune_stub(text);
+                            reclaimable += text.len().saturating_sub(stub.len());
+                        }
+                    }
+                }
+            }
+        }
+        if reclaimable < min_reclaimable_bytes {
+            return Ok(0);
+        }
+
+        let entry = SessionEntry::ColdPrune {
+            id: uuid::Uuid::now_v7().to_string(),
+            keep_tail_count,
+            min_bytes,
+            timestamp_unix_ms: now_unix_ms(),
+        };
+        self.append_entry(entry, true)?;
+        Ok(reclaimable)
+    }
+
     pub fn tokens_since_checkpoint(&self) -> u64 {
         let start = self.checkpoint_index.map(|i| i + 1).unwrap_or(0);
         self.active_messages
@@ -493,18 +554,38 @@ impl SessionStore {
     /// Infallible in-memory state transition (replayed identically during `load()`).
     fn apply_in_memory(&mut self, entry: &SessionEntry) {
         match entry {
-            SessionEntry::Header { .. } => {}
-            SessionEntry::Usage { usage, .. } => {
+            SessionEntry::Header {
+                created_unix_ms, ..
+            } => {
+                self.last_activity_unix_ms = Some(*created_unix_ms);
+            }
+            SessionEntry::Usage {
+                usage,
+                timestamp_unix_ms,
+                ..
+            } => {
+                self.last_activity_unix_ms = Some(*timestamp_unix_ms);
                 let billed = usage.total_context_tokens();
                 if billed > 0 {
                     self.last_usage_anchor = Some((self.active_messages.len(), billed));
                 }
             }
-            SessionEntry::Message { id, message, .. } => {
+            SessionEntry::Message {
+                id,
+                message,
+                timestamp_unix_ms,
+                ..
+            } => {
+                self.last_activity_unix_ms = Some(*timestamp_unix_ms);
                 self.active_messages.push(Arc::new(message.clone()));
                 self.last_message_id = Some(id.clone());
             }
-            SessionEntry::Checkpoint { message_index, .. } => {
+            SessionEntry::Checkpoint {
+                message_index,
+                timestamp_unix_ms,
+                ..
+            } => {
+                self.last_activity_unix_ms = Some(*timestamp_unix_ms);
                 if *message_index < self.active_messages.len() {
                     self.checkpoint_index = Some(*message_index);
                 }
@@ -512,8 +593,10 @@ impl SessionStore {
             SessionEntry::Rewind {
                 checkpoint_message_index,
                 receipt_message,
+                timestamp_unix_ms,
                 ..
             } => {
+                self.last_activity_unix_ms = Some(*timestamp_unix_ms);
                 let keep_len = (*checkpoint_message_index + 1).min(self.active_messages.len());
                 self.active_messages.truncate(keep_len);
                 self.active_messages.push(Arc::new(receipt_message.clone()));
@@ -524,8 +607,10 @@ impl SessionStore {
                 summary_message,
                 kept_tail_count,
                 strip_thinking_from_tail,
+                timestamp_unix_ms,
                 ..
             } => {
+                self.last_activity_unix_ms = Some(*timestamp_unix_ms);
                 let n = self.active_messages.len();
                 let tail_start = n.saturating_sub(*kept_tail_count);
                 let tail: Vec<Arc<Message>> = self.active_messages[tail_start..]
@@ -548,7 +633,75 @@ impl SessionStore {
                 self.checkpoint_index = Some(0);
                 self.last_usage_anchor = None;
             }
+            SessionEntry::ColdPrune {
+                keep_tail_count,
+                min_bytes,
+                timestamp_unix_ms,
+                ..
+            } => {
+                self.last_activity_unix_ms = Some(*timestamp_unix_ms);
+                let cutoff = self.active_messages.len().saturating_sub(*keep_tail_count);
+                for slot in &mut self.active_messages[..cutoff] {
+                    let needs_prune = slot.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            carnot_core::ContentBlock::ToolResult { content, .. }
+                                if content.iter().any(|tb| matches!(
+                                    tb,
+                                    carnot_core::ToolResultBlock::Text { text }
+                                        if text.len() >= *min_bytes
+                                            && !text.starts_with("[pruned cold tool_result:")
+                                ))
+                        )
+                    });
+                    if needs_prune {
+                        let mut cloned = (**slot).clone();
+                        for block in &mut cloned.content {
+                            if let carnot_core::ContentBlock::ToolResult { content, .. } = block {
+                                for tb in content.iter_mut() {
+                                    if let carnot_core::ToolResultBlock::Text { text } = tb
+                                        && text.len() >= *min_bytes
+                                        && !text.starts_with("[pruned cold tool_result:")
+                                    {
+                                        *text = build_cold_prune_stub(text);
+                                    }
+                                }
+                            }
+                        }
+                        *slot = Arc::new(cloned);
+                    }
+                }
+                self.last_usage_anchor = None;
+            }
         }
+    }
+}
+
+fn extract_cas_handle(text: &str) -> Option<&str> {
+    let idx = text.find(".carnot/h/")?;
+    let rest = &text[idx..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_')))
+        .unwrap_or(rest.len());
+    let candidate = &rest[..end];
+    if candidate.len() > ".carnot/h/".len() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn build_cold_prune_stub(text: &str) -> String {
+    if let Some(handle) = extract_cas_handle(text) {
+        format!(
+            "[pruned cold tool_result: {} B — inspect archived handle {handle} or re-read if needed]",
+            text.len()
+        )
+    } else {
+        format!(
+            "[pruned cold tool_result: {} B (full output preserved in session JSONL; re-run or re-read if needed)]",
+            text.len()
+        )
     }
 }
 
@@ -798,5 +951,63 @@ mod tests {
             after < 500,
             "post-compaction must not reuse stale 50k usage: {after}"
         );
+    }
+
+    #[test]
+    fn cold_prune_shrinks_stale_tool_results_preserves_handles_and_replays_from_jsonl() {
+        let dir = std::env::temp_dir().join(format!("carnot-coldprune-{}", uuid::Uuid::new_v4()));
+        let mut s = SessionStore::create(
+            Some(&dir),
+            "claude-sonnet-5-5".into(),
+            "STATIC".into(),
+            vec![],
+        )
+        .expect("create");
+        let path = s.path.clone().expect("path");
+
+        s.push_message(Message::user_text("goal")).expect("u0");
+        // Old bulky tool result WITH a CAS handle pointer
+        s.push_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "old1".into(),
+                content: vec![ToolResultBlock::text(format!(
+                    "{}\n[spilled to .carnot/h/abcdef123456.txt]",
+                    "L".repeat(30_000)
+                ))],
+                is_error: false,
+            }],
+        })
+        .expect("old tr");
+        // Recent tail (4 messages) that must remain verbatim
+        for i in 0..4 {
+            s.push_message(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("recent{i}"),
+                    content: vec![ToolResultBlock::text("R".repeat(5_000))],
+                    is_error: false,
+                }],
+            })
+            .expect("recent");
+        }
+
+        let reclaimed = s.prune_cold_tool_results(4, 2_000, 10_000).expect("prune");
+        assert!(reclaimed > 25_000, "reclaimed={reclaimed}");
+
+        // Second call immediately after must be a no-op (already pruned!)
+        let second = s.prune_cold_tool_results(4, 2_000, 1_000).expect("prune2");
+        assert_eq!(second, 0);
+
+        // Verify persisted JSONL replays identically on reload
+        let reloaded = SessionStore::load(&path).expect("reload");
+        let old_json = serde_json::to_string(reloaded.active_messages()[1].as_ref()).expect("ser");
+        assert!(old_json.contains("[pruned cold tool_result:"));
+        assert!(old_json.contains(".carnot/h/abcdef123456.txt"));
+        let recent_json =
+            serde_json::to_string(reloaded.active_messages()[5].as_ref()).expect("ser");
+        assert!(recent_json.len() > 5_000, "recent tail must remain intact");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

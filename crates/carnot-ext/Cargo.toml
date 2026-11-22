@@ -9,7 +9,7 @@ workspace = true
 
 [features]
 default = ["web"]
-web = ["dep:reqwest", "dep:url", "dep:futures"]
+web = ["dep:reqwest", "dep:url", "dep:futures", "dep:webpki-root-certs"]
 
 [dependencies]
 blake3.workspace = true
@@ -27,3 +27,4 @@ tokio-util.workspace = true
 tracing.workspace = true
 url = { workspace = true, optional = true }
 uuid.workspace = true
+webpki-root-certs = { workspace = true, optional = true }

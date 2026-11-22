@@ -216,4 +216,62 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn confinement_blocks_dangling_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("carnot-dsym-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("mkdir");
+        let outside_missing = std::env::temp_dir()
+            .join(format!("carnot-outside-missing-{}", uuid::Uuid::new_v4()))
+            .join("secret.txt");
+        let evil_link = tmp.join("escape");
+        symlink(&outside_missing, &evil_link).expect("symlink outside");
+        assert!(
+            resolve_confined_path(&tmp, &[], "escape").is_err(),
+            "dangling symlink pointing outside workspace MUST be rejected"
+        );
+
+        let inside_missing = tmp.join("sub/valid.txt");
+        let ok_link = tmp.join("local_link");
+        symlink(&inside_missing, &ok_link).expect("symlink inside");
+        assert!(
+            resolve_confined_path(&tmp, &[], "local_link").is_ok(),
+            "dangling symlink pointing inside workspace should be allowed"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_mixed_line_range_and_text_hunks() {
+        let tmp = std::env::temp_dir().join(format!("carnot-mix-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("mkdir");
+        let file = tmp.join("mix.rs");
+        let orig = "a\nb\nc\n";
+        fs::write(&file, orig).expect("write");
+
+        let cfg = carnot_core::CarnotConfig::new(tmp.clone());
+        let cas = Arc::new(CasStore::open(&tmp).expect("cas"));
+        let reg = crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let edit = reg.get("Edit").expect("Edit");
+
+        let res = edit
+            .execute(
+                json!({
+                    "file_path": "mix.rs",
+                    "edits": [
+                        {"old_string": "a", "new_string": "a1\na2"},
+                        {"start_line": 2, "end_line": 2, "new_string": "B"}
+                    ]
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("edit exec");
+        assert!(res.is_error);
+        assert!(res.text_only().contains("cannot mix"));
+        assert_eq!(fs::read_to_string(&file).expect("read"), orig);
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }
