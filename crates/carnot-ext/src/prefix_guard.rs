@@ -15,7 +15,7 @@ Rules:\n\
 - Batch independent calls in parallel (`Read`/`Grep`, disjoint `Edit`/`Write`). Batch all changes to one file into one `Edit(edits:[...])`.\n\
 - Prefer `Read`/`Grep`/`Edit`/`Write` over `Bash`; tools run in workspace root (use relative paths).\n\
 - For multi-line edits (>8 lines), use `Edit` with `start_line`/`end_line` (no `old_string` repetition) or `Write` for full small-file rewrites.\n\
-- Verify thoroughly before concluding: run the project's tests/build, and when requirements lack test coverage write and run targeted edge-case checks (remove temporary scratch files afterward). Re-check assumptions before concluding a constraint is infeasible.\n\
+- Verify thoroughly before concluding: check every prompt requirement, output path, format, and edge case, run the project's tests/build (or write targeted verification checks and remove scratch files afterward). Re-check assumptions before concluding a constraint is infeasible.\n\
 - Outputs >8 KiB spill to `.carnot/h/<hash>.log`; inspect slices with `Read(offset, limit)` or `Grep`. Trust `[carnot:rewind-receipt]` and `[maxwell-daemon]` notes."
 }
 

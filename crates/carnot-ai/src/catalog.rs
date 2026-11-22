@@ -338,6 +338,8 @@ pub struct ModelEntry {
     #[serde(default)]
     pub context_window: Option<u64>,
     #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
     pub supports_mid_system_role: Option<bool>,
     #[serde(default)]
     pub supports_effort: Option<bool>,

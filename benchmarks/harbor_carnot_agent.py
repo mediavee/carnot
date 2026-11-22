@@ -71,6 +71,14 @@ class CarnotHarborOptions(AgentOptions):
         default="carnot",
         description="Carnot module profile preset.",
     )
+    max_turns: int | None = Field(
+        default=None,
+        description="Optional override for Carnot --max-turns (default 500).",
+    )
+    subagent: bool = Field(
+        default=False,
+        description="Enable Carnot disposable-context Subagent tool.",
+    )
 
 
 class CarnotHarborAgent(BaseAgent):
@@ -113,7 +121,7 @@ class CarnotHarborAgent(BaseAgent):
         return "carnot"
 
     def version(self) -> str | None:
-        return "0.1.0-v6.0"
+        return "0.1.0-v8.0"
 
     def _carnot_options(self) -> CarnotHarborOptions:
         if isinstance(self.options, CarnotHarborOptions):
@@ -196,6 +204,10 @@ class CarnotHarborAgent(BaseAgent):
             prompt_host_path.unlink(missing_ok=True)
 
         extra_flags: list[str] = []
+        if opts.max_turns is not None:
+            extra_flags.append(f"--max-turns {int(opts.max_turns)}")
+        if opts.subagent:
+            extra_flags.append("--subagent")
         if self.skills_dir:
             extra_flags.append(f"--skills-dir {shlex.quote(str(self.skills_dir))}")
 

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-const AUTO_OUTLINE_MIN_LINES: usize = 300;
+const AUTO_OUTLINE_MIN_LINES: usize = 800;
 const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_READ_LINES: usize = 2_000;

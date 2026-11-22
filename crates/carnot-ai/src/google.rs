@@ -38,7 +38,8 @@ use tokio_util::sync::CancellationToken;
 
 const API_GENERATIVE: &str = "google-generative";
 const API_CLOUDCODE: &str = "google-cloudcode";
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const HTTP_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
 const SKIP_THOUGHT_SIG_SENTINEL: &str = "skip_thought_signature_validator";
 
 static SYNTHETIC_CALL_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -438,48 +439,44 @@ impl Provider for GoogleProvider {
                     rb = rb.header(k.as_str(), v.as_str());
                 }
 
-                let send_res = match tokio::time::timeout(
-                    Duration::from_secs(90),
-                    rb.json(&body).send(),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        let err = CarnotError::Provider {
-                            provider: self.spec.provider_id.clone(),
-                            message: e.without_url().to_string(),
-                            retryable: true,
-                            retry_after_ms: None,
-                        };
-                        if idx + 1 < urls.len() {
-                            tracing::warn!(
-                                provider = %self.spec.provider_id,
-                                "endpoint network error; trying fallback_base_urls"
-                            );
-                            last_err = Some(err);
-                            continue;
+                let send_res =
+                    match tokio::time::timeout(HTTP_HEADERS_TIMEOUT, rb.json(&body).send()).await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            let err = CarnotError::Provider {
+                                provider: self.spec.provider_id.clone(),
+                                message: e.without_url().to_string(),
+                                retryable: true,
+                                retry_after_ms: None,
+                            };
+                            if idx + 1 < urls.len() {
+                                tracing::warn!(
+                                    provider = %self.spec.provider_id,
+                                    "endpoint network error; trying fallback_base_urls"
+                                );
+                                last_err = Some(err);
+                                continue;
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
-                    }
-                    Err(_) => {
-                        let err = CarnotError::Provider {
-                            provider: self.spec.provider_id.clone(),
-                            message: "HTTP response headers timeout (90s)".into(),
-                            retryable: true,
-                            retry_after_ms: None,
-                        };
-                        if idx + 1 < urls.len() {
-                            tracing::warn!(
-                                provider = %self.spec.provider_id,
-                                "endpoint timed out; trying fallback_base_urls"
-                            );
-                            last_err = Some(err);
-                            continue;
+                        Err(_) => {
+                            let err = CarnotError::Provider {
+                                provider: self.spec.provider_id.clone(),
+                                message: "HTTP response headers timeout (90s)".into(),
+                                retryable: true,
+                                retry_after_ms: None,
+                            };
+                            if idx + 1 < urls.len() {
+                                tracing::warn!(
+                                    provider = %self.spec.provider_id,
+                                    "endpoint timed out; trying fallback_base_urls"
+                                );
+                                last_err = Some(err);
+                                continue;
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
-                    }
-                };
+                    };
 
                 let status = send_res.status();
                 if status.is_success() {

@@ -17,7 +17,7 @@ impl ResilientProvider {
     pub fn new(providers: Vec<Arc<dyn Provider>>) -> Self {
         Self {
             providers,
-            max_attempts_per_provider: 3,
+            max_attempts_per_provider: 5,
             base_backoff_ms: 1_500,
         }
     }
@@ -76,7 +76,7 @@ impl Provider for ResilientProvider {
                                         .saturating_mul(shift)
                                         .saturating_add(jitter)
                                 })
-                                .min(30_000);
+                                .min(60_000);
                             tracing::warn!(
                                 provider = %prov,
                                 attempt,

@@ -339,6 +339,24 @@ impl Agent {
                 return Err(CarnotError::Cancelled);
             }
 
+            // Proactive compaction before exceeding the model's context window (preserves goal, edits, handles & recent turns).
+            if self.config.modules.compaction && consecutive_compactions < 1 {
+                let pre_est = self
+                    .session
+                    .lock()
+                    .await
+                    .project_context()
+                    .estimated_tokens();
+                let trigger = self
+                    .config
+                    .context_window
+                    .saturating_sub(self.config.compaction_reserve_tokens);
+                if trigger > 0 && pre_est >= trigger {
+                    consecutive_compactions += 1;
+                    self.compact_emergency(&seg).await?;
+                }
+            }
+
             let (req, turn_num, ctx_est) = {
                 let s = self.session.lock().await;
                 let proj = s.project_context();
@@ -477,10 +495,11 @@ impl Agent {
 
             if let Some((err, retryable)) = stream_err {
                 self.discard_eager_launches(eager_launches);
-                if retryable && consecutive_stream_retries < 3 {
+                if retryable && consecutive_stream_retries < 5 {
                     consecutive_stream_retries += 1;
-                    let delay =
-                        std::time::Duration::from_secs(1u64 << (consecutive_stream_retries - 1));
+                    let delay = std::time::Duration::from_secs(
+                        (1u64 << (consecutive_stream_retries - 1)).min(16),
+                    );
                     tracing::warn!(
                         provider = %self.provider.name(),
                         attempt = consecutive_stream_retries,

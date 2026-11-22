@@ -21,7 +21,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const API_ID: &str = "anthropic-messages";
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const HTTP_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub struct AnthropicMessagesAdapter;
@@ -526,11 +527,11 @@ impl Provider for AnthropicProvider {
             }
 
             let send_fut = req_builder.json(&body).send();
-            let resp = tokio::time::timeout(Duration::from_secs(90), send_fut)
+            let resp = tokio::time::timeout(HTTP_HEADERS_TIMEOUT, send_fut)
                 .await
                 .map_err(|_| CarnotError::Provider {
                     provider: self.spec.provider_id.clone(),
-                    message: "HTTP response headers timeout (90s)".into(),
+                    message: "HTTP response headers timeout (300s)".into(),
                     retryable: true,
                     retry_after_ms: None,
                 })?
@@ -545,8 +546,11 @@ impl Provider for AnthropicProvider {
             if !status.is_success() {
                 let retry_after_ms = parse_retry_after_ms(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if text.to_ascii_lowercase().contains("prompt is too long")
-                    || text.to_ascii_lowercase().contains("context length")
+                let low = text.to_ascii_lowercase();
+                if low.contains("prompt is too long")
+                    || low.contains("context length")
+                    || low.contains("too many tokens")
+                    || low.contains("maximum context")
                 {
                     return Err(CarnotError::ContextOverflow(text));
                 }
@@ -583,7 +587,7 @@ impl Provider for AnthropicProvider {
                         Err(_) => {
                             let _ = tx
                                 .send(StreamEvent::Error {
-                                    message: "stream idle timeout (120s)".into(),
+                                    message: "stream idle timeout (300s)".into(),
                                     retryable: true,
                                 })
                                 .await;
@@ -929,6 +933,12 @@ async fn handle_sse_frame(
             }
             if let Some(ot) = v.pointer("/usage/output_tokens").and_then(Value::as_u64) {
                 state.usage.output_tokens = ot;
+            }
+            if let Some(tt) = v
+                .pointer("/usage/output_tokens_details/thinking_tokens")
+                .and_then(Value::as_u64)
+            {
+                state.usage.reasoning_tokens = tt;
             }
         }
         _ => {}

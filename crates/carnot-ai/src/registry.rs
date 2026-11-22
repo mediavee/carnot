@@ -91,6 +91,12 @@ impl ProviderRegistry {
             .and_then(|m| m.context_window)
     }
 
+    pub fn max_output_tokens_for_model(&self, model: &str) -> Option<u32> {
+        self.catalog
+            .find_model(model)
+            .and_then(|m| m.max_output_tokens)
+    }
+
     /// Resolves a provider by name or alias and wraps it in `ResilientProvider` retry logic.
     pub fn build_provider(
         &self,

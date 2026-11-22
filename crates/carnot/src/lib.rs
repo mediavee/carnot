@@ -269,6 +269,9 @@ impl CarnotBuilder {
         if let Some(ctx_win) = registry.context_window_for_model(&self.config.model) {
             self.config.context_window = ctx_win;
         }
+        if let Some(max_out) = registry.max_output_tokens_for_model(&self.config.model) {
+            self.config.max_output_tokens = max_out;
+        }
         if self.config.scrubbed_env_vars.is_empty() {
             self.config.scrubbed_env_vars = registry.catalog().secret_env_vars();
         }

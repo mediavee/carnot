@@ -25,7 +25,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const API_ID: &str = "openai-responses";
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const HTTP_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub struct OpenAiResponsesAdapter;
@@ -266,11 +267,11 @@ impl Provider for OpenAiResponsesProvider {
                 );
             }
 
-            let resp = tokio::time::timeout(Duration::from_secs(90), rb.json(&body).send())
+            let resp = tokio::time::timeout(HTTP_HEADERS_TIMEOUT, rb.json(&body).send())
                 .await
                 .map_err(|_| CarnotError::Provider {
                     provider: self.spec.provider_id.clone(),
-                    message: "HTTP response headers timeout (90s)".into(),
+                    message: "HTTP response headers timeout (300s)".into(),
                     retryable: true,
                     retry_after_ms: None,
                 })?

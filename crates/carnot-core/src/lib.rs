@@ -1047,7 +1047,7 @@ pub struct CarnotConfig {
 }
 
 fn default_max_tokens_continuations() -> u8 {
-    2
+    4
 }
 
 impl CarnotConfig {
@@ -1063,7 +1063,7 @@ impl CarnotConfig {
             provider: "anthropic".to_string(),
             effort: ReasoningEffort::High,
             cache_ttl: CacheTtl::Hybrid,
-            max_turns: 200,
+            max_turns: 500,
             max_cost_usd: None,
             max_output_tokens: 32_768,
             max_tokens_continuations: default_max_tokens_continuations(),
@@ -1072,7 +1072,7 @@ impl CarnotConfig {
             cas_spill_threshold_bytes: 8_192,
             cas_preview_max_bytes: 3_200,
             bash_yield_ms: 60_000,
-            bash_max_timeout_ms: 1_800_000,
+            bash_max_timeout_ms: 3_600_000,
             rewind_min_heat_tokens: 80_000,
             rewind_max_per_session: 12,
             rewind_assumed_reread_frac: 0.15,
