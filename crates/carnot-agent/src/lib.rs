@@ -246,6 +246,12 @@ impl Agent {
     /// Manually compacts the active session using cache-warm semantic synthesis (with deterministic
     /// fallback), preserving the verbatim user objective + recent tail + verified workspace state.
     pub async fn compact_now(&self) -> Result<(u64, u64, bool)> {
+        self.compact_now_with_focus(None).await
+    }
+
+    /// Manually compacts the active session with an optional caller focus instruction
+    /// (e.g. `/compact preserve SQL migration schema and failing test output`).
+    pub async fn compact_now_with_focus(&self, focus: Option<&str>) -> Result<(u64, u64, bool)> {
         let _run_guard = self.run_lock.lock().await;
         let seg = SegmentTracker::default();
         execute_compaction(
@@ -259,6 +265,7 @@ impl Agent {
             &self.raw_user_goal,
             &self.user_instructions,
             &seg,
+            focus,
             CancellationToken::new(),
         )
         .await
@@ -381,12 +388,11 @@ impl Agent {
                 return Err(CarnotError::Cancelled);
             }
 
-            // Proactive cache-warm thermodynamic compaction (respects cooldown so prompt cache stays >96%)
+            // Proactive cache-warm thermodynamic compaction (provider-grounded token count + cooldown)
             if self.config.modules.compaction {
                 let (pre_est, msg_count) = {
                     let s = self.session.lock().await;
-                    let proj = s.project_context();
-                    (proj.estimated_tokens(), proj.messages.len())
+                    (s.effective_context_tokens(), s.active_messages().len())
                 };
                 let current_turns = self.metrics.lock().await.turns;
                 let cooldown_ok = last_compaction_turn
@@ -404,8 +410,8 @@ impl Agent {
 
             let (req, turn_num, ctx_est) = {
                 let s = self.session.lock().await;
+                let ctx_est = s.effective_context_tokens();
                 let proj = s.project_context();
-                let ctx_est = proj.estimated_tokens();
                 let mut m = self.metrics.lock().await;
                 m.turns += 1;
                 m.requests += 1;
@@ -1100,6 +1106,7 @@ impl Agent {
             &self.raw_user_goal,
             &self.user_instructions,
             seg,
+            None,
             cancel,
         )
         .await?;

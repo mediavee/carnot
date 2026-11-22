@@ -18,9 +18,13 @@
 
 use crate::segment::SegmentTracker;
 use carnot_ai::{Provider, ProviderRequest, StreamEvent};
-use carnot_core::{AgentEvent, CarnotConfig, Message, Result, Role, ThermodynamicMetrics, Usage};
+use carnot_core::{
+    AgentEvent, CarnotConfig, ContentBlock, Message, ReasoningEffort, Result, Role, StopReason,
+    ThermodynamicMetrics, Usage,
+};
 use carnot_session::SessionStore;
 use carnot_tools::ToolRegistry;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -145,18 +149,127 @@ pub fn hydrate_anchors_from_session(messages: &[Arc<Message>]) -> (Option<String
     (goal, followups)
 }
 
+/// Chooses the optimal compaction effort:
+/// - On models whose effort parameter preserves the prompt cache (e.g. Claude 5.5 `output_config.effort`,
+///   verified empirically at 99.1% cache hit), cap compaction at `Medium` (`Low` stays `Low`) so
+///   high/max-effort sessions don't burn excessive thinking tokens just to write a handoff.
+/// - On legacy `thinking.budget_tokens` models (or unknown providers), preserve exact `config.effort`
+///   so prompt caches are never invalidated.
+pub fn compaction_effort_for_provider(
+    session_effort: ReasoningEffort,
+    effort_preserves_cache: bool,
+) -> ReasoningEffort {
+    if effort_preserves_cache {
+        match session_effort {
+            ReasoningEffort::Low => ReasoningEffort::Low,
+            _ => ReasoningEffort::Medium,
+        }
+    } else {
+        session_effort
+    }
+}
+
+/// Deterministically reconstructs `(modified_files, read_only_files)` from the persisted session
+/// messages, any prior compaction footer, and the current turn's `SegmentTracker` (inspired by
+/// Pi's `extractFileOperations` + `computeFileLists`). Ensures file tracking survives `--resume`
+/// and multiple chained compactions without duplicating modified files in the read-only list.
+pub(crate) fn extract_file_ops_from_session(
+    messages: &[Arc<Message>],
+    seg: &SegmentTracker,
+) -> (Vec<String>, Vec<String>) {
+    let mut modified: BTreeSet<String> = BTreeSet::new();
+    let mut read: BTreeSet<String> = BTreeSet::new();
+
+    for f in &seg.files_edited {
+        let t = f.trim();
+        if !t.is_empty() {
+            modified.insert(t.to_string());
+        }
+    }
+    for f in &seg.files_read {
+        let t = f.trim();
+        if !t.is_empty() {
+            read.insert(t.to_string());
+        }
+    }
+
+    for msg in messages {
+        let full_text = msg.text_concat();
+        let trimmed = full_text.trim();
+        // Carry forward file lists from any prior compaction summary
+        if trimmed.starts_with("[carnot:compaction ")
+            && let Some(ws_sec) =
+                extract_carnot_section(trimmed, "[carnot:verified-workspace-state]")
+        {
+            for line in ws_sec.lines() {
+                if let Some(rest) = line.strip_prefix("Files edited:") {
+                    for p in rest.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        modified.insert(p.to_string());
+                    }
+                } else if (line.starts_with("Read-only inspected files")
+                    || line.starts_with("Previously inspected files"))
+                    && let Some((_, rest)) = line.split_once(": ")
+                {
+                    for p in rest.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        read.insert(p.to_string());
+                    }
+                }
+            }
+        }
+
+        // Extract deterministic tool file targets directly from persisted assistant tool calls
+        if msg.role == Role::Assistant {
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { name, input, .. } = block
+                    && let Some(path) = input
+                        .get("file_path")
+                        .or_else(|| input.get("path"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    match name.as_str() {
+                        "Edit" | "Write" | "edit" | "write" => {
+                            modified.insert(path.to_string());
+                        }
+                        "Read" | "read" => {
+                            read.insert(path.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let read_only: Vec<String> = read
+        .into_iter()
+        .filter(|p| !modified.contains(p))
+        .take(30)
+        .collect();
+    let modified_list: Vec<String> = modified.into_iter().take(40).collect();
+    (modified_list, read_only)
+}
+
 /// Builds the concise, high-precision handoff prompt appended to the warm conversation prefix.
-fn build_semantic_compaction_prompt(has_prior_compaction: bool) -> String {
+fn build_semantic_compaction_prompt(
+    has_prior_compaction: bool,
+    custom_focus: Option<&str>,
+) -> String {
     let merge_note = if has_prior_compaction {
         "An earlier `[carnot:compaction]` handoff appears at the top of this conversation. MERGE and preserve every still-relevant fact, constraint, file path, and refuted hypothesis from it into your updated handoff.\n"
     } else {
         ""
     };
+    let focus_note = match custom_focus.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(f) => format!("Additional caller focus to prioritize verbatim: {f}\n"),
+        None => String::new(),
+    };
     format!(
         "[carnot:compaction-request]\n\
 Produce an ultra-dense, high-recall task handoff (~400-1,000 words, crisp bullet points, zero narrative fluff) so work can continue seamlessly after older turns are folded. Do NOT call any tools.\n\
 Maximize exact recall: preserve every concrete number, constant, identifier, file path, schema/format rule, error message, decision, and user correction verbatim so no already-inspected file needs to be re-read.\n\
-{merge_note}\
+{merge_note}{focus_note}\
 Use these exact 6 markdown headings:\n\
 ## 1. Exact Constraints & Edge Cases\n\
 Every concrete requirement, output artifact/path, format or schema rule, numerical tolerance, user correction, and edge case.\n\
@@ -218,12 +331,14 @@ async fn collect_git_facts(ws: std::path::PathBuf) -> WorkspaceGitFacts {
     .unwrap_or_default()
 }
 
-/// Attempts a single cache-warm LLM semantic handoff reusing the exact conversation prefix.
+/// Attempts a cache-warm LLM semantic handoff reusing the exact conversation prefix (with 1 retry
+/// on transient stream errors, rejecting truncated `MaxTokens` or rogue tool-calling outputs).
 /// Returns `Some((handoff_text, usage))` on success, or `None` to trigger deterministic fallback.
 async fn try_semantic_llm_handoff(
     config: &CarnotConfig,
     provider: &Arc<dyn Provider>,
     session: &Mutex<SessionStore>,
+    custom_focus: Option<&str>,
     cancel: CancellationToken,
 ) -> Option<(String, Usage)> {
     let req = {
@@ -235,7 +350,7 @@ async fn try_semantic_llm_handoff(
         let has_prior = proj
             .messages
             .first()
-            .is_some_and(|m| m.text_concat().contains("[carnot:compaction]"));
+            .is_some_and(|m| m.text_concat().contains("[carnot:compaction "));
 
         // Ensure trailing messages don't leave an unanswered `tool_use` before appending our User prompt
         let mut msgs = proj.messages;
@@ -243,12 +358,17 @@ async fn try_semantic_llm_handoff(
             return None;
         }
         msgs.push(Arc::new(Message::user_text(
-            build_semantic_compaction_prompt(has_prior),
+            build_semantic_compaction_prompt(has_prior, custom_focus),
         )));
 
-        // CRITICAL CACHE INVARIANT: keep `effort`, `max_output_tokens`, `cache_ttl`, `tools`,
-        // `static_system_prompt`, and `messages` IDENTICAL to the active session so Anthropic/OpenAI
-        // serves ~98% of the compaction input from the warm prompt cache (0.05x input rate)!
+        let compaction_effort = compaction_effort_for_provider(
+            config.effort,
+            provider.effort_preserves_cache(&config.model),
+        );
+
+        // Reuse the warm conversation prefix verbatim (`system`, `tools`, `messages`, `cache_ttl`)
+        // with `skip_tail_cache_write: true` so the existing prefix hits at 0.05x while the
+        // discarded tail + compaction request pays 1.0x instead of 1.25x/2.0x cache-write.
         ProviderRequest {
             model: config.model.clone(),
             static_system_prompt: proj.static_system_prompt,
@@ -257,55 +377,92 @@ async fn try_semantic_llm_handoff(
             messages: msgs,
             checkpoint_index: proj.checkpoint_index,
             cache_ttl: config.cache_ttl,
-            effort: config.effort,
+            effort: compaction_effort,
             max_output_tokens: config.max_output_tokens,
             skip_tail_cache_write: true,
         }
     };
 
-    let rx_res = tokio::time::timeout(
-        SEMANTIC_COMPACTION_TIMEOUT,
-        provider.stream(req, cancel.clone()),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let mut rx = rx_res;
-
-    let mut final_text = String::new();
-    let mut usage = Usage::default();
-    let mut failed = false;
-
-    let drain = async {
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                StreamEvent::Done {
-                    message, usage: u, ..
-                } => {
-                    final_text = message.text_concat();
-                    usage = u;
-                }
-                StreamEvent::Error { .. } => {
-                    failed = true;
-                }
-                _ => {}
-            }
+    for attempt in 0..2u8 {
+        if cancel.is_cancelled() {
+            return None;
         }
-    };
-
-    if tokio::time::timeout(SEMANTIC_COMPACTION_TIMEOUT, drain)
+        let rx_res = match tokio::time::timeout(
+            SEMANTIC_COMPACTION_TIMEOUT,
+            provider.stream(req.clone(), cancel.clone()),
+        )
         .await
-        .is_err()
-        || failed
-    {
-        return None;
-    }
+        {
+            Ok(Ok(rx)) => rx,
+            Ok(Err(_)) | Err(_) => {
+                if attempt == 0 && !cancel.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    continue;
+                }
+                return None;
+            }
+        };
+        let mut rx = rx_res;
 
-    let trimmed = final_text.trim();
-    if trimmed.len() < 40 {
-        return None;
+        let mut final_text = String::new();
+        let mut usage = Usage::default();
+        let mut failed = false;
+        let mut retryable_err = false;
+        let mut rejected_incomplete = false;
+
+        let drain = async {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    StreamEvent::Done {
+                        message,
+                        usage: u,
+                        stop_reason,
+                    } => {
+                        // Pi guard: never persist a length-truncated or tool-calling summary
+                        if stop_reason == StopReason::MaxTokens || message.has_tool_use() {
+                            rejected_incomplete = true;
+                        } else {
+                            final_text = message.text_concat();
+                            usage = u;
+                        }
+                    }
+                    StreamEvent::Error { retryable, .. } => {
+                        failed = true;
+                        retryable_err = retryable;
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        if tokio::time::timeout(SEMANTIC_COMPACTION_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            if attempt == 0 && !cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                continue;
+            }
+            return None;
+        }
+        if failed {
+            if retryable_err && attempt == 0 && !cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                continue;
+            }
+            return None;
+        }
+        if rejected_incomplete {
+            return None;
+        }
+
+        let trimmed = final_text.trim();
+        if trimmed.len() < 40 {
+            return None;
+        }
+        return Some((trimmed.to_string(), usage));
     }
-    Some((trimmed.to_string(), usage))
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,15 +477,31 @@ pub(crate) async fn execute_compaction(
     raw_user_goal: &Mutex<Option<String>>,
     user_instructions: &Mutex<Vec<String>>,
     seg: &SegmentTracker,
+    custom_focus: Option<&str>,
     cancel: CancellationToken,
 ) -> Result<(u64, u64, bool)> {
+    // Guard against re-compacting an already-compacted single-summary session (Pi pattern)
+    {
+        let s = session.lock().await;
+        if s.active_messages().len() <= 1
+            && s.active_messages().first().is_some_and(|m| {
+                m.text_concat()
+                    .trim_start()
+                    .starts_with("[carnot:compaction ")
+            })
+        {
+            let tok = s.effective_context_tokens();
+            return Ok((tok, tok, false));
+        }
+    }
+
     let git_facts = collect_git_facts(config.workspace_root.clone()).await;
 
     // Tier 1: Try cache-warm semantic LLM handoff for Soft & Manual modes
     // (Skip LLM call in EmergencyOverflow since the prompt already exceeds the physical window!)
     let semantic_handoff = if mode != CompactionMode::EmergencyOverflow {
         if let Some((text, usage)) =
-            try_semantic_llm_handoff(config, provider, session, cancel).await
+            try_semantic_llm_handoff(config, provider, session, custom_focus, cancel).await
         {
             // Account for compaction usage accurately in session & metrics
             let turn_num = {
@@ -425,20 +598,14 @@ pub(crate) async fn execute_compaction(
     if let Some(ref ds) = git_facts.diff_stat {
         summary.push_str(&format!("git diff --stat:\n{ds}\n"));
     }
-    if !seg.files_edited.is_empty() {
-        summary.push_str(&format!("Files edited: {}\n", seg.files_edited.join(", ")));
+    let (modified_files, read_only_files) = extract_file_ops_from_session(s.active_messages(), seg);
+    if !modified_files.is_empty() {
+        summary.push_str(&format!("Files edited: {}\n", modified_files.join(", ")));
     }
-    if !seg.files_read.is_empty() {
-        let recent_reads: Vec<&str> = seg
-            .files_read
-            .iter()
-            .rev()
-            .take(20)
-            .map(String::as_str)
-            .collect();
+    if !read_only_files.is_empty() {
         summary.push_str(&format!(
-            "Previously inspected files (all key discoveries are already captured in [carnot:task-handoff] above; only re-read a file if you need to edit it or inspect an uncaptured detail): {}\n",
-            recent_reads.join(", ")
+            "Read-only inspected files (all key discoveries are already captured in [carnot:task-handoff] above; only re-read a file if you need to edit it or inspect an uncaptured detail): {}\n",
+            read_only_files.join(", ")
         ));
     }
     if !seg.handles_created.is_empty() {
@@ -568,5 +735,62 @@ Phase 2:\nLine A\nLine B\n\n\
                 "Phase 3: export CSV".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn compaction_effort_caps_at_medium_only_when_cache_safe() {
+        assert_eq!(
+            compaction_effort_for_provider(ReasoningEffort::Max, true),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            compaction_effort_for_provider(ReasoningEffort::High, true),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            compaction_effort_for_provider(ReasoningEffort::Low, true),
+            ReasoningEffort::Low
+        );
+        // Budget-thinking models preserve exact session effort so cache is never busted
+        assert_eq!(
+            compaction_effort_for_provider(ReasoningEffort::Max, false),
+            ReasoningEffort::Max
+        );
+    }
+
+    #[test]
+    fn file_ops_ledger_survives_resume_and_separates_modified_from_read_only() {
+        let prior = Message::system_note(
+            "[carnot:compaction mode=soft semantic_llm=true session=s1]\n\n\
+[carnot:verified-workspace-state]\n\
+Files edited: src/a.rs\n\
+Read-only inspected files (details above): docs/spec.md, src/b.rs\n",
+        );
+        let turn = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "src/c.rs"}),
+                    invalid_json: None,
+                    provider_meta: None,
+                    origin: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "t2".into(),
+                    name: "Edit".into(),
+                    input: serde_json::json!({"file_path": "src/b.rs"}),
+                    invalid_json: None,
+                    provider_meta: None,
+                    origin: None,
+                },
+            ],
+        };
+        let msgs = vec![Arc::new(prior), Arc::new(turn)];
+        let (modified, read_only) =
+            extract_file_ops_from_session(&msgs, &SegmentTracker::default());
+        assert_eq!(modified, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(read_only, vec!["docs/spec.md", "src/c.rs"]);
     }
 }

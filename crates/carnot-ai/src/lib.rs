@@ -115,6 +115,13 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// True when changing `ProviderRequest::effort` preserves the provider's prompt cache for
+    /// `model` (e.g. Anthropic `output_config.effort` on adaptive/native models vs legacy
+    /// `thinking.budget_tokens` models where changing budget invalidates message caches).
+    fn effort_preserves_cache(&self, _model: &str) -> bool {
+        false
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,

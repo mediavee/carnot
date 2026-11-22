@@ -58,7 +58,7 @@ pub async fn run_repl(agent: Arc<Agent>) -> i32 {
                 "exit" | "quit" | "q" => return 0,
                 "help" | "h" => {
                     eprintln!(
-                        "Commands:\n  /compact  Run cache-warm semantic context compaction\n  /undo     Atomically revert last Edit/Write via CAS snapshot\n  /cost     Show live turns, tokens, cache hit rate, and cost\n  /session  Show current session ID and prefix BLAKE3 hash\n  /exit     Quit interactive session"
+                        "Commands:\n  /compact [focus]  Run cache-warm semantic context compaction (optional focus instructions)\n  /undo             Atomically revert last Edit/Write via CAS snapshot\n  /cost             Show live turns, tokens, cache hit rate, and cost\n  /session          Show current session ID and prefix BLAKE3 hash\n  /exit             Quit interactive session"
                     );
                 }
                 "cost" | "stats" => {
@@ -91,8 +91,12 @@ pub async fn run_repl(agent: Arc<Agent>) -> i32 {
                     Err(e) => eprintln!("\x1b[31mundo failed:\x1b[0m {e}"),
                 },
                 "compact" => {
+                    let focus = cmd
+                        .strip_prefix("compact")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
                     eprintln!("\x1b[2mcompacting context (cache-warm semantic handoff)...\x1b[0m");
-                    match agent.compact_now().await {
+                    match agent.compact_now_with_focus(focus).await {
                         Ok((before, after, semantic)) => {
                             let mode = if semantic {
                                 "semantic-llm"

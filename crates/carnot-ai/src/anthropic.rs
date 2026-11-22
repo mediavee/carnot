@@ -500,6 +500,10 @@ impl Provider for AnthropicProvider {
         self.spec.native_tool_search
     }
 
+    fn effort_preserves_cache(&self, model: &str) -> bool {
+        self.supports_effort(model) && self.thinking_mode(model) != Some("budget")
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,
@@ -1034,6 +1038,14 @@ mod tests {
             body.pointer("/messages/4/content/0/cache_control")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn effort_preserves_cache_follows_catalog_thinking_mode() {
+        let p = AnthropicProvider::new("test-key".into());
+        assert!(p.effort_preserves_cache("claude-opus-5-5"));
+        assert!(p.effort_preserves_cache("claude-sonnet-5-5"));
+        assert!(!p.effort_preserves_cache("unknown-budget-model"));
     }
 
     #[test]

@@ -139,6 +139,9 @@ pub struct SessionStore {
     active_messages: Vec<Arc<Message>>,
     checkpoint_index: Option<usize>,
     last_message_id: Option<String>,
+    /// Last valid provider-reported input token count anchored at `(active_messages.len(), tokens)`.
+    /// Invalidated automatically by any compaction or rewind (inspired by Pi's `estimateProjectedContextTokens`).
+    last_usage_anchor: Option<(usize, u64)>,
 }
 
 impl SessionStore {
@@ -172,6 +175,7 @@ impl SessionStore {
             active_messages: Vec::new(),
             checkpoint_index: None,
             last_message_id: None,
+            last_usage_anchor: None,
         };
 
         store.append_entry(
@@ -271,6 +275,7 @@ impl SessionStore {
             active_messages: Vec::new(),
             checkpoint_index: None,
             last_message_id: None,
+            last_usage_anchor: None,
         };
 
         for entry in entries {
@@ -392,7 +397,7 @@ impl SessionStore {
         min_tail_messages: usize,
         max_tail_messages: usize,
     ) -> Result<(u64, u64)> {
-        let tokens_before = self.project_context().estimated_tokens();
+        let tokens_before = self.effective_context_tokens();
         let n = self.active_messages.len();
         let min_keep = min_tail_messages.min(n);
         let max_keep = max_tail_messages.max(min_keep).min(n);
@@ -440,6 +445,23 @@ impl SessionStore {
             .sum()
     }
 
+    /// Provider-grounded context size estimate: uses the exact last provider-billed input token
+    /// count plus `estimated_tokens()` for any trailing messages added since that call.
+    /// Automatically falls back to full `project_context().estimated_tokens()` after compaction
+    /// or rewind (inspired by Pi's `estimateProjectedContextTokens`).
+    pub fn effective_context_tokens(&self) -> u64 {
+        if let Some((anchor_len, input_tokens)) = self.last_usage_anchor
+            && anchor_len <= self.active_messages.len()
+        {
+            let trailing: u64 = self.active_messages[anchor_len..]
+                .iter()
+                .map(|m| m.estimated_tokens())
+                .sum();
+            return input_tokens.saturating_add(trailing);
+        }
+        self.project_context().estimated_tokens()
+    }
+
     pub fn project_context(&self) -> ProjectedContext {
         ProjectedContext {
             static_system_prompt: self.static_system_prompt.clone(),
@@ -469,7 +491,13 @@ impl SessionStore {
     /// Infallible in-memory state transition (replayed identically during `load()`).
     fn apply_in_memory(&mut self, entry: &SessionEntry) {
         match entry {
-            SessionEntry::Header { .. } | SessionEntry::Usage { .. } => {}
+            SessionEntry::Header { .. } => {}
+            SessionEntry::Usage { usage, .. } => {
+                let billed = usage.total_context_tokens();
+                if billed > 0 {
+                    self.last_usage_anchor = Some((self.active_messages.len(), billed));
+                }
+            }
             SessionEntry::Message { message, .. } => {
                 self.active_messages.push(Arc::new(message.clone()));
             }
@@ -487,6 +515,7 @@ impl SessionStore {
                 self.active_messages.truncate(keep_len);
                 self.active_messages.push(Arc::new(receipt_message.clone()));
                 self.checkpoint_index = Some(self.active_messages.len() - 1);
+                self.last_usage_anchor = None;
             }
             SessionEntry::Compaction {
                 summary_message,
@@ -511,6 +540,7 @@ impl SessionStore {
                 self.active_messages.push(Arc::new(summary_message.clone()));
                 self.active_messages.extend(tail);
                 self.checkpoint_index = Some(0);
+                self.last_usage_anchor = None;
             }
         }
     }
@@ -727,5 +757,40 @@ mod tests {
         assert!(after < before, "expected drop: {before} -> {after}");
         assert_eq!(s.active_messages().len(), 1);
         assert_eq!(s.active_messages()[0].text_concat(), "DENSE HANDOFF");
+    }
+
+    #[test]
+    fn effective_context_tokens_uses_provider_usage_and_resets_on_compaction() {
+        let mut s = SessionStore::create(None, "claude-sonnet-5-5".into(), "STATIC".into(), vec![])
+            .expect("create");
+        s.push_message(Message::user_text("short prompt"))
+            .expect("u0");
+        // Provider reports 50_000 actual billed input tokens (e.g. dense JSON/CJK/PDF)
+        s.record_usage(
+            1,
+            Usage {
+                input_tokens: 100,
+                cache_read_tokens: 49_900,
+                ..Default::default()
+            },
+        )
+        .expect("usage");
+        assert_eq!(s.effective_context_tokens(), 50_000);
+
+        // Appending a trailing assistant reply adds its estimate on top of 50_000
+        let reply = Message::assistant_text("A".repeat(400));
+        let reply_est = reply.estimated_tokens();
+        s.push_message(reply).expect("a0");
+        assert_eq!(s.effective_context_tokens(), 50_000 + reply_est);
+
+        // Compaction invalidates the stale pre-compaction Usage anchor immediately
+        let (before, after) = s
+            .apply_compaction_budgeted("COMPACT".into(), 4_000, 0, 4)
+            .expect("compact");
+        assert_eq!(before, 50_000 + reply_est);
+        assert!(
+            after < 500,
+            "post-compaction must not reuse stale 50k usage: {after}"
+        );
     }
 }
