@@ -1,8 +1,11 @@
-//! Optional Tier-1 LSP Diagnostics Delta Module (`LspDiagnosticsModule`).
+//! Optional Tier-1 LSP Diagnostics Delta & Deferred Semantic Navigation (`LspDiagnosticsModule` + `LspQuery`).
 //!
 //! Complements Carnot's <0.5 ms Tier-0 tree-sitter syntax check with full type/borrow/symbol
-//! diagnostics from `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, or `gopls`:
-//!   - Lazy-spawns per language on first `Read`/`Edit`/`Write` (opt-in only for trusted workspaces!)
+//! intelligence from `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls`,
+//! `clangd` (C/C++), or `zls` (Zig):
+//!   - Lazy-spawns per language on first `Read`/`Edit`/`Write`/`LspQuery` (opt-in for trusted workspaces!)
+//!   - Shared `LspServerPool` between passive post-Edit diagnostics AND active deferred `LspQuery`
+//!     (`definition`, `references`, `hover`, `diagnostics` — `defer_loading: true`, 0 static prefix cost!)
 //!   - Exact byte-counted `Content-Length:` JSON-RPC 2.0 framing
 //!   - Answers server-initiated `workspace/configuration`, `client/registerCapability`,
 //!     `window/workDoneProgress/create` so servers never deadlock
@@ -10,8 +13,9 @@
 //!   - Strict latency budget (default 400 ms): emits 0 extra tokens on clean edits or timeouts!
 
 use crate::{BoxFuture, Module};
-use carnot_core::{Result, ToolOutput, ToolResultBlock};
+use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolResultBlock, ToolSpec};
 use carnot_sandbox::apply_safe_env;
+use carnot_tools::{Tool, files::resolve_confined_path};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,22 +25,27 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum LspLang {
+pub enum LspLang {
     Rust,
     TypeScript,
     Python,
     Go,
+    Cpp,
+    Zig,
 }
 
 impl LspLang {
     fn from_path(path: &Path) -> Option<Self> {
         match path.extension().and_then(|e| e.to_str())? {
             "rs" => Some(Self::Rust),
-            "ts" | "tsx" | "js" | "jsx" => Some(Self::TypeScript),
-            "py" => Some(Self::Python),
+            "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "py" | "pyi" => Some(Self::Python),
             "go" => Some(Self::Go),
+            "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hxx" => Some(Self::Cpp),
+            "zig" => Some(Self::Zig),
             _ => None,
         }
     }
@@ -47,15 +56,19 @@ impl LspLang {
             Self::TypeScript => "typescript",
             Self::Python => "python",
             Self::Go => "go",
+            Self::Cpp => "cpp",
+            Self::Zig => "zig",
         }
     }
 
-    fn server_command(self) -> (&'static str, &'static [&'static str]) {
+    fn default_command(self) -> (&'static str, &'static [&'static str]) {
         match self {
             Self::Rust => ("rust-analyzer", &[]),
             Self::TypeScript => ("typescript-language-server", &["--stdio"]),
             Self::Python => ("pyright-langserver", &["--stdio"]),
             Self::Go => ("gopls", &[]),
+            Self::Cpp => ("clangd", &[]),
+            Self::Zig => ("zls", &[]),
         }
     }
 }
@@ -100,8 +113,7 @@ fn frame_lsp_message(v: &Value) -> Vec<u8> {
 }
 
 impl LspConn {
-    async fn spawn(lang: LspLang, workspace_root: &Path) -> Option<Arc<Self>> {
-        let (bin, args) = lang.server_command();
+    async fn spawn(bin: &str, args: &[String], workspace_root: &Path) -> Option<Arc<Self>> {
         let mut cmd = Command::new(bin);
         cmd.args(args)
             .current_dir(workspace_root)
@@ -267,7 +279,10 @@ impl LspConn {
                     "rootUri": root_uri,
                     "capabilities": {
                         "textDocument": {
-                            "publishDiagnostics": { "relatedInformation": false }
+                            "publishDiagnostics": { "relatedInformation": false },
+                            "definition": { "linkSupport": true },
+                            "references": {},
+                            "hover": { "contentFormat": ["markdown", "plaintext"] }
                         }
                     }
                 }),
@@ -339,22 +354,23 @@ impl LspConn {
     }
 }
 
-/// Optional Tier-1 LSP Diagnostics module. Emits ONLY newly introduced errors after `Edit`/`Write`.
+/// Shared lazy LSP server pool used by both passive `LspDiagnosticsModule` and active `LspQueryTool`.
 #[derive(Debug)]
-pub struct LspDiagnosticsModule {
+struct LspServerPool {
     workspace_root: PathBuf,
-    budget: Duration,
     servers: Mutex<HashMap<LspLang, Option<Arc<LspConn>>>>,
-    baseline: StdMutex<HashMap<String, HashSet<DiagFingerprint>>>,
+    custom_commands: HashMap<LspLang, (String, Vec<String>)>,
 }
 
-impl LspDiagnosticsModule {
-    pub fn new(workspace_root: PathBuf, budget_ms: u64) -> Self {
+impl LspServerPool {
+    fn new(
+        workspace_root: PathBuf,
+        custom_commands: HashMap<LspLang, (String, Vec<String>)>,
+    ) -> Self {
         Self {
             workspace_root,
-            budget: Duration::from_millis(budget_ms.clamp(50, 5_000)),
             servers: Mutex::new(HashMap::new()),
-            baseline: StdMutex::new(HashMap::new()),
+            custom_commands,
         }
     }
 
@@ -363,9 +379,285 @@ impl LspDiagnosticsModule {
         if let Some(cached) = map.get(&lang) {
             return cached.clone();
         }
-        let spawned = LspConn::spawn(lang, &self.workspace_root).await;
+        let (bin, args): (String, Vec<String>) = match self.custom_commands.get(&lang) {
+            Some((b, a)) => (b.clone(), a.clone()),
+            None => {
+                let (b, a) = lang.default_command();
+                (b.to_string(), a.iter().map(|s| (*s).to_string()).collect())
+            }
+        };
+        let spawned = LspConn::spawn(&bin, &args, &self.workspace_root).await;
         map.insert(lang, spawned.clone());
         spawned
+    }
+}
+
+fn format_lsp_locations(val: &Value, workspace_root: &Path, max_items: usize) -> Vec<String> {
+    let items: Vec<&Value> = match val {
+        Value::Array(arr) => arr.iter().collect(),
+        Value::Object(_) => vec![val],
+        _ => Vec::new(),
+    };
+    let ws_canon = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut out = Vec::new();
+    for item in items.into_iter().take(max_items) {
+        let uri = item
+            .get("uri")
+            .or_else(|| item.get("targetUri"))
+            .and_then(Value::as_str);
+        let range = item
+            .get("range")
+            .or_else(|| item.get("targetSelectionRange"))
+            .or_else(|| item.get("targetRange"));
+        let (Some(uri), Some(range)) = (uri, range) else {
+            continue;
+        };
+        let line0 = range
+            .pointer("/start/line")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let col0 = range
+            .pointer("/start/character")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let raw_path = uri.strip_prefix("file://").unwrap_or(uri);
+        let path = PathBuf::from(raw_path);
+        let disp = path
+            .strip_prefix(&ws_canon)
+            .or_else(|_| path.strip_prefix(workspace_root))
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let preview = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.lines().nth(line0).map(|l| l.trim().to_string()))
+            .filter(|l| !l.is_empty());
+        match preview {
+            Some(line_txt) => out.push(format!("{disp}:{}:{}  {line_txt}", line0 + 1, col0 + 1)),
+            None => out.push(format!("{disp}:{}:{}", line0 + 1, col0 + 1)),
+        }
+    }
+    out
+}
+
+fn format_hover_contents(val: &Value) -> Option<String> {
+    let contents = val.get("contents")?;
+    match contents {
+        Value::String(s) => (!s.trim().is_empty()).then(|| s.trim().to_string()),
+        Value::Object(map) => map
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        Value::Array(arr) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(s) => Some(s.trim().to_string()),
+                    Value::Object(map) => map
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n---\n"))
+        }
+        _ => None,
+    }
+}
+
+/// Deferred active semantic navigation tool (`LspQuery`, `defer_loading: true` => 0 static prefix tokens).
+#[derive(Debug)]
+struct LspQueryTool {
+    pool: Arc<LspServerPool>,
+}
+
+impl Tool for LspQueryTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "LspQuery".into(),
+            description: "Query active language server for semantic `definition`, `references`, `hover` (type/docs), or `diagnostics` at a 1-based `(file_path, line, column)`.".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action", "file_path"],
+                "properties": {
+                    "action": { "type": "string", "enum": ["definition", "references", "hover", "diagnostics"] },
+                    "file_path": { "type": "string" },
+                    "line": { "type": "integer", "description": "1-based line number (required for definition/references/hover)" },
+                    "column": { "type": "integer", "description": "1-based column number (default 1)" }
+                }
+            }),
+            defer_loading: true,
+        }
+    }
+
+    fn effects(&self, _input: &Value) -> ToolEffects {
+        ToolEffects::global_read()
+    }
+
+    fn execute(
+        &self,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<ToolOutput>> {
+        Box::pin(async move {
+            let Some(action) = input.get("action").and_then(Value::as_str) else {
+                return Ok(ToolOutput::err_text("LspQuery requires `action`"));
+            };
+            let Some(raw_fp) = input.get("file_path").and_then(Value::as_str) else {
+                return Ok(ToolOutput::err_text("LspQuery requires `file_path`"));
+            };
+            let path = match resolve_confined_path(&self.pool.workspace_root, &[], raw_fp) {
+                Ok(p) => p,
+                Err(msg) => return Ok(ToolOutput::err_text(msg)),
+            };
+            let Some(lang) = LspLang::from_path(&path) else {
+                return Ok(ToolOutput::err_text(format!(
+                    "No LSP configured for file extension of `{raw_fp}`"
+                )));
+            };
+            let text = match tokio::fs::read_to_string(&path).await {
+                Ok(t) => t,
+                Err(e) => return Ok(ToolOutput::err_text(format!("Cannot read `{raw_fp}`: {e}"))),
+            };
+            let Some(conn) = self.pool.get_server(lang).await else {
+                return Ok(ToolOutput::err_text(format!(
+                    "LSP server `{}` is not installed or failed to start",
+                    lang.default_command().0
+                )));
+            };
+
+            let uri = conn.sync_document(&path, lang, &text).await;
+            if action == "diagnostics" {
+                let diags = conn
+                    .diagnostics
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&uri).cloned())
+                    .unwrap_or_default();
+                if diags.is_empty() {
+                    return Ok(ToolOutput::ok_text(format!(
+                        "No LSP error diagnostics reported for {raw_fp}."
+                    )));
+                }
+                let lines: Vec<String> = diags
+                    .iter()
+                    .take(25)
+                    .map(|d| format!("L{}: [{}] {}", d.line + 1, d.code, d.message))
+                    .collect();
+                return Ok(ToolOutput::ok_text(lines.join("\n")));
+            }
+
+            let Some(line1) = input
+                .get("line")
+                .and_then(Value::as_u64)
+                .filter(|&l| l >= 1)
+            else {
+                return Ok(ToolOutput::err_text(format!(
+                    "LspQuery action `{action}` requires 1-based `line` (>= 1)"
+                )));
+            };
+            let col1 = input
+                .get("column")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .max(1);
+            let pos = json!({ "line": line1 - 1, "character": col1 - 1 });
+
+            let (method, params) = match action {
+                "definition" => (
+                    "textDocument/definition",
+                    json!({ "textDocument": { "uri": uri }, "position": pos }),
+                ),
+                "references" => (
+                    "textDocument/references",
+                    json!({
+                        "textDocument": { "uri": uri },
+                        "position": pos,
+                        "context": { "includeDeclaration": true }
+                    }),
+                ),
+                "hover" => (
+                    "textDocument/hover",
+                    json!({ "textDocument": { "uri": uri }, "position": pos }),
+                ),
+                other => {
+                    return Ok(ToolOutput::err_text(format!(
+                        "Unknown LspQuery action `{other}`"
+                    )));
+                }
+            };
+
+            let resp = tokio::select! {
+                _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                r = conn.request(method, params, Duration::from_secs(5)) => r,
+            };
+            let Some(val) = resp else {
+                return Ok(ToolOutput::err_text(format!(
+                    "LSP `{method}` timed out or returned no response"
+                )));
+            };
+
+            match action {
+                "definition" | "references" => {
+                    let locs = format_lsp_locations(&val, &self.pool.workspace_root, 30);
+                    if locs.is_empty() {
+                        Ok(ToolOutput::ok_text(format!(
+                            "No {action} found at {raw_fp}:{line1}:{col1}."
+                        )))
+                    } else {
+                        Ok(ToolOutput::ok_text(locs.join("\n")))
+                    }
+                }
+                "hover" => match format_hover_contents(&val) {
+                    Some(h) => Ok(ToolOutput::ok_text(h)),
+                    None => Ok(ToolOutput::ok_text(format!(
+                        "No hover info at {raw_fp}:{line1}:{col1}."
+                    ))),
+                },
+                _ => unreachable!(),
+            }
+        })
+    }
+}
+
+/// Optional Tier-1 LSP Diagnostics & Semantic Query module.
+/// Emits ONLY newly introduced errors after `Edit`/`Write` and registers deferred `LspQuery`.
+#[derive(Debug)]
+pub struct LspDiagnosticsModule {
+    pool: Arc<LspServerPool>,
+    budget: Duration,
+    baseline: StdMutex<HashMap<String, HashSet<DiagFingerprint>>>,
+    query_tool: Arc<dyn Tool>,
+}
+
+impl LspDiagnosticsModule {
+    pub fn new(workspace_root: PathBuf, budget_ms: u64) -> Self {
+        Self::with_custom_commands(workspace_root, budget_ms, HashMap::new())
+    }
+
+    /// Creates an `LspDiagnosticsModule` with optional custom language-server binary overrides.
+    pub fn with_custom_commands(
+        workspace_root: PathBuf,
+        budget_ms: u64,
+        custom_commands: HashMap<LspLang, (String, Vec<String>)>,
+    ) -> Self {
+        let pool = Arc::new(LspServerPool::new(workspace_root, custom_commands));
+        let query_tool = Arc::new(LspQueryTool {
+            pool: Arc::clone(&pool),
+        });
+        Self {
+            pool,
+            budget: Duration::from_millis(budget_ms.clamp(50, 5_000)),
+            baseline: StdMutex::new(HashMap::new()),
+            query_tool,
+        }
     }
 }
 
@@ -395,6 +687,10 @@ impl Module for LspDiagnosticsModule {
         "lsp_diagnostics"
     }
 
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![self.query_tool.clone()]
+    }
+
     fn after_tool_result<'a>(
         &'a self,
         tool_name: &'a str,
@@ -420,7 +716,7 @@ impl Module for LspDiagnosticsModule {
                 let joined = if path.is_absolute() {
                     path
                 } else {
-                    self.workspace_root.join(path)
+                    self.pool.workspace_root.join(path)
                 };
                 joined.canonicalize().unwrap_or(joined)
             };
@@ -430,7 +726,7 @@ impl Module for LspDiagnosticsModule {
             let Ok(text) = tokio::fs::read_to_string(&p).await else {
                 return Ok(());
             };
-            let Some(conn) = self.get_server(lang).await else {
+            let Some(conn) = self.pool.get_server(lang).await else {
                 return Ok(());
             };
 
@@ -489,5 +785,105 @@ impl Module for LspDiagnosticsModule {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lsp_query_tool_handles_definition_references_hover_and_diagnostics() {
+        let dir = std::env::temp_dir().join(format!("carnot-lsp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let src = dir.join("lib.rs");
+        std::fs::write(&src, "pub fn answer() -> i32 {\n    42\n}\n").expect("write rs");
+        let srv_py = dir.join("mock_lsp.py");
+        std::fs::write(
+            &srv_py,
+            r#"import sys, json
+def send(obj):
+    data = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(data)}\r\n\r\n".encode("ascii") + data)
+    sys.stdout.buffer.flush()
+buf = sys.stdin.buffer
+while True:
+    cl = None
+    while True:
+        line = buf.readline()
+        if not line:
+            sys.exit(0)
+        s = line.decode("ascii", "ignore").strip()
+        if not s:
+            break
+        if s.lower().startswith("content-length:"):
+            cl = int(s.split(":", 1)[1].strip())
+    if cl is None:
+        continue
+    msg = json.loads(buf.read(cl).decode("utf-8"))
+    m = msg.get("method")
+    rid = msg.get("id")
+    p = msg.get("params") or {}
+    if m == "initialize":
+        send({"jsonrpc":"2.0","id":rid,"result":{"capabilities":{"definitionProvider":True,"referencesProvider":True,"hoverProvider":True}}})
+    elif m == "textDocument/didOpen":
+        uri = p["textDocument"]["uri"]
+        send({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":uri,"diagnostics":[{"severity":1,"code":"E0308","message":"mismatched types","range":{"start":{"line":1,"character":4},"end":{"line":1,"character":6}}}]}})
+    elif m == "textDocument/definition":
+        uri = p["textDocument"]["uri"]
+        send({"jsonrpc":"2.0","id":rid,"result":[{"uri":uri,"range":{"start":{"line":0,"character":7},"end":{"line":0,"character":13}}}]})
+    elif m == "textDocument/references":
+        uri = p["textDocument"]["uri"]
+        send({"jsonrpc":"2.0","id":rid,"result":[{"uri":uri,"range":{"start":{"line":0,"character":7},"end":{"line":0,"character":13}}}]})
+    elif m == "textDocument/hover":
+        send({"jsonrpc":"2.0","id":rid,"result":{"contents":{"kind":"markdown","value":"```rust\npub fn answer() -> i32\n```"}}})
+"#,
+        )
+        .expect("write py");
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            LspLang::Rust,
+            (
+                "python3".to_string(),
+                vec![srv_py.to_string_lossy().to_string()],
+            ),
+        );
+        let module = LspDiagnosticsModule::with_custom_commands(dir.clone(), 400, custom);
+        let tool = module.tools().into_iter().next().expect("LspQuery");
+        assert!(tool.spec().defer_loading);
+
+        let def = tool
+            .execute(
+                json!({"action": "definition", "file_path": "lib.rs", "line": 1, "column": 8}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("def");
+        assert!(!def.is_error, "got: {}", def.text_only());
+        assert!(def.text_only().contains("lib.rs:1:8"));
+        assert!(def.text_only().contains("pub fn answer()"));
+
+        let hover = tool
+            .execute(
+                json!({"action": "hover", "file_path": "lib.rs", "line": 1, "column": 8}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("hover");
+        assert!(hover.text_only().contains("pub fn answer() -> i32"));
+
+        // Diagnostics pushed during didOpen should be queryable cleanly!
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let diags = tool
+            .execute(
+                json!({"action": "diagnostics", "file_path": "lib.rs"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("diags");
+        assert!(diags.text_only().contains("L2: [E0308] mismatched types"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

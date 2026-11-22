@@ -890,3 +890,206 @@ async fn e2e_cache_warm_semantic_compaction_preserves_full_goal_and_bash_cwd() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn e2e_background_subagent_spawn_list_collect_and_cost_rollup() {
+    use carnot_ai::{Provider, ProviderRequest, StreamEvent};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Deterministic router separating parent vs background child requests so async scheduling is 100% race-free.
+    #[derive(Debug)]
+    struct SplitProvider {
+        parent: Arc<FauxProvider>,
+        child: Arc<FauxProvider>,
+    }
+
+    impl Provider for SplitProvider {
+        fn name(&self) -> &str {
+            "split-faux"
+        }
+        fn stream(
+            &self,
+            req: ProviderRequest,
+            cancel: CancellationToken,
+        ) -> carnot_ai::BoxFuture<'_, Result<mpsc::Receiver<StreamEvent>>> {
+            let is_child = req
+                .messages
+                .first()
+                .map(|m| m.text_concat().contains("CHILD_TASK"))
+                .unwrap_or(false);
+            let target = if is_child {
+                Arc::clone(&self.child)
+            } else {
+                Arc::clone(&self.parent)
+            };
+            Box::pin(async move { target.stream(req, cancel).await })
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("carnot-bgsub-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::write(dir.join("work.txt"), "parent_file=ok\n").expect("write");
+
+    let parent_faux = Arc::new(FauxProvider::new(vec![
+        // Turn 1: parent spawns 2 non-blocking background subagents in parallel!
+        ScriptedTurn::tool_calls(vec![
+            (
+                "bg1",
+                "Subagent",
+                json!({"task": "CHILD_TASK alpha", "background": true}),
+            ),
+            (
+                "bg2",
+                "Subagent",
+                json!({"task": "CHILD_TASK beta", "background": true}),
+            ),
+        ]),
+        // Turn 2: parent keeps working (Read + list) while children run in background!
+        ScriptedTurn::tool_calls(vec![
+            ("r1", "Read", json!({"file_path": "work.txt"})),
+            ("l1", "Subagent", json!({"list": true})),
+        ]),
+        // Turn 3: parent waits & collects both background subagents in parallel!
+        ScriptedTurn::tool_calls(vec![
+            ("w1", "Subagent", json!({"job": "sub-1", "wait": true})),
+            ("w2", "Subagent", json!({"job": "sub-2", "wait": true})),
+        ]),
+        // Turn 4: final answer
+        ScriptedTurn::text("Collected both background subagents."),
+    ]));
+
+    let mut c1 = ScriptedTurn::text("Alpha result ready.");
+    c1.output_tokens = 2_000;
+    let mut c2 = ScriptedTurn::text("Beta result ready.");
+    c2.output_tokens = 3_000;
+    let child_faux = Arc::new(FauxProvider::new(vec![c1, c2]));
+
+    let router = Arc::new(SplitProvider {
+        parent: Arc::clone(&parent_faux),
+        child: Arc::clone(&child_faux),
+    });
+
+    let mut cfg = CarnotConfig::new(dir.clone());
+    cfg.modules.sandbox = false;
+    cfg.modules.subagent = true;
+    let agent = CarnotBuilder::new(dir.clone())
+        .config(cfg)
+        .provider(router)
+        .persist_session(false)
+        .build()
+        .expect("build");
+
+    let out = agent
+        .prompt("Run parallel background work")
+        .await
+        .expect("run");
+    assert_eq!(out.final_text, "Collected both background subagents.");
+
+    let preqs = parent_faux.recorded_requests();
+    assert_eq!(preqs.len(), 4);
+    // Turn 2 received immediate non-blocking handles (`sub-1`, `sub-2`)
+    let t2_ctx = msgs_json(&preqs[1].messages);
+    assert!(t2_ctx.contains("sub-1") && t2_ctx.contains("sub-2"));
+    // Turn 3 received `work.txt` AND `list: true` output
+    let t3_ctx = msgs_json(&preqs[2].messages);
+    assert!(t3_ctx.contains("parent_file=ok"));
+    assert!(t3_ctx.contains("CHILD_TASK"));
+    // Turn 4 received BOTH subagent reports
+    let t4_ctx = msgs_json(&preqs[3].messages);
+    assert!(t4_ctx.contains("Alpha result ready."));
+    assert!(t4_ctx.contains("Beta result ready."));
+
+    // Parent metrics MUST include exact single-counted rollup of both children's spend!
+    // Parent alone is ~$0.001; 5,000 child output tokens add ~$0.0625 -> total ~$0.0636.
+    assert!(
+        out.metrics.total_usage.cost_usd >= 0.05,
+        "expected rolled-up child cost >= $0.05, got ${:.6}",
+        out.metrics.total_usage.cost_usd
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn e2e_before_compact_module_hook_adds_focus_and_can_cancel() {
+    use carnot::{CompactionHookAction, CompactionHookContext, Module};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct CompactHookModule {
+        cancel_next: Arc<AtomicBool>,
+    }
+
+    impl Module for CompactHookModule {
+        fn name(&self) -> &str {
+            "compact_hook_test"
+        }
+
+        fn before_compact<'a>(
+            &'a self,
+            _ctx: &'a CompactionHookContext,
+        ) -> carnot_ext::BoxFuture<'a, Result<CompactionHookAction>> {
+            let cancel = self.cancel_next.load(Ordering::Relaxed);
+            Box::pin(async move {
+                if cancel {
+                    Ok(CompactionHookAction::Cancel {
+                        reason: "busy transaction".into(),
+                    })
+                } else {
+                    Ok(CompactionHookAction::AddFocus(
+                        "HOOK_FOCUS_PRESERVE_SQL_SCHEMA_V9".into(),
+                    ))
+                }
+            })
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("carnot-cmphook-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).expect("mkdir");
+    let cancel_flag = Arc::new(AtomicBool::new(true));
+
+    let faux = Arc::new(FauxProvider::new(vec![
+        ScriptedTurn::text("initial reply"),
+        ScriptedTurn::text("second reply"),
+        ScriptedTurn::text(
+            "## 1. Exact Constraints & Edge Cases\n- Preserved SQL schema v9 migration ordering and foreign keys.\n## 6. Immediate Next Step\n- Run integration tests.",
+        ),
+    ]));
+
+    let mut cfg = CarnotConfig::new(dir.clone());
+    cfg.modules.sandbox = false;
+    cfg.modules.compaction = true;
+    let agent = CarnotBuilder::new(dir.clone())
+        .config(cfg)
+        .provider(faux.clone())
+        .with_module(Arc::new(CompactHookModule {
+            cancel_next: Arc::clone(&cancel_flag),
+        }))
+        .persist_session(false)
+        .build()
+        .expect("build");
+
+    let _ = agent.prompt("Initial prompt").await.expect("p1");
+    let _ = agent.prompt("Second prompt").await.expect("p2");
+
+    // 1. When hook returns `Cancel`, manual compaction is vetoed without calling the provider!
+    let (b1, a1, used1) = agent.compact_now().await.expect("vetoed compact");
+    assert_eq!(b1, a1);
+    assert!(!used1);
+    assert_eq!(faux.recorded_requests().len(), 2);
+
+    // 2. When hook returns `AddFocus`, its instruction is injected into the semantic compaction request!
+    cancel_flag.store(false, Ordering::Relaxed);
+    let (_, _, used2) = agent.compact_now().await.expect("focused compact");
+    assert!(used2);
+    let reqs = faux.recorded_requests();
+    assert_eq!(reqs.len(), 3);
+    let compact_req_txt = msgs_json(&reqs[2].messages);
+    assert!(
+        compact_req_txt.contains("HOOK_FOCUS_PRESERVE_SQL_SCHEMA_V9"),
+        "expected hook focus in compaction prompt, got: {compact_req_txt}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

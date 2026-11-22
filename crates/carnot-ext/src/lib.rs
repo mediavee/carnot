@@ -88,6 +88,27 @@ pub struct TurnBoundarySnapshot {
     pub failed_attempts_summary: Vec<String>,
 }
 
+/// Context passed to `Module::before_compact` before proactive or manual compaction runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionHookContext {
+    pub mode: String,
+    pub tokens_before: u64,
+    pub message_count: usize,
+    pub custom_focus: Option<String>,
+}
+
+/// Decision returned by `Module::before_compact` (inspired by Pi's `session_before_compact`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionHookAction {
+    Continue,
+    /// Append extra focus instructions to the semantic compaction handoff prompt.
+    AddFocus(String),
+    /// Cancel a non-emergency compaction (ignored during `emergency` overflow recovery).
+    Cancel {
+        reason: String,
+    },
+}
+
 /// First-class in-process Rust module interface.
 ///
 /// Every built-in Carnot capability implements this exact trait, so external Rust extensions
@@ -130,5 +151,13 @@ pub trait Module: Send + Sync + std::fmt::Debug {
         _snapshot: &'a TurnBoundarySnapshot,
     ) -> BoxFuture<'a, Result<BoundaryAction>> {
         Box::pin(async { Ok(BoundaryAction::Continue) })
+    }
+
+    /// Optional pre-compaction hook (add custom focus constraints or veto non-emergency compaction).
+    fn before_compact<'a>(
+        &'a self,
+        _ctx: &'a CompactionHookContext,
+    ) -> BoxFuture<'a, Result<CompactionHookAction>> {
+        Box::pin(async { Ok(CompactionHookAction::Continue) })
     }
 }

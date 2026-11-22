@@ -22,6 +22,7 @@ use carnot_core::{
     AgentEvent, CarnotConfig, ContentBlock, Message, ReasoningEffort, Result, Role, StopReason,
     ThermodynamicMetrics, Usage,
 };
+use carnot_ext::{CompactionHookAction, CompactionHookContext, Module};
 use carnot_session::SessionStore;
 use carnot_tools::ToolRegistry;
 use std::collections::BTreeSet;
@@ -483,6 +484,7 @@ pub(crate) async fn execute_compaction(
     config: &CarnotConfig,
     provider: &Arc<dyn Provider>,
     tools: &Arc<ToolRegistry>,
+    modules: &[Arc<dyn Module>],
     session: &Mutex<SessionStore>,
     metrics: &Mutex<ThermodynamicMetrics>,
     events: &crate::EventLog,
@@ -493,27 +495,74 @@ pub(crate) async fn execute_compaction(
     cancel: CancellationToken,
 ) -> Result<(u64, u64, bool)> {
     // Guard against re-compacting an already-compacted single-summary session (Pi pattern)
-    {
+    let (pre_tokens, pre_msg_count) = {
         let s = session.lock().await;
-        if s.active_messages().len() <= 1
+        let tok = s.effective_context_tokens();
+        let cnt = s.active_messages().len();
+        if cnt <= 1
             && s.active_messages().first().is_some_and(|m| {
                 m.text_concat()
                     .trim_start()
                     .starts_with("[carnot:compaction ")
             })
         {
-            let tok = s.effective_context_tokens();
             return Ok((tok, tok, false));
         }
+        (tok, cnt)
+    };
+
+    // Invoke `Module::before_compact` hooks (Pi-style extensibility; EmergencyOverflow cannot be vetoed)
+    let mut focus_parts: Vec<String> = Vec::new();
+    if let Some(f) = custom_focus.map(str::trim).filter(|s| !s.is_empty()) {
+        focus_parts.push(f.to_string());
     }
+    if !modules.is_empty() {
+        let hook_ctx = CompactionHookContext {
+            mode: mode.as_str().to_string(),
+            tokens_before: pre_tokens,
+            message_count: pre_msg_count,
+            custom_focus: custom_focus.map(str::to_string),
+        };
+        for m in modules {
+            match m.before_compact(&hook_ctx).await {
+                Ok(CompactionHookAction::Continue) => {}
+                Ok(CompactionHookAction::AddFocus(extra)) => {
+                    let t = extra.trim();
+                    if !t.is_empty() {
+                        focus_parts.push(t.to_string());
+                    }
+                }
+                Ok(CompactionHookAction::Cancel { reason }) => {
+                    if mode != CompactionMode::EmergencyOverflow {
+                        tracing::info!(module = %m.name(), %reason, "compaction cancelled by module hook");
+                        return Ok((pre_tokens, pre_tokens, false));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(module = %m.name(), error = %e, "before_compact hook failed (fail-open)");
+                }
+            }
+        }
+    }
+    let effective_focus = if focus_parts.is_empty() {
+        None
+    } else {
+        Some(focus_parts.join("\n"))
+    };
 
     let git_facts = collect_git_facts(config.workspace_root.clone()).await;
 
     // Tier 1: Try cache-warm semantic LLM handoff for Soft & Manual modes
     // (Skip LLM call in EmergencyOverflow since the prompt already exceeds the physical window!)
     let semantic_handoff = if mode != CompactionMode::EmergencyOverflow {
-        if let Some((text, usage)) =
-            try_semantic_llm_handoff(config, provider, session, custom_focus, cancel).await
+        if let Some((text, usage)) = try_semantic_llm_handoff(
+            config,
+            provider,
+            session,
+            effective_focus.as_deref(),
+            cancel,
+        )
+        .await
         {
             // Account for compaction usage accurately in session & metrics
             let turn_num = {

@@ -30,9 +30,10 @@ pub use carnot_core::{
     ToolEffects, ToolOutput, ToolSpec, Usage, canonicalize_json,
 };
 pub use carnot_ext::{
-    BoundaryAction, Module, PermissionBroker, ToolGateDecision, TurnBoundarySnapshot,
-    daemon::MaxwellDaemonModule, lsp::LspDiagnosticsModule, microskills::ExecMicroSkillsModule,
-    policy::PolicyGuardModule, prefix_guard::assert_prefix_invariance, rewind::RewindReceiptModule,
+    BoundaryAction, CompactionHookAction, CompactionHookContext, Module, PermissionBroker,
+    ToolGateDecision, TurnBoundarySnapshot, daemon::MaxwellDaemonModule, lsp::LspDiagnosticsModule,
+    microskills::ExecMicroSkillsModule, policy::PolicyGuardModule,
+    prefix_guard::assert_prefix_invariance, rewind::RewindReceiptModule,
     subprocess::SubprocessExtension, warm_fork::IsolatedForkWorktree, web::WebFetchModule,
 };
 pub use carnot_mcp::{
