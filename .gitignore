@@ -1,0 +1,11 @@
+/target
+/Cargo.lock.bak
+.carnot/
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.tmp
+.env
+.env.*

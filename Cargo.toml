@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/carnot-core",
+    "crates/carnot-cas",
+    "crates/carnot-sandbox",
+    "crates/carnot-session",
+    "crates/carnot-ai",
+    "crates/carnot-tools",
+    "crates/carnot-mcp",
+    "crates/carnot-ext",
+    "crates/carnot-agent",
+    "crates/carnot-protocol",
+    "crates/carnot",
+    "crates/carnot-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+
+[workspace.dependencies]
+base64 = "0.23"
+blake3 = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+futures = "0.3"
+regex = "1.13"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+similar = "3.2"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "io-std", "net", "signal", "fs"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tree-sitter = "0.27"
+tree-sitter-go = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+url = "2.5"
+uuid = { version = "1.29", features = ["v4", "v7", "serde"] }
+webpki-root-certs = "1"
+
+carnot-core = { path = "crates/carnot-core" }
+carnot-cas = { path = "crates/carnot-cas" }
+carnot-sandbox = { path = "crates/carnot-sandbox" }
+carnot-session = { path = "crates/carnot-session" }
+carnot-ai = { path = "crates/carnot-ai" }
+carnot-tools = { path = "crates/carnot-tools" }
+carnot-mcp = { path = "crates/carnot-mcp" }
+carnot-ext = { path = "crates/carnot-ext" }
+carnot-agent = { path = "crates/carnot-agent" }
+carnot-protocol = { path = "crates/carnot-protocol" }
+carnot = { path = "crates/carnot" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
