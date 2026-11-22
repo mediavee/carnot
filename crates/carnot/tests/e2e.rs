@@ -866,7 +866,7 @@ async fn e2e_cache_warm_semantic_compaction_preserves_full_goal_and_bash_cwd() {
         "full user objective past char 1200 MUST survive compaction verbatim!"
     );
     assert!(
-        post_compact_ctx.contains("[carnot:engineering-handoff]"),
+        post_compact_ctx.contains("[carnot:task-handoff]"),
         "missing semantic LLM handoff section"
     );
 

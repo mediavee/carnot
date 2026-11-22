@@ -93,17 +93,18 @@ fn build_semantic_compaction_prompt(has_prior_compaction: bool) -> String {
     };
     format!(
         "[carnot:compaction-request]\n\
-Produce a dense, lossless engineering handoff so work can continue seamlessly after older turns are folded. Do NOT call any tools.\n\
+Produce a dense, high-recall task handoff so work can continue seamlessly after older turns are folded. Do NOT call any tools.\n\
+Maximize recall over brevity: preserve exact numbers, identifiers, paths, error messages, decisions, and user corrections verbatim.\n\
 {merge_note}\
-Structure your response with these exact 6 markdown headings (omit nothing critical, stay crisp and factual):\n\
+Structure your response with these exact 6 markdown headings (crisp, factual, zero fluff):\n\
 ## 1. Exact Constraints & Edge Cases\n\
-Every concrete requirement, output file path, schema/format rule, numerical tolerance, and edge case.\n\
-## 2. Verified Workspace State & Measurements\n\
-Files created/modified/deleted, commands/tests executed, exact passing vs failing counts, and measured numbers.\n\
-## 3. Key Technical Discoveries & Invariants\n\
-Exact `path:line` or symbol names, diagnosed root causes, data/API quirks, and invariants relied on.\n\
-## 4. Dead Ends & Failed Approaches (DO NOT REPEAT)\n\
-Approaches already tried that failed and the exact reason each failed.\n\
+Every concrete requirement, output artifact/path, format or schema rule, numerical tolerance, user correction, and edge case.\n\
+## 2. Verified State, Artifacts & Measurements\n\
+Files or artifacts created/modified/deleted, checks/commands/tests executed, exact passing vs failing counts, and measured values.\n\
+## 3. Key Discoveries, Decisions & References\n\
+Exact references (file paths, line numbers, symbols, document sections, rows, formulas, or URLs), diagnosed root causes, accepted decisions, and invariants.\n\
+## 4. Rejected Approaches & Dead Ends (DO NOT REPEAT)\n\
+Approaches already tried or rejected and the exact reason each failed.\n\
 ## 5. Open Questions & Remaining Verification\n\
 Unverified edge cases, ambiguities, or remaining requirements not yet confirmed.\n\
 ## 6. Immediate Next Step\n\
@@ -339,7 +340,7 @@ pub(crate) async fn execute_compaction(
     }
 
     if let Some(ref llm_handoff) = semantic_handoff {
-        summary.push_str("\n[carnot:engineering-handoff]\n");
+        summary.push_str("\n[carnot:task-handoff]\n");
         summary.push_str(llm_handoff);
         summary.push('\n');
     } else if let Some(ref note) = last_assistant_note {
@@ -348,8 +349,11 @@ pub(crate) async fn execute_compaction(
         summary.push('\n');
     }
 
-    // Ground-truth deterministic harness footer (never hallucinated!)
+    // Ground-truth deterministic harness footer (restorable pointers — never hallucinated!)
     summary.push_str("\n[carnot:verified-workspace-state]\n");
+    if let Some(ref sp) = s.path {
+        summary.push_str(&format!("Full verbatim session log: {}\n", sp.display()));
+    }
     if let Some(ref st) = git_facts.status_short {
         summary.push_str(&format!("git status --short:\n{st}\n"));
     }
