@@ -381,6 +381,42 @@ impl SessionStore {
         self.append_entry(entry, true)
     }
 
+    /// Token-budgeted compaction: preserves as many recent verbatim messages as fit within
+    /// `tail_token_budget` (clamped to `min_tail_messages..=max_tail_messages`), strictly aligned
+    /// on `tool_use`/`tool_result` boundaries (S-1), returning `(tokens_before, tokens_after)`.
+    pub fn apply_compaction_budgeted(
+        &mut self,
+        summary: String,
+        tail_token_budget: u64,
+        min_tail_messages: usize,
+        max_tail_messages: usize,
+    ) -> Result<(u64, u64)> {
+        let tokens_before = self.project_context().estimated_tokens();
+        let n = self.active_messages.len();
+        let min_keep = min_tail_messages.min(n);
+        let max_keep = max_tail_messages.max(min_keep).min(n);
+
+        let mut acc_tokens = 0u64;
+        let mut keep = 0usize;
+        for msg in self.active_messages.iter().rev() {
+            let mt = msg.without_thinking().estimated_tokens();
+            if keep >= max_keep {
+                break;
+            }
+            if keep >= min_keep && acc_tokens.saturating_add(mt) > tail_token_budget {
+                break;
+            }
+            acc_tokens = acc_tokens.saturating_add(mt);
+            keep += 1;
+        }
+
+        // Never compact to keep 100% of active messages when there are older turns to fold
+        let capped_keep = if n > 2 { keep.min(n - 1) } else { keep };
+        self.apply_compaction(summary, capped_keep)?;
+        let tokens_after = self.project_context().estimated_tokens();
+        Ok((tokens_before, tokens_after))
+    }
+
     pub fn checkpoint_index(&self) -> Option<usize> {
         self.checkpoint_index
     }
@@ -462,11 +498,12 @@ impl SessionStore {
                 let tail: Vec<Arc<Message>> = self.active_messages[tail_start..]
                     .iter()
                     .map(|m| {
-                        if *strip_thinking_from_tail {
-                            Arc::new(m.without_thinking())
+                        let base = if *strip_thinking_from_tail {
+                            m.without_thinking()
                         } else {
-                            m.clone()
-                        }
+                            (**m).clone()
+                        };
+                        Arc::new(trim_oversized_tail_blocks(base))
                     })
                     .collect();
                 self.active_messages.clear();
@@ -476,6 +513,38 @@ impl SessionStore {
             }
         }
     }
+}
+
+/// Deterministic safety cap for gigantic individual `ToolResult` blocks preserved in a compacted
+/// tail (>32 KiB -> 12 KiB head + 12 KiB tail) so emergency compaction can never re-overflow.
+fn trim_oversized_tail_blocks(mut msg: Message) -> Message {
+    const MAX_TAIL_RESULT_BYTES: usize = 32_768;
+    const KEEP_EDGE_BYTES: usize = 12_288;
+    for block in &mut msg.content {
+        if let carnot_core::ContentBlock::ToolResult { content, .. } = block {
+            for tb in content.iter_mut() {
+                if let carnot_core::ToolResultBlock::Text { text } = tb
+                    && text.len() > MAX_TAIL_RESULT_BYTES
+                {
+                    let mut h = KEEP_EDGE_BYTES.min(text.len());
+                    while h > 0 && !text.is_char_boundary(h) {
+                        h -= 1;
+                    }
+                    let mut t = text.len().saturating_sub(KEEP_EDGE_BYTES);
+                    while t < text.len() && !text.is_char_boundary(t) {
+                        t += 1;
+                    }
+                    let omitted = t.saturating_sub(h);
+                    *text = format!(
+                        "{}\n[... {omitted} bytes trimmed during compaction; full trace preserved in session JSONL ...]\n{}",
+                        &text[..h],
+                        &text[t..]
+                    );
+                }
+            }
+        }
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -582,5 +651,55 @@ mod tests {
         })
         .expect("steer");
         assert!(s.apply_rewind(0, 20_000, 0.2, "receipt".into()).is_err());
+    }
+
+    #[test]
+    fn budgeted_compaction_caps_oversized_tail_and_preserves_pairs() {
+        let mut s = SessionStore::create(None, "claude-opus-5-5".into(), "STATIC".into(), vec![])
+            .expect("create");
+        s.push_message(Message::user_text("initial")).expect("u0");
+        for i in 0..5 {
+            s.push_message(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("c{i}"),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "echo ok"}),
+                    invalid_json: None,
+                    provider_meta: None,
+                    origin: None,
+                }],
+            })
+            .expect("a");
+            let big = if i == 4 {
+                "X".repeat(60_000)
+            } else {
+                format!("small-{i}")
+            };
+            s.push_message(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("c{i}"),
+                    content: vec![ToolResultBlock::text(big)],
+                    is_error: false,
+                }],
+            })
+            .expect("u");
+        }
+
+        let (before, after) = s
+            .apply_compaction_budgeted("HANDOFF".into(), 2_000, 2, 6)
+            .expect("budgeted");
+        assert!(after < before, "expected token drop: {before} -> {after}");
+        let msgs = s.active_messages();
+        assert_eq!(msgs[0].text_concat(), "HANDOFF");
+        assert!(
+            msgs[1].has_tool_use(),
+            "must never start tail on tool_result"
+        );
+        // Verify oversized 60 KiB tail block was trimmed safely
+        let last_json = serde_json::to_string(msgs.last().expect("last").as_ref()).expect("ser");
+        assert!(last_json.contains("bytes trimmed during compaction"));
+        assert!(last_json.len() < 32_000);
     }
 }

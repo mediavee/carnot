@@ -7,10 +7,11 @@
 //!   - Signal exit codes reported as `128 + sig`, saturating timeout arithmetic (B5)
 //!   - Finished jobs pruned on collection & bounded to 64 retained entries (B6)
 
+use crate::files::resolve_confined_path;
 use crate::{BoxFuture, Tool};
 use carnot_cas::{CasStore, shape_command_output};
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
-use carnot_sandbox::{SandboxPolicy, annotate_sandbox_denial, build_sandboxed_shell};
+use carnot_sandbox::{SandboxPolicy, annotate_sandbox_denial, build_sandboxed_shell_in_dir};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -327,8 +328,35 @@ impl Tool for BashTool {
                 None => self.yield_ms.min(hard_timeout_ms),
             };
 
-            let mut cmd = build_sandboxed_shell(&self.sandbox, command, &self.extra_env)
-                .map_err(CarnotError::Sandbox)?;
+            let exec_dir = if let Some(raw_cwd) = input
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let resolved = match resolve_confined_path(
+                    &self.workspace_root,
+                    &self.sandbox.extra_writable_roots,
+                    raw_cwd,
+                ) {
+                    Ok(p) => p,
+                    Err(msg) => {
+                        return Ok(ToolOutput::err_text(format!("Invalid Bash cwd: {msg}")));
+                    }
+                };
+                if !resolved.is_dir() {
+                    return Ok(ToolOutput::err_text(format!(
+                        "Bash cwd is not an existing directory: {raw_cwd}"
+                    )));
+                }
+                resolved
+            } else {
+                self.workspace_root.clone()
+            };
+
+            let mut cmd =
+                build_sandboxed_shell_in_dir(&self.sandbox, command, &exec_dir, &self.extra_env)
+                    .map_err(CarnotError::Sandbox)?;
             let mut child = cmd.spawn().map_err(|e| CarnotError::Tool {
                 tool: "Bash".into(),
                 message: format!(

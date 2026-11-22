@@ -6,12 +6,16 @@
 //!   - Safe `StopReason` (`MaxTokens`, `Refusal`, `ContextWindowExceeded`) & malformed tool-JSON guards
 //!   - Module lifecycle orchestration, automatic Rewind-Receipt, and live thermodynamic telemetry
 
+pub mod compaction;
 pub mod event_log;
 mod scheduler;
 mod segment;
 pub mod subagent;
 pub mod tool_search;
 
+use crate::compaction::{
+    CompactionMode, clip_anchor_text, effective_proactive_trigger, execute_compaction,
+};
 use crate::scheduler::{ActiveEager, EagerLaunch, ScheduledCall, partition_conflict_free_waves};
 use crate::segment::SegmentTracker;
 
@@ -58,6 +62,7 @@ pub struct Agent {
     cancel_current: Mutex<CancellationToken>,
     turn1_injected: Mutex<bool>,
     raw_user_goal: Mutex<Option<String>>,
+    user_instructions: Mutex<Vec<String>>,
     pending_steers: Mutex<Vec<String>>,
     permission_broker: Mutex<Option<Arc<dyn PermissionBroker>>>,
 }
@@ -147,6 +152,7 @@ impl Agent {
             cancel_current: Mutex::new(CancellationToken::new()),
             turn1_injected: Mutex::new(turn1_already_injected),
             raw_user_goal: Mutex::new(None),
+            user_instructions: Mutex::new(Vec::new()),
             pending_steers: Mutex::new(Vec::new()),
             permission_broker: Mutex::new(None),
         })
@@ -166,6 +172,7 @@ impl Agent {
         *self.session.lock().await = loaded;
         *self.turn1_injected.lock().await = has_msgs;
         *self.raw_user_goal.lock().await = None;
+        self.user_instructions.lock().await.clear();
         self.tools.reset_read_tracker();
         Ok(sid)
     }
@@ -229,6 +236,27 @@ impl Agent {
     /// Atomically rolls back the most recent `Edit`/`Write` via its verified BLAKE3 CAS snapshot.
     pub fn undo_last_edit(&self) -> Result<Option<std::path::PathBuf>> {
         self.tools.undo_last_edit()
+    }
+
+    /// Manually compacts the active session using cache-warm semantic synthesis (with deterministic
+    /// fallback), preserving the verbatim user objective + recent tail + verified workspace state.
+    pub async fn compact_now(&self) -> Result<(u64, u64, bool)> {
+        let _run_guard = self.run_lock.lock().await;
+        let seg = SegmentTracker::default();
+        execute_compaction(
+            CompactionMode::Manual,
+            &self.config,
+            &self.provider,
+            &self.tools,
+            &self.session,
+            &self.metrics,
+            &self.events,
+            &self.raw_user_goal,
+            &self.user_instructions,
+            &seg,
+            CancellationToken::new(),
+        )
+        .await
     }
 
     async fn run_before_gates(
@@ -295,11 +323,19 @@ impl Agent {
         let cancel = CancellationToken::new();
         *self.cancel_current.lock().await = cancel.clone();
 
-        // Capture raw user objective BEFORE Turn-1 `[workspace-facts]`/`AGENTS.md` injection (Opus #10)
-        {
+        // Capture full verbatim user objective BEFORE Turn-1 `[workspace-facts]`/`AGENTS.md` injection
+        // (and track any subsequent follow-up prompts so compaction NEVER drops user requirements!)
+        if !initial_text.trim().is_empty() {
             let mut goal = self.raw_user_goal.lock().await;
-            if goal.is_none() && !initial_text.trim().is_empty() {
-                *goal = Some(initial_text.chars().take(600).collect());
+            if goal.is_none() {
+                *goal = Some(clip_anchor_text(&initial_text, 24_000));
+            } else {
+                drop(goal);
+                let mut followups = self.user_instructions.lock().await;
+                followups.push(clip_anchor_text(&initial_text, 4_000));
+                if followups.len() > 16 {
+                    followups.remove(0);
+                }
             }
         }
 
@@ -331,6 +367,7 @@ impl Agent {
         let mut final_text = String::new();
         let mut halted_reason: Option<String> = None;
         let mut consecutive_compactions: u32 = 0;
+        let mut last_compaction_turn: Option<u64> = None;
         let mut consecutive_stream_retries: u32 = 0;
         let mut consecutive_max_tokens: u8 = 0;
 
@@ -339,21 +376,25 @@ impl Agent {
                 return Err(CarnotError::Cancelled);
             }
 
-            // Proactive compaction before exceeding the model's context window (preserves goal, edits, handles & recent turns).
+            // Proactive cache-warm thermodynamic compaction (respects cooldown so prompt cache stays >96%)
             if self.config.modules.compaction && consecutive_compactions < 1 {
-                let pre_est = self
-                    .session
-                    .lock()
-                    .await
-                    .project_context()
-                    .estimated_tokens();
-                let trigger = self
-                    .config
-                    .context_window
-                    .saturating_sub(self.config.compaction_reserve_tokens);
-                if trigger > 0 && pre_est >= trigger {
+                let (pre_est, msg_count) = {
+                    let s = self.session.lock().await;
+                    let proj = s.project_context();
+                    (proj.estimated_tokens(), proj.messages.len())
+                };
+                let current_turns = self.metrics.lock().await.turns;
+                let cooldown_ok = last_compaction_turn
+                    .map(|t| {
+                        current_turns.saturating_sub(t) >= self.config.compaction_cooldown_turns
+                    })
+                    .unwrap_or(true);
+                let trigger = effective_proactive_trigger(&self.config);
+                if trigger > 0 && msg_count >= 10 && cooldown_ok && pre_est >= trigger {
                     consecutive_compactions += 1;
-                    self.compact_emergency(&seg).await?;
+                    last_compaction_turn = Some(current_turns);
+                    self.compact_with_mode(CompactionMode::Soft, &seg, cancel.clone())
+                        .await?;
                 }
             }
 
@@ -391,7 +432,9 @@ impl Agent {
                     if self.config.modules.compaction && consecutive_compactions < 1 =>
                 {
                     consecutive_compactions += 1;
-                    self.compact_emergency(&seg).await?;
+                    last_compaction_turn = Some(turn_num);
+                    self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
+                        .await?;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -528,8 +571,10 @@ impl Agent {
                 && consecutive_compactions < 1
             {
                 consecutive_compactions += 1;
+                last_compaction_turn = Some(turn_num);
                 self.discard_eager_launches(eager_launches);
-                self.compact_emergency(&seg).await?;
+                self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
+                    .await?;
                 continue;
             }
             consecutive_compactions = 0;
@@ -836,6 +881,13 @@ impl Agent {
                     std::mem::take(&mut *q)
                 };
                 for st in steers {
+                    {
+                        let mut followups = self.user_instructions.lock().await;
+                        followups.push(clip_anchor_text(&st, 4_000));
+                        if followups.len() > 16 {
+                            followups.remove(0);
+                        }
+                    }
                     result_blocks.push(ContentBlock::Text {
                         text: format!("[user-steer]\n{st}"),
                     });
@@ -1026,61 +1078,26 @@ impl Agent {
         Ok(None)
     }
 
-    /// Rich state-preserving compaction (Opus #10 / N10): preserves raw user objective (pre-Turn-1
-    /// injection), edited files, CAS handles, failed attempts, git diff stat, and strips thinking +
-    /// heavy images from kept tail turns.
-    async fn compact_emergency(&self, seg: &SegmentTracker) -> Result<()> {
-        let ws = self.config.workspace_root.clone();
-        let diff_stat = tokio::task::spawn_blocking(move || {
-            carnot_sandbox::host_safe_git_command(&ws)
-                .args(["diff", "--stat"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .await
-        .ok()
-        .flatten();
-
-        let captured_goal = self.raw_user_goal.lock().await.clone();
-        let mut s = self.session.lock().await;
-        let orig_goal = captured_goal.unwrap_or_else(|| {
-            s.active_messages()
-                .first()
-                .map(|m| m.text_concat().chars().take(600).collect::<String>())
-                .unwrap_or_default()
-        });
-
-        let mut summary = format!(
-            "[carnot:compaction]\nContext reached window limit; older turns archived in session {}.\n",
-            s.session_id
-        );
-        if !orig_goal.is_empty() {
-            summary.push_str(&format!("Original objective: {orig_goal}\n"));
-        }
-        if !seg.files_edited.is_empty() {
-            summary.push_str(&format!("Files edited: {}\n", seg.files_edited.join(", ")));
-        }
-        if !seg.handles_created.is_empty() {
-            summary.push_str(&format!(
-                "CAS handles created: {}\n",
-                seg.handles_created.join(", ")
-            ));
-        }
-        if !seg.failed_attempts.is_empty() {
-            summary.push_str("Failed attempts (do NOT repeat):\n");
-            for f in seg.failed_attempts.iter().take(6) {
-                summary.push_str(&format!("- {f}\n"));
-            }
-        }
-        if let Some(ds) = diff_stat {
-            summary.push_str(&format!("Current workspace diff stat:\n{ds}\n"));
-        }
-        summary.push_str("Latest turns are preserved verbatim below (images & thinking stripped; read-tracker reset).");
-        s.apply_compaction(summary, 4)?;
-        self.tools.reset_read_tracker();
+    async fn compact_with_mode(
+        &self,
+        mode: CompactionMode,
+        seg: &SegmentTracker,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let _ = execute_compaction(
+            mode,
+            &self.config,
+            &self.provider,
+            &self.tools,
+            &self.session,
+            &self.metrics,
+            &self.events,
+            &self.raw_user_goal,
+            &self.user_instructions,
+            seg,
+            cancel,
+        )
+        .await?;
         Ok(())
     }
 }

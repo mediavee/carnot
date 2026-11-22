@@ -230,6 +230,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "command": { "type": "string" },
+                    "cwd": { "type": "string", "description": "Subdir in workspace" },
                     "job": { "type": "string", "description": "Collect yielded job ID" },
                     "kill": { "type": "boolean" },
                     "timeout": { "type": "integer", "description": "Seconds" }

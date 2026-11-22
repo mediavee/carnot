@@ -4,6 +4,7 @@
 //! budget/timeout guardrails, graceful signal handling, and micro-benchmarks.
 
 mod bench;
+mod repl;
 
 use carnot::{
     AgentEvent, CacheTtl, CarnotBuilder, CasStore, McpManager, Profile, ProviderRegistry,
@@ -15,6 +16,7 @@ use carnot_ext::prefix_guard::static_system_prompt;
 use carnot_tools::canonical_tool_specs;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,13 +158,17 @@ struct Cli {
     #[arg(long)]
     no_session: bool,
 
-    /// Maximum agent turns before halting (default: 200)
+    /// Maximum agent turns before halting (default: 500)
     #[arg(long = "max-turns")]
     max_turns: Option<u64>,
 
     /// Hard USD cost cap circuit-breaker for this session (e.g. --max-cost-usd 2.50)
     #[arg(long = "max-cost-usd")]
     max_cost_usd: Option<f64>,
+
+    /// Soft thermodynamic compaction threshold in estimated tokens (default: 220000; 0 disables soft compaction)
+    #[arg(long = "compact-at")]
+    compact_at: Option<u64>,
 
     /// Overall wall-clock timeout in seconds for one-shot runs (cancels cleanly on expiry)
     #[arg(long = "timeout")]
@@ -393,9 +399,13 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 buf
             } else if let Some(p) = cli.prompt {
                 p
+            } else if matches!(cli.mode, Mode::Text) && std::io::stdin().is_terminal() {
+                let rc = repl::run_repl(agent).await;
+                mcp.shutdown_all().await;
+                return rc;
             } else {
                 eprintln!(
-                    "usage: carnot -p \"<prompt>\" | carnot --prompt-file <path> | carnot doctor | carnot --mode acp|rpc | carnot serve | carnot mcp list | carnot bench"
+                    "usage: carnot [-p \"<prompt>\" | --prompt-file <path>] | carnot doctor | carnot --mode acp|rpc | carnot serve | carnot mcp list | carnot bench"
                 );
                 mcp.shutdown_all().await;
                 return 2;
@@ -635,6 +645,9 @@ async fn build_agent(
     }
     if let Some(mc) = cli.max_cost_usd {
         b = b.max_cost_usd(mc);
+    }
+    if let Some(ca) = cli.compact_at {
+        b = b.soft_compaction_tokens(if ca == 0 { None } else { Some(ca) });
     }
 
     for p in &cli.provider_configs {

@@ -787,3 +787,106 @@ async fn e2e_root_max_cost_usd_halts_cleanly() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn e2e_cache_warm_semantic_compaction_preserves_full_goal_and_bash_cwd() {
+    let dir = std::env::temp_dir().join(format!("carnot-compact-{}", uuid::Uuid::new_v4()));
+    let sub = dir.join("nested_pkg");
+    fs::create_dir_all(&sub).expect("mkdir");
+    fs::write(sub.join("marker.txt"), "inside-nested\n").expect("write");
+
+    // 1,400-char user goal whose critical final constraint lies past char 1,200 (old 600-char cap would lose it!)
+    let long_goal = format!(
+        "Inspect nested_pkg.\n{}\nCRITICAL_FINAL_TOLERANCE=1e-12_OUTPUT=/app/result.json",
+        "Specification detail line for verification.\n".repeat(30)
+    );
+    assert!(long_goal.len() > 1_200);
+
+    let faux = Arc::new(FauxProvider::new(vec![
+        // Turn 1: Bash with confined `cwd` inside workspace
+        ScriptedTurn::tool_calls(vec![(
+            "b1",
+            "Bash",
+            json!({"command": "cat marker.txt", "cwd": "nested_pkg"}),
+        )]),
+        // Turn 2: Bash attempting escape via `cwd` MUST be denied!
+        ScriptedTurn::tool_calls(vec![(
+            "b2",
+            "Bash",
+            json!({"command": "pwd", "cwd": "../../etc"}),
+        )]),
+        ScriptedTurn::text("Initial exploration complete."),
+        // Turn 4 (manual compact_now cache-warm semantic LLM handoff!)
+        ScriptedTurn::text(
+            "## 1. Exact Constraints & Edge Cases\nCRITICAL_FINAL_TOLERANCE=1e-12_OUTPUT=/app/result.json\n\
+             ## 2. Verified Workspace State & Measurements\nVerified nested_pkg/marker.txt contains inside-nested.\n\
+             ## 6. Immediate Next Step\nFinish cleanly.",
+        ),
+        // Turn 5: Follow-up prompt after compaction sees BOTH anchored full goal AND semantic handoff
+        ScriptedTurn::text("Continued seamlessly with all constraints intact."),
+    ]));
+
+    let agent = CarnotBuilder::new(dir.clone())
+        .sandbox(false)
+        .persist_session(false)
+        .provider(faux.clone())
+        .build()
+        .expect("build");
+
+    let mut ev_stream = agent.subscribe();
+    let _ = agent.prompt(long_goal).await.expect("run 1");
+
+    // Trigger manual cache-warm semantic compaction
+    let (before, after, semantic) = agent.compact_now().await.expect("compact_now");
+    assert!(semantic, "expected semantic LLM handoff to succeed");
+    assert!(before > 0 && after > 0);
+
+    // Run follow-up turn after compaction
+    let out2 = agent.prompt("Now finish").await.expect("run 2");
+    assert!(out2.final_text.contains("Continued seamlessly"));
+
+    let reqs = faux.recorded_requests();
+    assert_eq!(reqs.len(), 5);
+    // Compaction call (reqs[3]) MUST share the EXACT same byte-identical static prefix hash!
+    assert_eq!(reqs[0].prefix_hash, reqs[3].prefix_hash);
+    // Verify Bash(cwd="nested_pkg") succeeded and Bash(cwd="../../etc") was rejected!
+    let turn2_ctx = msgs_json(&reqs[1].messages);
+    assert!(turn2_ctx.contains("inside-nested"));
+    let turn3_ctx = msgs_json(&reqs[2].messages);
+    assert!(turn3_ctx.contains("Invalid Bash cwd"));
+
+    // Verify post-compaction context (reqs[4]) retains the FULL verbatim final constraint (>char 1200) AND semantic handoff!
+    let post_compact_ctx = msgs_json(&reqs[4].messages);
+    assert!(
+        post_compact_ctx.contains("[carnot:anchored-objective]"),
+        "missing anchored objective header"
+    );
+    assert!(
+        post_compact_ctx.contains("CRITICAL_FINAL_TOLERANCE=1e-12_OUTPUT=/app/result.json"),
+        "full user objective past char 1200 MUST survive compaction verbatim!"
+    );
+    assert!(
+        post_compact_ctx.contains("[carnot:engineering-handoff]"),
+        "missing semantic LLM handoff section"
+    );
+
+    // Verify CompactionApplied event was emitted in EventLog
+    let mut saw_compact_ev = false;
+    while let Ok(env) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), ev_stream.next()).await
+    {
+        if matches!(
+            env.event,
+            carnot::AgentEvent::CompactionApplied {
+                semantic_llm: true,
+                ..
+            }
+        ) {
+            saw_compact_ev = true;
+            break;
+        }
+    }
+    assert!(saw_compact_ev, "expected CompactionApplied event");
+
+    let _ = fs::remove_dir_all(&dir);
+}

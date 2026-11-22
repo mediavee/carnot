@@ -855,6 +855,12 @@ pub enum AgentEvent {
         receipt_tokens: u64,
         expected_net_usd: f64,
     },
+    CompactionApplied {
+        mode: String,
+        tokens_before: u64,
+        tokens_after: u64,
+        semantic_llm: bool,
+    },
     DaemonAdvisory {
         signal: String,
         message: String,
@@ -1013,6 +1019,16 @@ pub struct CarnotConfig {
     pub max_tokens_continuations: u8,
     pub context_window: u64,
     pub compaction_reserve_tokens: u64,
+    /// Optional soft thermodynamic compaction threshold decoupled from physical `context_window`
+    /// (prevents attention rot & quadratic cost on 200+ turn sessions; `None` = hard-limit only).
+    #[serde(default = "default_soft_compaction_tokens")]
+    pub soft_compaction_tokens: Option<u64>,
+    /// Minimum turns between proactive soft compactions so prompt cache stays warm (>96%).
+    #[serde(default = "default_compaction_cooldown_turns")]
+    pub compaction_cooldown_turns: u64,
+    /// Token budget for verbatim recent messages preserved after compaction.
+    #[serde(default = "default_compaction_tail_budget_tokens")]
+    pub compaction_tail_budget_tokens: u64,
     pub cas_spill_threshold_bytes: usize,
     pub cas_preview_max_bytes: usize,
     pub bash_yield_ms: u64,
@@ -1050,6 +1066,18 @@ fn default_max_tokens_continuations() -> u8 {
     4
 }
 
+fn default_soft_compaction_tokens() -> Option<u64> {
+    Some(220_000)
+}
+
+fn default_compaction_cooldown_turns() -> u64 {
+    30
+}
+
+fn default_compaction_tail_budget_tokens() -> u64 {
+    24_000
+}
+
 impl CarnotConfig {
     pub fn new(workspace_root: PathBuf) -> Self {
         let session_dir = std::env::var_os("HOME")
@@ -1069,6 +1097,9 @@ impl CarnotConfig {
             max_tokens_continuations: default_max_tokens_continuations(),
             context_window: 200_000,
             compaction_reserve_tokens: 16_384,
+            soft_compaction_tokens: default_soft_compaction_tokens(),
+            compaction_cooldown_turns: default_compaction_cooldown_turns(),
+            compaction_tail_budget_tokens: default_compaction_tail_budget_tokens(),
             cas_spill_threshold_bytes: 8_192,
             cas_preview_max_bytes: 3_200,
             bash_yield_ms: 60_000,

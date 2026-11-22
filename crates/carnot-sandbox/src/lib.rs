@@ -151,11 +151,21 @@ pub fn build_sandboxed_shell(
     shell_cmd: &str,
     extra_env: &BTreeMap<String, String>,
 ) -> std::result::Result<Command, String> {
+    build_sandboxed_shell_in_dir(policy, shell_cmd, &policy.workspace_root, extra_env)
+}
+
+/// Same as `build_sandboxed_shell`, starting the shell in a verified working directory `cwd`.
+pub fn build_sandboxed_shell_in_dir(
+    policy: &SandboxPolicy,
+    shell_cmd: &str,
+    cwd: &Path,
+    extra_env: &BTreeMap<String, String>,
+) -> std::result::Result<Command, String> {
     let mut cmd = if policy.enabled {
         if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
             build_macos_seatbelt_command(policy, shell_cmd)
         } else if cfg!(target_os = "linux") && Path::new("/usr/bin/bwrap").exists() {
-            build_linux_bwrap_command(policy, shell_cmd)
+            build_linux_bwrap_command(policy, shell_cmd, cwd)
         } else {
             return Err(
                 "OS sandbox requested (`sandbox: true`) but no supported kernel sandbox (macOS sandbox-exec / Linux bwrap) is available on this host (pass `--no-sandbox` to explicitly disable)"
@@ -168,7 +178,7 @@ pub fn build_sandboxed_shell(
         c
     };
 
-    cmd.current_dir(&policy.workspace_root);
+    cmd.current_dir(cwd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -322,7 +332,7 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
 ///   - Fresh `--tmpfs /run`, `--tmpfs /tmp`, and `--tmpfs $XDG_RUNTIME_DIR`.
 ///   - Read-only `<ws>/.git` (C1), `--new-session` (blocks TIOCSTI), `--die-with-parent`, and
 ///     credential file/dir masking (`~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.cargo/credentials.toml`).
-fn build_linux_bwrap_command(policy: &SandboxPolicy, shell_cmd: &str) -> Command {
+fn build_linux_bwrap_command(policy: &SandboxPolicy, shell_cmd: &str, cwd: &Path) -> Command {
     let mut c = Command::new("/usr/bin/bwrap");
     c.args(["--unshare-all", "--new-session", "--die-with-parent"]);
     if policy.allow_network {
@@ -394,7 +404,8 @@ fn build_linux_bwrap_command(policy: &SandboxPolicy, shell_cmd: &str) -> Command
         }
     }
 
-    c.args(["--chdir", &ws, resolve_shell_binary(), "-c", shell_cmd]);
+    let chdir = cwd.to_string_lossy().to_string();
+    c.args(["--chdir", &chdir, resolve_shell_binary(), "-c", shell_cmd]);
     c
 }
 

@@ -116,6 +116,11 @@ impl CarnotBuilder {
         self
     }
 
+    pub fn soft_compaction_tokens(mut self, tokens: Option<u64>) -> Self {
+        self.config.soft_compaction_tokens = tokens.filter(|&t| t > 0);
+        self
+    }
+
     pub fn effort(mut self, effort: ReasoningEffort) -> Self {
         self.config.effort = effort;
         self
