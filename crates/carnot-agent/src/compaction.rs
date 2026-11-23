@@ -391,13 +391,14 @@ async fn try_semantic_llm_handoff(
             static_system_prompt: proj.static_system_prompt,
             tools: wire_tools,
             prefix_hash: proj.prefix_hash,
-            session_id: s.session_id.clone(),
+            session_id: proj.cache_key_id,
             messages: msgs,
             checkpoint_index: proj.checkpoint_index,
             cache_ttl: config.cache_ttl,
             effort: compaction_effort,
             max_output_tokens: config.max_output_tokens.min(16_384),
             skip_tail_cache_write: true,
+            native_web: config.native_web.clone(),
         }
     };
 
@@ -492,6 +493,7 @@ pub(crate) async fn execute_compaction(
     modules: &[Arc<dyn Module>],
     session: &Mutex<SessionStore>,
     metrics: &Mutex<ThermodynamicMetrics>,
+    total_cost_micros: &std::sync::atomic::AtomicU64,
     events: &crate::EventLog,
     raw_user_goal: &Mutex<Option<String>>,
     user_instructions: &Mutex<Vec<String>>,
@@ -581,6 +583,7 @@ pub(crate) async fn execute_compaction(
                     m.prefix_cache_misses += 1;
                 }
                 m.total_usage.add_assign(&usage);
+                crate::add_cost_micros(total_cost_micros, usage.cost_usd);
                 m.turns
             };
             let _ = session.lock().await.record_usage(turn_num, usage.clone());
@@ -718,6 +721,11 @@ pub(crate) async fn execute_compaction(
         s.apply_compaction_budgeted(summary, budget, min_tail, max_tail)?;
     drop(s);
     tools.reset_read_tracker();
+    {
+        let mut met = metrics.lock().await;
+        met.compactions_applied += 1;
+        met.heat_shed_tokens += tokens_before.saturating_sub(tokens_after);
+    }
 
     events.push(AgentEvent::CompactionApplied {
         mode: mode.as_str().to_string(),

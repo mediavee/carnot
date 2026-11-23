@@ -83,6 +83,10 @@ impl OpenAiProvider {
                 .as_ref()
                 .map(|e| e.headers.clone())
                 .unwrap_or_default(),
+            query_params: entry
+                .as_ref()
+                .map(|e| e.query_params.clone())
+                .unwrap_or_default(),
             betas: Vec::new(),
             cache_diagnosis_beta: None,
             native_tool_search: false,
@@ -115,8 +119,12 @@ impl OpenAiProvider {
             "role": sys_role,
             "content": req.static_system_prompt,
         })];
+        // Track wire index of the last emitted wire message for each `req.messages` index,
+        // so `checkpoint_index` and Turn-1 (`idx == 0`) map accurately to wire positions.
+        let mut msg_end_wire_idx: Vec<Option<usize>> = Vec::with_capacity(req.messages.len());
 
         for msg in &req.messages {
+            let before_len = messages.len();
             match msg.role {
                 Role::System => {
                     let txt = msg.text_concat();
@@ -271,6 +279,23 @@ impl OpenAiProvider {
                     messages.push(obj);
                 }
             }
+            if messages.len() > before_len {
+                msg_end_wire_idx.push(Some(messages.len() - 1));
+            } else {
+                msg_end_wire_idx.push(None);
+            }
+        }
+
+        if should_inject_cache_control(&compat, &req.model) {
+            apply_openai_cache_control(
+                &mut messages,
+                &msg_end_wire_idx,
+                req.checkpoint_index,
+                req.cache_ttl,
+                req.skip_tail_cache_write,
+                &compat,
+                &req.model,
+            );
         }
 
         let tools: Vec<Value> = req
@@ -354,42 +379,27 @@ impl Provider for OpenAiProvider {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<mpsc::Receiver<StreamEvent>>> {
         Box::pin(async move {
-            let url = self
-                .spec
-                .auth
-                .apply_to_url(&format!("{}/chat/completions", self.spec.base_url));
+            let raw_url = format!("{}/chat/completions", self.spec.base_url);
             let body = self.build_body(&request);
             let compat = self.spec.effective_compat(&request.model);
 
-            let mut rb = self
-                .client
-                .post(&url)
-                .header("content-type", "application/json");
-            rb = self.spec.auth.apply_to_request(rb);
-            for (k, v) in &self.spec.headers {
-                rb = rb.header(k.as_str(), v.as_str());
-            }
+            let mut extra_headers: Vec<(String, String)> = Vec::new();
             if let Some(ref hdr) = compat.session_id_header {
-                rb = rb.header(
-                    hdr.as_str(),
+                extra_headers.push((
+                    hdr.clone(),
                     session_cache_key(&request.prefix_hash, &request.session_id),
-                );
+                ));
             }
 
-            let resp = tokio::time::timeout(HTTP_HEADERS_TIMEOUT, rb.json(&body).send())
-                .await
-                .map_err(|_| CarnotError::Provider {
-                    provider: self.spec.provider_id.clone(),
-                    message: "HTTP response headers timeout (300s)".into(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })?
-                .map_err(|e| CarnotError::Provider {
-                    provider: self.spec.provider_id.clone(),
-                    message: e.without_url().to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })?;
+            let resp = crate::send_authorized_json_post(
+                &self.client,
+                &self.spec,
+                &raw_url,
+                &extra_headers,
+                &body,
+                HTTP_HEADERS_TIMEOUT,
+            )
+            .await?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -601,5 +611,280 @@ impl Provider for OpenAiProvider {
 
             Ok(rx)
         })
+    }
+}
+
+fn should_inject_cache_control(compat: &crate::catalog::CompatFlags, model: &str) -> bool {
+    if !compat.supports_cache_control.unwrap_or(false) {
+        return false;
+    }
+    let Some(ref prefixes) = compat.cache_control_model_prefixes else {
+        return true;
+    };
+    if prefixes.is_empty() {
+        return true;
+    }
+    let lower = model.to_ascii_lowercase();
+    prefixes
+        .iter()
+        .any(|p| lower.starts_with(&p.to_ascii_lowercase()))
+}
+
+fn cache_control_value(ttl_1h: bool) -> Value {
+    if ttl_1h {
+        json!({"type": "ephemeral", "ttl": "1h"})
+    } else {
+        json!({"type": "ephemeral"})
+    }
+}
+
+/// Attaches `cache_control` to the final text/part of a Chat Completions message, converting plain
+/// string `content` into multipart `[{"type":"text","text":...,"cache_control":...}]` as required
+/// by OpenRouter / Anthropic-compatible gateways. Returns `false` if message has no cacheable text.
+fn attach_cache_control_to_message(msg: &mut Value, cc: &Value) -> bool {
+    let Some(obj) = msg.as_object_mut() else {
+        return false;
+    };
+    let Some(content) = obj.get_mut("content") else {
+        return false;
+    };
+    match content {
+        Value::String(s) => {
+            if s.is_empty() {
+                return false;
+            }
+            let text = std::mem::take(s);
+            *content = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": cc,
+            }]);
+            true
+        }
+        Value::Array(parts) => {
+            // Attach to the FINAL content part so images (`[text, image_url]`) stay inside the cached prefix.
+            if let Some(part_obj) = parts.last_mut().and_then(Value::as_object_mut) {
+                part_obj.insert("cache_control".into(), cc.clone());
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Applies up to 4 strictly monotonic `cache_control` breakpoints across `messages`:
+/// - BP1: static system prompt (`messages[0]`, 1h when supported)
+/// - BP2: Turn-1 initial user/context message (1h when supported)
+/// - BP3: `checkpoint_index` message (rolling TTL)
+/// - BP4: final cacheable tail message (rolling TTL; skipped during compaction when `skip_tail_cache_write` is true)
+fn apply_openai_cache_control(
+    messages: &mut [Value],
+    msg_end_wire_idx: &[Option<usize>],
+    checkpoint_index: Option<usize>,
+    cache_ttl: CacheTtl,
+    skip_tail_cache_write: bool,
+    compat: &crate::catalog::CompatFlags,
+    model: &str,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let allow_1h = compat.supports_cache_control_1h_ttl.unwrap_or(false)
+        && model.to_ascii_lowercase().starts_with("anthropic/");
+    let static_cc =
+        cache_control_value(allow_1h && matches!(cache_ttl, CacheTtl::Long1h | CacheTtl::Hybrid));
+    let rolling_cc = cache_control_value(allow_1h && cache_ttl == CacheTtl::Long1h);
+
+    let mut used: Vec<usize> = Vec::with_capacity(4);
+
+    // BP1: static system prompt
+    if attach_cache_control_to_message(&mut messages[0], &static_cc) {
+        used.push(0);
+    }
+
+    // BP2: Turn-1 context message (AGENTS.md + workspace-facts + goal)
+    if let Some(&Some(turn1_wire)) = msg_end_wire_idx.first()
+        && turn1_wire < messages.len()
+        && !used.contains(&turn1_wire)
+        && attach_cache_control_to_message(&mut messages[turn1_wire], &static_cc)
+    {
+        used.push(turn1_wire);
+    }
+
+    // BP3: stable checkpoint boundary (walk backward if exact checkpoint message has `content: null`,
+    // e.g. an assistant message containing only `tool_calls`, so BP3 is never silently wasted)
+    if let Some(cp_idx) = checkpoint_index
+        && let Some(&Some(cp_wire)) = msg_end_wire_idx.get(cp_idx)
+        && cp_wire < messages.len()
+        && used.len() < 4
+    {
+        for idx in (1..=cp_wire).rev() {
+            if used.contains(&idx) {
+                break;
+            }
+            if attach_cache_control_to_message(&mut messages[idx], &rolling_cc) {
+                used.push(idx);
+                break;
+            }
+        }
+    }
+
+    // BP4: rolling tail (omitted when `skip_tail_cache_write` is active during compaction)
+    if !skip_tail_cache_write && used.len() < 4 {
+        for idx in (1..messages.len()).rev() {
+            if used.contains(&idx) {
+                break;
+            }
+            if attach_cache_control_to_message(&mut messages[idx], &rolling_cc) {
+                used.push(idx);
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carnot_core::{NativeWebConfig, ReasoningEffort};
+    use std::sync::Arc;
+
+    fn openrouter_provider() -> OpenAiProvider {
+        let catalog = ProviderCatalog::embedded().expect("embedded catalog");
+        let (_, entry) = catalog.find_provider("openrouter").expect("openrouter");
+        let spec = ResolvedProviderSpec {
+            provider_id: "openrouter".into(),
+            api: API_ID.into(),
+            base_url: entry.base_url.clone(),
+            fallback_base_urls: Vec::new(),
+            project_id: None,
+            auth: ResolvedAuth::Bearer {
+                token: "test".into(),
+                source: "test".into(),
+            },
+            headers: entry.headers.clone(),
+            query_params: entry.query_params.clone(),
+            betas: Vec::new(),
+            cache_diagnosis_beta: None,
+            native_tool_search: false,
+            compat: entry.compat.clone(),
+            usage_map: entry.usage_map.clone(),
+            body_patch: entry.body_patch.clone(),
+            subprocess: None,
+            catalog_models: catalog.models,
+        };
+        OpenAiProvider::from_spec(spec)
+    }
+
+    fn make_req(
+        model: &str,
+        messages: Vec<Message>,
+        cp: Option<usize>,
+        skip_tail: bool,
+    ) -> ProviderRequest {
+        ProviderRequest {
+            model: model.into(),
+            static_system_prompt: "You are Carnot.".into(),
+            tools: Vec::new(),
+            prefix_hash: "abcdef0123456789".into(),
+            session_id: "sess-1".into(),
+            messages: messages.into_iter().map(Arc::new).collect(),
+            checkpoint_index: cp,
+            cache_ttl: CacheTtl::Hybrid,
+            effort: ReasoningEffort::High,
+            max_output_tokens: 4096,
+            skip_tail_cache_write: skip_tail,
+            native_web: NativeWebConfig::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_injects_4_monotonic_cache_control_breakpoints_for_claude() {
+        let p = openrouter_provider();
+        let body = p.build_body(&make_req(
+            "anthropic/claude-sonnet-4.5",
+            vec![
+                Message::user_text("Turn 1 AGENTS.md + goal"),
+                Message::assistant_text("Working on it"),
+                Message::user_text("Checkpoint turn"),
+                Message::assistant_text("Done step"),
+                Message::user_text("Latest user turn"),
+            ],
+            Some(2),
+            false,
+        ));
+        let serialized = body.to_string();
+        assert_eq!(serialized.matches("\"cache_control\"").count(), 4);
+        assert_eq!(
+            body.pointer("/messages/0/content/0/cache_control/ttl"),
+            Some(&json!("1h"))
+        );
+        assert_eq!(
+            body.pointer("/messages/1/content/0/cache_control/ttl"),
+            Some(&json!("1h"))
+        );
+        assert_eq!(
+            body.pointer("/messages/3/content/0/cache_control"),
+            Some(&json!({"type": "ephemeral"}))
+        );
+        assert_eq!(
+            body.pointer("/messages/5/content/0/cache_control"),
+            Some(&json!({"type": "ephemeral"}))
+        );
+    }
+
+    #[test]
+    fn openrouter_uses_plain_ephemeral_for_gemini_and_skips_openai_models() {
+        let p = openrouter_provider();
+        let gemini_body = p.build_body(&make_req(
+            "google/gemini-2.5-pro",
+            vec![
+                Message::user_text("Turn 1"),
+                Message::assistant_text("ok"),
+                Message::user_text("Turn 2"),
+            ],
+            None,
+            false,
+        ));
+        assert_eq!(
+            gemini_body.pointer("/messages/0/content/0/cache_control"),
+            Some(&json!({"type": "ephemeral"}))
+        );
+        assert!(
+            gemini_body
+                .pointer("/messages/0/content/0/cache_control/ttl")
+                .is_none()
+        );
+
+        let gpt_body = p.build_body(&make_req(
+            "openai/gpt-5.4",
+            vec![Message::user_text("Turn 1")],
+            None,
+            false,
+        ));
+        assert!(!gpt_body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn openrouter_skip_tail_cache_write_omits_bp4_during_compaction() {
+        let p = openrouter_provider();
+        let body = p.build_body(&make_req(
+            "anthropic/claude-sonnet-4.5",
+            vec![
+                Message::user_text("Turn 1"),
+                Message::assistant_text("Step 1"),
+                Message::user_text("Compaction prompt"),
+            ],
+            Some(1),
+            true,
+        ));
+        let serialized = body.to_string();
+        assert_eq!(serialized.matches("\"cache_control\"").count(), 3);
+        assert!(
+            body.pointer("/messages/3/content")
+                .and_then(Value::as_str)
+                .is_some()
+        );
     }
 }

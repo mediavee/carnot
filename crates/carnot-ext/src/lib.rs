@@ -1,26 +1,17 @@
-//! Modular plugin architecture (`Module` trait + `PermissionBroker` + out-of-process JSON-RPC 2.0
-//! `SubprocessExtension`) and built-in Carnot thermodynamic & engineering modules:
-//!   - `RewindReceiptModule` (N1)
-//!   - `MaxwellDaemonModule` (S1/S2/S3 advisory-first + progress decay)
-//!   - `ExecMicroSkillsModule` (Turn-1 repo facts + `AGENTS.md`/`CLAUDE.md`/`.carnot/skills/*.md`)
-//!   - `PrefixGuardModule` (continuous runtime & CI prefix-invariance auditor)
-//!   - `IsolatedForkWorktree` (safe `git worktree add` + isolated `CARGO_TARGET_DIR`)
+//! Modular plugin architecture (`Module` trait + `PermissionBroker`) and lean core modules:
+//!   - `ExecMicroSkillsModule` (Turn-1 repo facts + `AGENTS.md`/`CLAUDE.md`/`SKILL.md`)
+//!   - `prefix_guard` (continuous runtime & CI static prefix-invariance auditor)
+//!   - `IsolatedForkWorktree` (safe `git worktree add --detach` + isolated `CARGO_TARGET_DIR`)
 //!   - `PolicyGuardModule` (enterprise command/path guardrails + secret redaction + JSONL audit)
-//!   - `LspDiagnosticsModule` (opt-in Tier-1 LSP stdio diagnostics delta)
-//!   - `WebFetchModule` (opt-in SSRF-safe `WebFetch` behind feature `web`)
 
-pub mod daemon;
-pub mod lsp;
+pub mod ask_user;
+pub mod dropin;
 pub mod microskills;
 pub mod policy;
 pub mod prefix_guard;
-pub mod rewind;
-pub mod subprocess;
 pub mod warm_fork;
-#[cfg(feature = "web")]
-pub mod web;
 
-use carnot_core::{CarnotConfig, Result, ToolOutput};
+use carnot_core::{CarnotConfig, Result, ToolOutput, UserQuestion, UserQuestionAnswer};
 use carnot_tools::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,7 +29,7 @@ pub enum ToolGateDecision {
     Deny { reason: String },
 }
 
-/// Interactive permission broker trait (Opus architecture point #1).
+/// Interactive permission broker trait.
 /// Lives in `carnot-ext` so `carnot-agent` invokes it without depending on `carnot-protocol`,
 /// while ACP implements it via `session/request_permission`.
 pub trait PermissionBroker: Send + Sync + std::fmt::Debug {
@@ -50,6 +41,17 @@ pub trait PermissionBroker: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'_, Result<ToolGateDecision>>;
 }
 
+/// Interactive user question broker trait for the deferred `AskUser` tool.
+/// Lives in `carnot-ext` so `carnot-agent` and `AskUserModule` invoke it cleanly across ACP,
+/// Host RPC, HTTP/SSE, terminal REPL, and custom Rust UI embedders.
+pub trait UserQuestionBroker: Send + Sync + std::fmt::Debug {
+    fn ask<'a>(
+        &'a self,
+        request_id: &'a str,
+        questions: &'a [UserQuestion],
+    ) -> BoxFuture<'a, Result<Vec<UserQuestionAnswer>>>;
+}
+
 /// Action returned by a module at a turn boundary (`on_turn_boundary`).
 #[derive(Debug, Clone)]
 pub enum BoundaryAction {
@@ -59,13 +61,7 @@ pub enum BoundaryAction {
         signal: String,
         message: String,
     },
-    /// Trigger a Preserved-Thinking-safe Rewind-Receipt back to active checkpoint C.
-    TriggerRewind {
-        shed_tokens: u64,
-        expected_net_usd: f64,
-        receipt_text: String,
-    },
-    /// Stop autonomous loop cleanly (e.g. idle circuit breaker).
+    /// Stop autonomous loop cleanly.
     Halt {
         reason: String,
     },
@@ -75,12 +71,9 @@ pub enum BoundaryAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnBoundarySnapshot {
     pub turn_index: u64,
-    pub tokens_since_checkpoint: u64,
     pub total_context_tokens: u64,
     pub had_edit_in_segment: bool,
     pub had_tool_call_in_turn: bool,
-    pub verified_green_command: Option<String>,
-    pub verified_green_summary: Option<String>,
     pub files_read_in_segment: Vec<String>,
     pub files_edited_in_segment: Vec<String>,
     pub handles_created_in_segment: Vec<String>,
@@ -97,7 +90,7 @@ pub struct CompactionHookContext {
     pub custom_focus: Option<String>,
 }
 
-/// Decision returned by `Module::before_compact` (inspired by Pi's `session_before_compact`).
+/// Decision returned by `Module::before_compact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionHookAction {
     Continue,
@@ -111,8 +104,8 @@ pub enum CompactionHookAction {
 
 /// First-class in-process Rust module interface.
 ///
-/// Every built-in Carnot capability implements this exact trait, so external Rust extensions
-/// have the same power and lifecycle guarantees as core modules.
+/// Every built-in Carnot capability implements this exact trait, so external Rust embedders
+/// have the same lifecycle hooks as core modules.
 pub trait Module: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
 

@@ -26,7 +26,7 @@
 - **97.6%+ prompt cache hit & two-tier cache-warm compaction** — byte-identical static prefix (`carnot audit-prefix`), Hybrid `1h`/`5m` cache breakpoints, Turn-1-only workspace/skills injection (`AGENTS.md`, `CLAUDE.md`, `SKILL.md`), and high-recall semantic compaction that preserves the verbatim user objective, recent tail, CAS handles, and verified workspace state while reusing the warm prompt cache.
 - **5 surgical tools, zero context bloat** — `Read` (multimodal images, tree-sitter symbols/outlines, diff-on-reread), `Edit` (atomic line-range + 4-tier resilient patch + CAS undo + tree-sitter syntax guard), `Write`, `Grep`, and `Bash` (confined `cwd`, adaptive-yield job registry, lazy zero-I/O CAS spill, semantic compressors with 100% diagnostic recall).
 - **Zero-hardcode modular providers** — protocol adapters (`anthropic-messages`, `openai-completions`, `openai-responses`, `google-generative`, `google-cloudcode`, `subprocess-jsonl`, `faux`) driven purely by [`providers.json`](crates/carnot-ai/catalog/providers.json) + `webpki-root-certs` TLS fallback.
-- **Interactive REPL, full MCP & production surfaces** — interactive terminal REPL (`/compact`, `/undo`, `/cost`, Ctrl+C turn abort), MCP `2026-07-28` / `2025-11-25` / Legacy HTTP+SSE `2024-11-05` (`defer_loading: true` = 0 static tokens), fail-closed macOS Seatbelt / Linux `bwrap`, ACP stdio, Host RPC, Bearer-auth HTTP/SSE server, `carnot doctor`, `SIGINT`/`SIGTERM` cleanup, and `--max-turns` / `--max-cost-usd` / `--compact-at` / `--timeout` guardrails.
+- **Interactive TUI, full MCP & production surfaces** — full-screen Ratatui TUI (streaming Markdown with syntax-highlighted code blocks & tables, compact `Edit` diffs, slash autocomplete, `^P` model picker, interactive `AskUser` & `/approve` modals, live context meter; `--plain` line-REPL fallback), MCP `2026-07-28` / `2025-11-25` / Legacy HTTP+SSE `2024-11-05` (`defer_loading: true` = 0 static tokens), fail-closed macOS Seatbelt / Linux `bwrap`, ACP stdio, Host RPC, Bearer-auth HTTP/SSE server, `carnot doctor`, `SIGINT`/`SIGTERM` cleanup, and `--max-turns` / `--max-cost-usd` / `--compact-at` / `--timeout` guardrails.
 
 ## Benchmarks
 
@@ -77,7 +77,7 @@ cargo build --release --bin carnot
 ./target/release/carnot doctor
 ./target/release/carnot audit-prefix
 
-# Interactive terminal REPL (`/compact`, `/undo`, `/cost`, `/exit`)
+# Interactive terminal TUI (`^P` model picker, `^T` thinking, `^O` diffs, `/help`; pass `--plain` for minimalist line REPL)
 ANTHROPIC_API_KEY=... carnot --model claude-opus-5-5 --effort high
 
 # One-shot with production guardrails
@@ -95,29 +95,59 @@ carnot --mode acp
 CARNOT_HTTP_TOKEN=secret carnot serve --addr 127.0.0.1:7744
 ```
 
-## Architecture (12-Crate One-Way DAG)
+## Architecture (12 Core Crates + Modular Extensions)
 
 ```text
-carnot-cli         CLI · doctor · audit-prefix · bench · SIGINT/SIGTERM · single-thread runtime
-carnot             Ergonomic Rust SDK facade (`CarnotBuilder`)
-carnot-protocol    ACP stdio · Host RPC stdio · Bearer-auth HTTP/1.1 + SSE
-carnot-agent       Async turn loop · I2 effect-parallel scheduler · lossless EventLog · Subagent
-carnot-ext         Modules: MicroSkills / Agent Skills · Rewind-Receipt · Maxwell Daemon · LSP · WebFetch · PolicyGuard
-carnot-mcp         MCP 2026-07-28 · 2025-11-25 · Legacy SSE 2024-11-05 · lazy schema cache · SSRF/MCPoison guards
-carnot-tools       5 canonical LID tools (`Read`, `Edit`, `Write`, `Grep`, `Bash`) · tree-sitter · BLAKE3 ReadTracker
-carnot-ai          ProviderRegistry · protocol adapters · declarative `providers.json` · retry & webpki TLS fallback
-carnot-session     Crash-safe branching JSONL v2 · canonical prefix hash · multimodal compaction
-carnot-sandbox     Fail-closed macOS Seatbelt & Linux `bwrap` · catalog-driven env scrubbing
-carnot-cas         Lazy zero-I/O 256-bit BLAKE3 store (RO `$TMPDIR` fallback) · semantic compressors · worktree hasher
-carnot-core        Zero-dependency leaf types (`Message`, `ContentOrigin`, `ToolEffects`, `Usage`, `CarnotConfig`)
+Core crates (crates/*)
+  carnot-cli         CLI · doctor · audit-prefix · SIGINT/SIGTERM · interactive REPL · single-thread runtime
+  carnot             Ergonomic Rust SDK facade (`CarnotBuilder`, opt-in `ext-*` / `all-ext` features)
+  carnot-protocol    Bidirectional multi-session multimodal ACP stdio · Host RPC stdio · Bearer-auth HTTP/1.1 + SSE · `ChannelInteractionBroker`
+  carnot-agent       Async turn loop · I2 effect-parallel scheduler · lossless EventLog · abort-safe tool pairing
+  carnot-ext         Core modules (`ExecMicroSkills`, `PrefixGuard`, `PolicyGuard`, `AskUserModule`, `IsolatedForkWorktree`) + Pi-style drop-in host
+  carnot-mcp         MCP 2026-07-28 · 2025-11-25 · Legacy SSE 2024-11-05 · lazy schema cache · SSRF/MCPoison guards
+  carnot-tools       5 canonical LID tools (`Read`, `Edit`, `Write`, `.gitignore`-aware `Grep`, `Bash`) · optional `syntax` (tree-sitter) · BLAKE3 ReadTracker
+  carnot-ai          ProviderRegistry · protocol adapters (incl. native web search/fetch) · declarative `providers.json` · retry & webpki TLS fallback
+  carnot-session     Crash-safe branching JSONL v2 · canonical prefix hash · multimodal compaction
+  carnot-sandbox     Fail-closed macOS Seatbelt & Linux `bwrap` · catalog-driven env scrubbing
+  carnot-cas         Lazy zero-I/O 256-bit BLAKE3 store (pre-spill redaction + 7d GC + RO `$TMPDIR` fallback) · semantic compressors
+  carnot-core        Zero-dependency leaf types (`Message`, `ContentOrigin`, `ToolEffects`, `Usage`, `CarnotConfig`, `UserQuestion`)
+
+Official in-process Rust extensions (extensions/* — opt-in, 0 bloat in default build)
+  carnot-ext-web             Hybrid Native + Local Web (`auto|native|local`): native Anthropic `web_search`/`web_fetch`, OpenAI Responses `web_search`, Gemini 3 `googleSearch`/`urlContext`, + SSRF-safe local `WebFetch` (`text/markdown` negotiation, HTML→MD/Text, CAS spill) & API-backed `WebSearch` (SearXNG/Exa/Tavily/Brave)
+  carnot-ext-lsp             Non-blocking background LSP warm-up, post-edit diagnostics & deferred `LspQuery`
+  carnot-ext-subagent        Disposable-context sync & non-blocking background `SubagentModule` (worktree isolation + cost rollup)
+  carnot-ext-hooks           Declarative lifecycle hooks 100% compatible with Claude Code (`command` & `http` webhooks for `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionStart`, `PreCompact`, `Stop`)
+  carnot-ext-claude-plugins  Native Claude Code plugin loader (`.claude-plugin/plugin.json`, `hooks.json`, `skills/`, `commands/`, `agents/`, `.mcp.json`, `${CLAUDE_PLUGIN_ROOT}`)
+  carnot-ext-memory          Two-tier cache-safe cross-session memory (Turn-1 curated digest + BM25 `MemorySearch` + secret-redacted `MemorySave` + synced `MEMORY.md`)
 ```
+
+### Interactive Approvals & `AskUser`
+
+Carnot ships first-class interactive user flows across every embedding surface (**0 static prefix tokens**, `defer_loading: true`):
+
+- **Tool approvals (`PermissionBroker`)** : ACP `session/request_permission` (with `allow_once`, session-cached `allow_always`, `reject_once`), Host RPC (`set_require_approval`, `respond_permission`, `list_pending`), HTTP/SSE (`GET /v1/pending`, `POST /v1/permissions`), and Rust SDK (`Agent::set_permission_broker`).
+- **Clarifying questions (`AskUser` / `UserQuestionBroker`)** : enabled automatically on interactive surfaces (ACP, RPC, HTTP, REPL; opt-in via `CarnotBuilder::ask_user(true)`). Supports structured multiple-choice options, `multi_select`, and free text — with `carnot/ask_user` on ACP (and automatic fallback to standard `session/request_permission` option buttons on generic ACP clients!), `respond_question` on RPC, `POST /v1/questions` on HTTP, and interactive terminal prompts in the REPL.
+
+### Extensions (Two Tiers)
+
+1. **In-process Rust extensions (`extensions/*`, zero IPC overhead):**
+   - Enable at compile time via Cargo features (`ext-web`, `ext-lsp`, `ext-subagent`, `ext-hooks`, `ext-claude-plugins`, `ext-memory`, or `all-ext`), or wire any custom `Arc<dyn Module>` via `CarnotBuilder::with_module(...)`.
+   - CLI flags (when compiled in): `--web`, `--web-mode`, `--lsp`, `--subagent`, `--hooks-file`, `--claude-hooks`, `--claude-plugin`, `--load-installed-claude-plugins`, `--memory`.
+2. **Pi-style drop-in file extensions (zero recompilation):**
+   - Drop any executable script (Python, Bun/TS, Bash) or native binary into `~/.carnot/extensions/`, declare entries in `~/.carnot/extensions.json`, or pass `--ext ./my_ext.py` (workspace `.carnot/extensions/` requires explicit `--trust-workspace-ext`).
+   - Speaks `carnot-ext/1` JSON-RPC 2.0 over multiplexed stdio with negotiated hooks (0 IPC on unused hooks) and `defer_loading: true` by default (0 static prefix tokens). Python helper: [`sdk/python/carnot_sdk.py`](sdk/python/carnot_sdk.py).
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for the full threat model (fail-closed OS sandbox, filesystem confinement, pre-spill secret redaction, SSRF protection, anti-RCE workspace trust boundaries, and `PolicyGuard` ordering).
 
 ## Development
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo check -p carnot-tools --no-default-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 ```
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

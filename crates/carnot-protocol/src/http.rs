@@ -9,13 +9,14 @@
 //!   - Returns `409 Conflict` if a second `POST /v1/prompt` arrives while a run is active (N5).
 //!   - Lossless SSE streaming from `EventLog` with `id: <seq>` & `Last-Event-ID` replay on `GET /v1/events`.
 
+use crate::interaction::ChannelInteractionBroker;
 use carnot_agent::Agent;
-use carnot_core::{AgentEvent, Result};
+use carnot_core::{AgentEvent, Result, UserQuestionAnswer};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const MAX_HEADERS: usize = 64;
@@ -49,6 +50,9 @@ pub async fn serve_http(agent: Arc<Agent>, addr: &str) -> Result<()> {
 }
 
 pub async fn serve_http_with_token(agent: Arc<Agent>, addr: &str, token: String) -> Result<()> {
+    let broker = ChannelInteractionBroker::new(Arc::clone(&agent));
+    agent.set_question_broker(broker.clone()).await;
+
     let listener = TcpListener::bind(addr).await?;
     let expected_token = Arc::new(token);
     tracing::info!(%addr, "carnot HTTP/SSE server listening (Bearer auth + CSRF protection enabled)");
@@ -57,9 +61,10 @@ pub async fn serve_http_with_token(agent: Arc<Agent>, addr: &str, token: String)
             accept_res = listener.accept() => {
                 let (stream, _) = accept_res?;
                 let ag = agent.clone();
+                let br = broker.clone();
                 let tok = expected_token.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(ag, stream, &tok).await;
+                    let _ = handle_conn(ag, br, stream, &tok).await;
                 });
             }
             _ = shutdown_signal() => {
@@ -155,32 +160,26 @@ fn is_allowed_origin(origin: &str) -> bool {
 async fn read_bounded_line(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> std::io::Result<Option<String>> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = reader.read(&mut byte).await?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            break;
-        }
-        buf.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-        if buf.len() > MAX_HEADER_LINE_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "HTTP header line exceeds 8 KiB limit",
-            ));
-        }
+    let mut buf = Vec::with_capacity(128);
+    let n = reader
+        .take((MAX_HEADER_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > MAX_HEADER_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP header line exceeds 8 KiB limit",
+        ));
     }
     Ok(Some(String::from_utf8_lossy(&buf).to_string()))
 }
 
 async fn handle_conn(
     agent: Arc<Agent>,
+    broker: Arc<ChannelInteractionBroker>,
     stream: TcpStream,
     expected_token: &str,
 ) -> std::io::Result<()> {
@@ -222,6 +221,10 @@ async fn handle_conn(
                         Err(_) => {
                             content_len_err = Some((400, "invalid Content-Length header"));
                         }
+                    }
+                } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                    if val.to_ascii_lowercase().contains("chunked") {
+                        content_len_err = Some((501, "chunked Transfer-Encoding is not supported"));
                     }
                 } else if k.eq_ignore_ascii_case("last-event-id") {
                     last_event_id = val.parse().ok();
@@ -390,10 +393,89 @@ async fn handle_conn(
             agent.follow_up(msg).await;
             write_json(&mut write_half, 200, &json!({"queued": true})).await
         }
+        ("GET", "/v1/pending") => {
+            let pending = broker.list_pending().await;
+            write_json(&mut write_half, 200, &pending).await
+        }
+        ("POST", "/v1/permissions") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let req_id = payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let decision = payload
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or("deny");
+            let reason = payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let resolved = broker.respond_permission(req_id, decision, reason).await;
+            let status = if resolved { 200 } else { 404 };
+            write_json(&mut write_half, status, &json!({"resolved": resolved})).await
+        }
+        ("POST", "/v1/questions") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let req_id = payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let answers: Vec<UserQuestionAnswer> = payload
+                .get("answers")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let resolved = broker.respond_question(req_id, answers).await;
+            let status = if resolved { 200 } else { 404 };
+            write_json(&mut write_half, status, &json!({"resolved": resolved})).await
+        }
         ("POST", "/v1/abort") => {
             agent.abort().await;
             write_json(&mut write_half, 200, &json!({"aborted": true})).await
         }
+        ("POST", "/v1/compact") => {
+            if agent.is_busy() {
+                return write_json(
+                    &mut write_half,
+                    409,
+                    &json!({"error": "agent run already in progress; cancel before compacting"}),
+                )
+                .await;
+            }
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let focus = payload
+                .get("focus")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match agent.compact_now_with_focus(focus).await {
+                Ok((before, after, semantic)) => {
+                    write_json(
+                        &mut write_half,
+                        200,
+                        &json!({
+                            "tokens_before": before,
+                            "tokens_after": after,
+                            "semantic_llm": semantic,
+                        }),
+                    )
+                    .await
+                }
+                Err(e) => write_json(&mut write_half, 500, &json!({"error": e.to_string()})).await,
+            }
+        }
+        ("POST", "/v1/undo") => match agent.undo_last_edit() {
+            Ok(path) => {
+                write_json(
+                    &mut write_half,
+                    200,
+                    &json!({"reverted": path.map(|p| p.display().to_string())}),
+                )
+                .await
+            }
+            Err(e) => write_json(&mut write_half, 409, &json!({"error": e.to_string()})).await,
+        },
         ("POST", "/v1/prompt") => {
             if agent.is_busy() {
                 return write_json(
@@ -496,6 +578,7 @@ async fn write_json(
         409 => "Conflict",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        501 => "Not Implemented",
         _ => "Internal Server Error",
     };
     let hdr = format!(
@@ -539,14 +622,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let tok = Arc::new("secret-test-token".to_string());
+        let broker = ChannelInteractionBroker::new(Arc::clone(&agent));
         let ag_bg = Arc::clone(&agent);
+        let br_bg = Arc::clone(&broker);
         let tok_bg = Arc::clone(&tok);
         let srv = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let a = Arc::clone(&ag_bg);
+                let b = Arc::clone(&br_bg);
                 let t = Arc::clone(&tok_bg);
                 tokio::spawn(async move {
-                    let _ = handle_conn(a, stream, &t).await;
+                    let _ = handle_conn(a, b, stream, &t).await;
                 });
             }
         });
@@ -623,6 +709,29 @@ mod tests {
             r413.starts_with("HTTP/1.1 413"),
             "expected 413, got: {r413}"
         );
+
+        // 6. Transfer-Encoding: chunked -> 501 Not Implemented (never silently empty!)
+        let r501 = send_raw(
+            addr,
+            "POST /v1/steer HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r501.starts_with("HTTP/1.1 501"),
+            "expected 501, got: {r501}"
+        );
+
+        // 7. POST /v1/undo returns 200 with reverted: null when stack is empty
+        let rundo = send_raw(
+            addr,
+            "POST /v1/undo HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\n\r\n",
+        )
+        .await;
+        assert!(
+            rundo.starts_with("HTTP/1.1 200"),
+            "expected 200, got: {rundo}"
+        );
+        assert!(rundo.contains("\"reverted\":null"));
 
         srv.abort();
         let _ = std::fs::remove_dir_all(&dir);

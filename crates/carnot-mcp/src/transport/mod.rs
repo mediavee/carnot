@@ -781,7 +781,7 @@ impl McpClient {
         on_progress: Option<ProgressCallback>,
     ) -> Result<Value> {
         let (era, ver) = {
-            let p = self.proto.lock().expect("proto lock");
+            let p = self.proto.lock().unwrap_or_else(|e| e.into_inner());
             (p.era, p.version.clone())
         };
         let mut wire_params = params.clone();
@@ -1022,7 +1022,7 @@ impl McpClient {
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let (era, ver) = {
-            let p = self.proto.lock().expect("proto lock");
+            let p = self.proto.lock().unwrap_or_else(|e| e.into_inner());
             (p.era, p.version.clone())
         };
         match &self.inner {

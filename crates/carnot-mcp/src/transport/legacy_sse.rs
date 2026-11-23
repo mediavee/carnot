@@ -235,7 +235,10 @@ impl LegacySseActor {
     ) -> std::result::Result<Value, TransportError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("pending lock").insert(id, tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
 
         let payload = json!({
             "jsonrpc": "2.0",

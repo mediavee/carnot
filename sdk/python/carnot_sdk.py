@@ -1,27 +1,15 @@
 """
-Zero-dependency Python 3.12+ async SDK & Negotiated Extension Host for Carnot.
+Zero-dependency Python 3.12+ async SDK for Carnot (`carnot --mode rpc`).
 
-Usage (Client):
+Usage:
     async with CarnotClient(cwd=".", provider="anthropic", model="claude-sonnet-5-5") as c:
         res = await c.prompt("Fix the failing tests")
         print(res["final_text"], res["metrics"])
-
-Usage (Out-of-process JSON-RPC 2.0 Extension with I3 negotiated hooks):
-    class MyExt(CarnotExtension):
-        hooks = ["before_tool"]
-        failure_policy = "fail_closed"
-
-        def before_tool(self, tool: str, inp: dict) -> dict:
-            if tool == "Bash" and "rm -rf /" in inp.get("command", ""):
-                return {"decision": "deny", "reason": "dangerous command"}
-            return {"decision": "allow"}
-    MyExt().serve_stdio()
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from typing import Any, Callable
 
 
@@ -121,6 +109,16 @@ class CarnotClient:
     async def steer(self, message: str) -> dict[str, Any]:
         return await self.call("steer", {"message": message})
 
+    async def follow_up(self, message: str) -> dict[str, Any]:
+        return await self.call("follow_up", {"message": message})
+
+    async def compact(self, focus: str | None = None) -> dict[str, Any]:
+        params = {"focus": focus} if focus else {}
+        return await self.call("compact", params)
+
+    async def undo(self) -> dict[str, Any]:
+        return await self.call("undo")
+
     async def replay_events(self, after_seq: int = 0) -> dict[str, Any]:
         return await self.call("replay_events", {"after_seq": after_seq})
 
@@ -130,71 +128,151 @@ class CarnotClient:
     async def get_metrics(self) -> dict[str, Any]:
         return await self.call("get_metrics")
 
+    async def list_pending(self) -> dict[str, Any]:
+        return await self.call("list_pending")
+
+    async def set_require_approval(self, enabled: bool = True) -> dict[str, Any]:
+        return await self.call("set_require_approval", {"enabled": enabled})
+
+    async def respond_permission(
+        self, request_id: str, decision: str = "allow_once", reason: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"request_id": request_id, "decision": decision}
+        if reason is not None:
+            params["reason"] = reason
+        return await self.call("respond_permission", params)
+
+    async def respond_question(
+        self, request_id: str, answers: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self.call("respond_question", {"request_id": request_id, "answers": answers})
+
     async def abort(self) -> dict[str, Any]:
         return await self.call("abort")
 
 
 class CarnotExtension:
-    """Base class for writing out-of-process Carnot extensions in Python over JSON-RPC 2.0."""
+    """
+    Base class for Pi-style drop-in Carnot file extensions (`carnot-ext/1` over stdio).
 
-    tools: list[dict[str, Any]] = []
-    hooks: list[str] = ["session_start", "before_tool", "after_tool", "turn_boundary"]
-    timeout_ms: int = 5000
+    Drop an executable script into `~/.carnot/extensions/` or pass `--ext ./my_ext.py`.
+    Only hooks you actually override are advertised in `ext/init` (zero IPC on unused hooks),
+    and tools default to `defer_loading: True` (0 static prefix tokens).
+
+    Example:
+        #!/usr/bin/env python3
+        from carnot_sdk import CarnotExtension
+
+        class GuardExt(CarnotExtension):
+            def before_tool(self, tool: str, inp: dict[str, Any]) -> dict[str, Any]:
+                if tool == "Bash" and "deploy --prod" in inp.get("command", ""):
+                    return {"decision": "deny", "reason": "prod deploy requires manual approval"}
+                return {"decision": "allow"}
+
+        if __name__ == "__main__":
+            GuardExt().run()
+    """
+
     failure_policy: str = "fail_closed"
 
-    def on_session_start(self, workspace_root: str) -> str | None:
+    def tools(self) -> list[dict[str, Any]]:
+        """Return tool definitions: `[{"name", "description", "input_schema", "defer_loading": True}]`."""
+        return []
+
+    def session_start(self, workspace_root: str, model: str) -> str | None:
         return None
 
     def before_tool(self, tool: str, inp: dict[str, Any]) -> dict[str, Any]:
         return {"decision": "allow"}
 
-    def after_tool(self, tool: str, inp: dict[str, Any], is_error: bool, text: str) -> None:
-        return None
+    def after_tool(
+        self, tool: str, inp: dict[str, Any], is_error: bool, text: str
+    ) -> dict[str, Any]:
+        return {}
 
-    def on_turn_boundary(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+    def turn_boundary(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {"action": "continue"}
+
+    def before_compact(self, ctx: dict[str, Any]) -> dict[str, Any]:
         return {"action": "continue"}
 
     def call_tool(self, name: str, inp: dict[str, Any]) -> dict[str, Any]:
-        return {"text": f"unhandled tool: {name}", "is_error": True}
+        return {"is_error": True, "text": f"unknown extension tool: {name}"}
 
-    def serve_stdio(self) -> None:
+    def _advertised_hooks(self) -> list[str]:
+        hooks: list[str] = []
+        for method_name, hook_name in (
+            ("session_start", "session_start"),
+            ("before_tool", "before_tool"),
+            ("after_tool", "after_tool"),
+            ("turn_boundary", "turn_boundary"),
+            ("before_compact", "before_compact"),
+        ):
+            if getattr(type(self), method_name) is not getattr(CarnotExtension, method_name):
+                hooks.append(hook_name)
+        return hooks
+
+    def run(self) -> None:
+        import sys
+
         for line in sys.stdin:
             line = line.strip()
             if not line:
                 continue
-            req = json.loads(line)
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             rid = req.get("id")
-            method = req.get("method")
+            method = req.get("method", "")
             params = req.get("params") or {}
             try:
                 if method == "ext/init":
-                    res: Any = {
-                        "protocolVersion": "carnot-ext/1",
-                        "tools": self.tools,
-                        "hooks": self.hooks,
-                        "timeout_ms": self.timeout_ms,
+                    normalized_tools = [
+                        {"defer_loading": True, **tool} for tool in self.tools()
+                    ]
+                    result: Any = {
+                        "protocol": "carnot-ext/1",
                         "failure_policy": self.failure_policy,
+                        "hooks": self._advertised_hooks(),
+                        "tools": normalized_tools,
                     }
                 elif method == "ext/session_start":
-                    res = {"context": self.on_session_start(params.get("workspace_root", "."))}
+                    ctx = self.session_start(
+                        str(params.get("workspace_root", "")),
+                        str(params.get("model", "")),
+                    )
+                    result = {"context": ctx} if ctx else {}
                 elif method == "ext/before_tool":
-                    res = self.before_tool(params.get("tool", ""), params.get("input") or {})
+                    result = self.before_tool(
+                        str(params.get("tool", "")),
+                        dict(params.get("input") or {}),
+                    )
                 elif method == "ext/after_tool":
-                    self.after_tool(
-                        params.get("tool", ""),
-                        params.get("input") or {},
+                    result = self.after_tool(
+                        str(params.get("tool", "")),
+                        dict(params.get("input") or {}),
                         bool(params.get("is_error", False)),
                         str(params.get("text", "")),
                     )
-                    res = {}
                 elif method == "ext/turn_boundary":
-                    res = self.on_turn_boundary(params)
+                    result = self.turn_boundary(dict(params))
+                elif method == "ext/before_compact":
+                    result = self.before_compact(dict(params))
                 elif method == "ext/tool_call":
-                    res = self.call_tool(params.get("name", ""), params.get("input") or {})
+                    result = self.call_tool(
+                        str(params.get("name", "")),
+                        dict(params.get("input") or {}),
+                    )
                 else:
-                    res = {}
-                out = {"jsonrpc": "2.0", "id": rid, "result": res}
-            except Exception as exc:
-                out = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(exc)}}
-            sys.stdout.write(json.dumps(out) + "\n")
-            sys.stdout.flush()
+                    result = {}
+                resp: dict[str, Any] = {"jsonrpc": "2.0", "id": rid, "result": result}
+            except Exception as exc:  # noqa: BLE001
+                resp = {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "error": {"code": -32000, "message": str(exc)},
+                }
+            if rid is not None:
+                sys.stdout.write(json.dumps(resp) + "\n")
+                sys.stdout.flush()

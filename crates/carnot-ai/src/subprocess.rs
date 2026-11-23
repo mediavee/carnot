@@ -287,7 +287,14 @@ impl Provider for SubprocessProvider {
             line.push('\n');
 
             // Take ownership of the live child while streaming, then return it to the slot on completion.
-            let mut lc = guard.take().expect("just verified live");
+            let Some(mut lc) = guard.take() else {
+                return Err(CarnotError::Provider {
+                    provider: self.provider_id.clone(),
+                    message: "subprocess provider slot unexpectedly empty".into(),
+                    retryable: true,
+                    retry_after_ms: None,
+                });
+            };
             drop(guard);
 
             if let Err(e) = lc.stdin.write_all(line.as_bytes()).await {

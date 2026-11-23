@@ -53,10 +53,20 @@ enum EditHunk {
 }
 
 fn parse_edit_hunk(item: &Value, label: &str) -> std::result::Result<EditHunk, String> {
-    let has_start = item.get("start_line").is_some();
-    let has_end = item.get("end_line").is_some();
+    let has_start = item
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v >= 1);
+    let has_end = item
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v >= 1);
     if has_start || has_end {
-        if item.get("old_string").is_some() {
+        if item
+            .get("old_string")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        {
             return Err(format!(
                 "{label} cannot specify both `old_string` and `start_line`/`end_line`"
             ));
@@ -220,8 +230,24 @@ impl Tool for EditTool {
             let mut hunks = Vec::new();
             let parsed_edits_val: Option<Value> = match input.get("edits") {
                 Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+                Some(Value::Null) | None => None,
+                Some(Value::Array(arr)) if arr.is_empty() => {
+                    // Strict-schema models often emit `"edits": []` alongside top-level `old_string` / `start_line`.
+                    let has_top_level = input
+                        .get("old_string")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                        || input
+                            .get("start_line")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|v| v >= 1);
+                    if has_top_level {
+                        None
+                    } else {
+                        Some(Value::Array(Vec::new()))
+                    }
+                }
                 Some(v) => Some(v.clone()),
-                None => None,
             };
             if let Some(val) = parsed_edits_val {
                 let items: Vec<Value> = match val {

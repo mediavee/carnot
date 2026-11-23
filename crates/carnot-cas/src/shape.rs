@@ -511,13 +511,9 @@ pub fn shape_text_output(
     shape_command_output(None, raw, store, spill_threshold_bytes, preview_max_bytes)
 }
 
-/// Command-aware semantic shaper + truly lossless RAW CAS spillover (Opus #4, #7, #8, #15):
-///   - Dispatches strictly on `argv[0]` + subcommand (`cargo`, `pytest`, `jest`/`vitest`, `tsc`, `eslint`)
-///   - **Golden Rule (Opus #15):**
-///     1. When `store` is `None` (`cas_handles = false`, Baseline mode), NEVER apply lossy compression
-///        or 1.4 KiB truncation (only a 32 KiB wire safety cap)!
-///     2. Whenever ANY lossy compression or spilling occurs, CAS stores the **exact bit-for-bit RAW**
-///        input bytes (before ANSI/duplicate cleaning) so zero information is ever lost!
+/// Command-aware semantic shaper + lossless CAS spillover.
+/// Calls `shape_command_output_with_redaction(..., false)` (use `redact_secrets = true`
+/// for shell/MCP outputs so credentials are scrubbed before writing `.carnot/h/<hash>.log`).
 pub fn shape_command_output(
     command: Option<&str>,
     raw: &str,
@@ -525,6 +521,33 @@ pub fn shape_command_output(
     spill_threshold_bytes: usize,
     preview_max_bytes: usize,
 ) -> Result<ShapedOutput> {
+    shape_command_output_with_redaction(
+        command,
+        raw,
+        store,
+        spill_threshold_bytes,
+        preview_max_bytes,
+        false,
+    )
+}
+
+/// Command-aware semantic shaper + lossless CAS spillover with optional pre-spill secret redaction.
+/// When `redact_secrets` is `true`, well-known credentials/keys are redacted BEFORE spilling bytes
+/// to `.carnot/h/<hash>.log` on disk AND before constructing the inline preview.
+pub fn shape_command_output_with_redaction(
+    command: Option<&str>,
+    raw: &str,
+    store: Option<&CasStore>,
+    spill_threshold_bytes: usize,
+    preview_max_bytes: usize,
+    redact_secrets: bool,
+) -> Result<ShapedOutput> {
+    let safe_raw = if redact_secrets {
+        crate::redact::redact_secrets_cow(raw)
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
+    let raw = safe_raw.as_ref();
     let raw_bytes = raw.len();
     let cleaned = clean_terminal_noise(raw);
 

@@ -7,6 +7,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["syntax"]
+syntax = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-typescript",
+]
+
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
@@ -19,9 +29,9 @@ serde_json.workspace = true
 similar.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tree-sitter.workspace = true
-tree-sitter-go.workspace = true
-tree-sitter-python.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-typescript.workspace = true
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
 uuid.workspace = true

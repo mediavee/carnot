@@ -1,14 +1,11 @@
-//! Per-segment working-memory tracker for verified Rewind-Receipt and state-preserving compaction.
+//! Per-segment working-memory tracker for state-preserving compaction and live telemetry.
 
 use carnot_core::{ThermodynamicMetrics, ToolOutput};
-use carnot_ext::rewind::is_verified_test_command;
 use serde_json::Value;
 
 #[derive(Debug, Default)]
 pub(crate) struct SegmentTracker {
     pub(crate) had_edit: bool,
-    pub(crate) verified_green_cmd: Option<String>,
-    pub(crate) verified_green_summary: Option<String>,
     pub(crate) files_read: Vec<String>,
     pub(crate) files_edited: Vec<String>,
     pub(crate) handles_created: Vec<String>,
@@ -26,7 +23,7 @@ impl SegmentTracker {
         }
     }
 
-    /// Records tool outcomes into both the segment state and live thermodynamic metrics.
+    /// Records tool outcomes into both the segment state and live runtime metrics.
     pub(crate) fn record_tool_outcome(
         &mut self,
         tool_name: &str,
@@ -60,36 +57,24 @@ impl SegmentTracker {
             }
             "Edit" | "Write" if !out.is_error => {
                 self.had_edit = true;
-                // Any mutation invalidates prior green test runs until re-verified!
-                self.verified_green_cmd = None;
-                self.verified_green_summary = None;
                 if let Some(p) = input.get("file_path").and_then(|v| v.as_str()) {
                     Self::push_unique(&mut self.files_edited, p.to_string());
                 }
             }
-            "Bash" => {
+            "Bash" if out.is_error => {
                 if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                    if !out.is_error && is_verified_test_command(cmd) {
-                        self.verified_green_cmd = Some(cmd.to_string());
-                        self.verified_green_summary = Some(out.text_only());
-                    } else if out.is_error {
-                        if is_verified_test_command(cmd) {
-                            self.verified_green_cmd = None;
-                            self.verified_green_summary = None;
-                        }
-                        let first_line = out
-                            .text_only()
-                            .lines()
-                            .next()
-                            .unwrap_or("failed")
-                            .chars()
-                            .take(120)
-                            .collect::<String>();
-                        Self::push_unique(
-                            &mut self.failed_attempts,
-                            format!("`{cmd}` -> {first_line}"),
-                        );
-                    }
+                    let first_line = out
+                        .text_only()
+                        .lines()
+                        .next()
+                        .unwrap_or("failed")
+                        .chars()
+                        .take(120)
+                        .collect::<String>();
+                    Self::push_unique(
+                        &mut self.failed_attempts,
+                        format!("`{cmd}` -> {first_line}"),
+                    );
                 }
             }
             _ => {}

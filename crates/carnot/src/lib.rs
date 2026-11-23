@@ -14,28 +14,69 @@
 //! # }
 //! ```
 
-pub use carnot_agent::{Agent, EventLog, EventStream, RunOutcome, SubagentModule};
+pub use carnot_agent::{Agent, EventLog, EventStream, RunOutcome};
 pub use carnot_ai::{
-    Provider, anthropic::AnthropicProvider, catalog::ProviderCatalog, catalog::ProviderSummary,
-    catalog::ResolvedProviderSpec, faux::FauxProvider, faux::ScriptedTurn, google::GoogleProvider,
-    openai::OpenAiProvider, openai_responses::OpenAiResponsesProvider, registry::ApiAdapter,
-    registry::ProviderRegistry, retry::ResilientProvider, subprocess::SubprocessProvider,
+    Provider,
+    anthropic::AnthropicProvider,
+    catalog::ProviderCatalog,
+    catalog::ProviderSummary,
+    catalog::ResolvedProviderSpec,
+    faux::FauxProvider,
+    faux::ScriptedTurn,
+    google::GoogleProvider,
+    oauth::{
+        AuthStore, OAuthConfig, OAuthFlow, OAuthLoginOptions, OAuthPrompt, OAuthStoredToken,
+        OAuthTokenManager, login_with_oauth, refresh_stored_token, save_manual_token,
+    },
+    openai::OpenAiProvider,
+    openai_responses::OpenAiResponsesProvider,
+    registry::ApiAdapter,
+    registry::AvailableModel,
+    registry::ProviderRegistry,
+    registry::ResolvedModelTarget,
+    retry::ResilientProvider,
+    subprocess::SubprocessProvider,
 };
 pub use carnot_cas::{
-    CasHandle, CasStore, WorktreeHasher, shape_command_output, shape_text_output,
+    CasHandle, CasStore, redact_secrets, shape_command_output, shape_command_output_with_redaction,
+    shape_text_output,
 };
 pub use carnot_core::{
     AgentEvent, CacheTtl, CarnotConfig, CarnotError, EventEnvelope, Message, ModelPricing,
-    ModuleSwitches, Profile, ReasoningEffort, Result, StopReason, ThermodynamicMetrics,
-    ToolEffects, ToolOutput, ToolSpec, Usage, canonicalize_json,
+    ModuleSwitches, NativeWebConfig, Profile, ProviderWebCapabilities, ReasoningEffort, Result,
+    StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolSpec, Usage, UserQuestion,
+    UserQuestionAnswer, UserQuestionOption, canonicalize_json,
 };
 pub use carnot_ext::{
     BoundaryAction, CompactionHookAction, CompactionHookContext, Module, PermissionBroker,
-    ToolGateDecision, TurnBoundarySnapshot, daemon::MaxwellDaemonModule, lsp::LspDiagnosticsModule,
-    microskills::ExecMicroSkillsModule, policy::PolicyGuardModule,
-    prefix_guard::assert_prefix_invariance, rewind::RewindReceiptModule,
-    subprocess::SubprocessExtension, warm_fork::IsolatedForkWorktree, web::WebFetchModule,
+    ToolGateDecision, TurnBoundarySnapshot, UserQuestionBroker,
+    ask_user::{AskUserModule, SharedQuestionBroker},
+    dropin::{
+        DropinExtension, DropinExtensionSpec, FailurePolicy, discover_dropin_specs,
+        load_dropin_extensions,
+    },
+    microskills::ExecMicroSkillsModule,
+    policy::PolicyGuardModule,
+    prefix_guard::assert_prefix_invariance,
+    warm_fork::{IsolatedForkWorktree, LandOutcome},
 };
+#[cfg(feature = "ext-claude-plugins")]
+pub use carnot_ext_claude_plugins::{
+    ClaudePluginsConfig, ClaudePluginsModule, LoadedClaudePlugin, PluginAsset,
+    discover_installed_claude_plugin_dirs,
+};
+#[cfg(feature = "ext-hooks")]
+pub use carnot_ext_hooks::{
+    CompiledHook, HookEvent, HooksConfig, HooksModule, parse_hooks_file, parse_hooks_value,
+};
+#[cfg(feature = "ext-lsp")]
+pub use carnot_ext_lsp::{LspDiagnosticsModule, LspLang};
+#[cfg(feature = "ext-memory")]
+pub use carnot_ext_memory::{MemoryConfig, MemoryEntry, MemoryKind, MemoryModule, MemoryScope};
+#[cfg(feature = "ext-subagent")]
+pub use carnot_ext_subagent::SubagentModule;
+#[cfg(feature = "ext-web")]
+pub use carnot_ext_web::{ResolvedWebExtension, WebConfig, WebMode, WebModule};
 pub use carnot_mcp::{
     CachedServerSchema, CachedToolEntry, HttpServerConfig, MCP_LEGACY_PROTOCOL_VERSION,
     MCP_PROTOCOL_VERSION, McpClient, McpConfigFile, McpManager, McpServerConfig, McpServerSummary,
@@ -45,7 +86,7 @@ pub use carnot_mcp::{
 pub use carnot_protocol::{
     acp::AcpHost, acp::AcpModelInfo, acp::ResolvedAcpModel, acp::serve_acp_stdio,
     acp::serve_acp_stdio_with_host, http::serve_http, http::serve_http_with_token,
-    rpc::serve_rpc_stdio,
+    interaction::ChannelInteractionBroker, rpc::serve_rpc_stdio,
 };
 pub use carnot_tools::{Tool, ToolRegistry};
 
@@ -66,7 +107,18 @@ pub struct CarnotBuilder {
     extra_mcp_servers: std::collections::BTreeMap<String, McpServerConfig>,
     persist_session: bool,
     resume_session: Option<PathBuf>,
+    fork_session: bool,
     policy_guard: bool,
+    #[cfg(feature = "ext-web")]
+    web_config: Option<WebConfig>,
+    #[cfg(feature = "ext-lsp")]
+    lsp_enabled: bool,
+    #[cfg(feature = "ext-hooks")]
+    hooks_config: Option<HooksConfig>,
+    #[cfg(feature = "ext-claude-plugins")]
+    claude_plugins_config: Option<ClaudePluginsConfig>,
+    #[cfg(feature = "ext-memory")]
+    memory_config: Option<MemoryConfig>,
 }
 
 impl CarnotBuilder {
@@ -81,7 +133,18 @@ impl CarnotBuilder {
             extra_mcp_servers: std::collections::BTreeMap::new(),
             persist_session: true,
             resume_session: None,
+            fork_session: false,
             policy_guard: false,
+            #[cfg(feature = "ext-web")]
+            web_config: None,
+            #[cfg(feature = "ext-lsp")]
+            lsp_enabled: false,
+            #[cfg(feature = "ext-hooks")]
+            hooks_config: None,
+            #[cfg(feature = "ext-claude-plugins")]
+            claude_plugins_config: None,
+            #[cfg(feature = "ext-memory")]
+            memory_config: None,
         }
     }
 
@@ -142,16 +205,7 @@ impl CarnotBuilder {
         self
     }
 
-    pub fn web_fetch(mut self, enabled: bool) -> Self {
-        self.config.modules.web_fetch = enabled;
-        self
-    }
-
-    pub fn lsp_diagnostics(mut self, enabled: bool) -> Self {
-        self.config.modules.lsp_diagnostics = enabled;
-        self
-    }
-
+    #[cfg(feature = "ext-subagent")]
     pub fn subagent(mut self, enabled: bool) -> Self {
         self.config.modules.subagent = enabled;
         self
@@ -159,6 +213,12 @@ impl CarnotBuilder {
 
     pub fn policy_guard(mut self, enabled: bool) -> Self {
         self.policy_guard = enabled;
+        self
+    }
+
+    /// Registers the deferred interactive `AskUser` tool (`defer_loading: true`, 0 static tokens).
+    pub fn ask_user(mut self, enabled: bool) -> Self {
+        self.config.enable_ask_user = enabled;
         self
     }
 
@@ -186,8 +246,95 @@ impl CarnotBuilder {
         self
     }
 
+    /// Adds a Pi-style drop-in file extension path (loaded via JSON-RPC stdio in `build_async`).
+    pub fn extension(mut self, path: PathBuf) -> Self {
+        self.config.extension_paths.push(path);
+        self
+    }
+
+    /// Opts into loading workspace-local `.carnot/extensions/` (disabled by default to block RCE).
+    pub fn trust_workspace_extensions(mut self, trust: bool) -> Self {
+        self.config.trust_workspace_extensions = trust;
+        self
+    }
+
+    /// Enables or disables the official web extension in `WebMode::Auto` (native server tools when
+    /// supported by the active provider, automatic fallback to local `WebFetch`/`WebSearch`).
+    #[cfg(feature = "ext-web")]
+    pub fn web_fetch(mut self, enabled: bool) -> Self {
+        self.web_config = enabled.then(WebConfig::default);
+        self
+    }
+
+    /// Enables the official web extension with a specific mode (`Auto`, `Native`, or `Local`).
+    #[cfg(feature = "ext-web")]
+    pub fn web_mode(mut self, mode: WebMode) -> Self {
+        let mut cfg = self.web_config.unwrap_or_default();
+        cfg.mode = mode;
+        self.web_config = Some(cfg);
+        self
+    }
+
+    /// Configures the official web extension (mode, domain policy, token/use caps).
+    #[cfg(feature = "ext-web")]
+    pub fn web_config(mut self, cfg: WebConfig) -> Self {
+        self.web_config = Some(cfg);
+        self
+    }
+
+    #[cfg(feature = "ext-lsp")]
+    pub fn lsp_diagnostics(mut self, enabled: bool) -> Self {
+        self.lsp_enabled = enabled;
+        self
+    }
+
+    /// Configures Claude Code-compatible declarative hooks (`PreToolUse`, `PostToolUse`, `SessionStart`, `PreCompact`, `Stop`).
+    #[cfg(feature = "ext-hooks")]
+    pub fn hooks_config(mut self, cfg: HooksConfig) -> Self {
+        self.hooks_config = Some(cfg);
+        self
+    }
+
+    /// Adds a Claude Code plugin directory (equivalent to Claude Code `--plugin-dir`).
+    #[cfg(feature = "ext-claude-plugins")]
+    pub fn claude_plugin(mut self, dir: PathBuf) -> Self {
+        self.claude_plugins_config
+            .get_or_insert_with(ClaudePluginsConfig::default)
+            .plugin_dirs
+            .push(dir);
+        self
+    }
+
+    /// Configures Claude Code plugin discovery (explicit dirs and/or `~/.claude/plugins/installed_plugins.json`).
+    #[cfg(feature = "ext-claude-plugins")]
+    pub fn claude_plugins_config(mut self, cfg: ClaudePluginsConfig) -> Self {
+        self.claude_plugins_config = Some(cfg);
+        self
+    }
+
+    /// Enables or disables cross-session persistent memory (`MemoryModule`) with default `~/.carnot/memory` storage.
+    #[cfg(feature = "ext-memory")]
+    pub fn memory(mut self, enabled: bool) -> Self {
+        self.memory_config = enabled.then(MemoryConfig::default);
+        self
+    }
+
+    /// Configures cross-session persistent memory (`MemoryModule`).
+    #[cfg(feature = "ext-memory")]
+    pub fn memory_config(mut self, cfg: MemoryConfig) -> Self {
+        self.memory_config = Some(cfg);
+        self
+    }
+
     pub fn resume_session(mut self, path: PathBuf) -> Self {
         self.resume_session = Some(path);
+        self
+    }
+
+    /// When paired with `resume_session(...)`, forks the resumed session into a brand-new JSONL
+    /// session file so the original session stays untouched while keeping the warm cache prefix.
+    pub fn fork_session(mut self, enabled: bool) -> Self {
+        self.fork_session = enabled;
         self
     }
 
@@ -248,8 +395,8 @@ impl CarnotBuilder {
         self.build_with_mcp(cas, Arc::new(McpManager::empty()))
     }
 
-    /// Async build loading all validated `.mcp.json` servers (with zero-cold-start lazy disk cache!).
-    pub async fn build_async(self) -> Result<(Arc<Agent>, Arc<McpManager>)> {
+    /// Async build loading all validated `.mcp.json` servers and drop-in file extensions.
+    pub async fn build_async(mut self) -> Result<(Arc<Agent>, Arc<McpManager>)> {
         let cas = Arc::new(CasStore::open(&self.config.workspace_root)?);
         let mut cfgs = load_mcp_configs(
             &self.config.workspace_root,
@@ -257,6 +404,14 @@ impl CarnotBuilder {
             self.config.trust_workspace_mcp,
         )?;
         cfgs.extend(self.extra_mcp_servers.clone());
+        #[cfg(feature = "ext-claude-plugins")]
+        if let Some(plugin_cfg) = self.claude_plugins_config.take() {
+            let plugin_mod = ClaudePluginsModule::load(&self.config.workspace_root, &plugin_cfg)?;
+            if !plugin_mod.is_empty() {
+                cfgs.extend(plugin_mod.mcp_servers().clone());
+                self.extra_modules.push(Arc::new(plugin_mod));
+            }
+        }
         let mcp = if cfgs.is_empty() {
             Arc::new(McpManager::empty())
         } else {
@@ -272,6 +427,13 @@ impl CarnotBuilder {
                 .await?,
             )
         };
+        let dropins = load_dropin_extensions(
+            &self.config.workspace_root,
+            &self.config.extension_paths,
+            self.config.trust_workspace_extensions,
+        )
+        .await?;
+        self.extra_modules.extend(dropins);
         let agent = self.build_with_mcp(cas, Arc::clone(&mcp))?;
         Ok((agent, mcp))
     }
@@ -306,8 +468,6 @@ impl CarnotBuilder {
         {
             self.config.extra_writable_roots.push(fallback_cas_root);
         }
-        let model_pricing = registry.pricing_for_model(&self.config.model);
-
         let mut tools = ToolRegistry::with_canonical_lid_tools(&self.config, Arc::clone(&cas));
         for t in mcp.tools() {
             tools.register(t);
@@ -330,48 +490,88 @@ impl CarnotBuilder {
         if sw.exec_microskills {
             modules.push(Arc::new(ExecMicroSkillsModule::new()));
         }
-        if sw.maxwell_daemon {
-            modules.push(Arc::new(MaxwellDaemonModule::new(
-                self.config.workspace_root.clone(),
-                self.config.idle_turn_circuit_breaker,
-            )));
-        }
-        if sw.rewind_receipt {
-            modules.push(Arc::new(RewindReceiptModule::new(
-                self.config.workspace_root.clone(),
-                model_pricing,
-                self.config.cache_ttl,
-                self.config.rewind_min_heat_tokens,
-                self.config.rewind_max_per_session,
-                self.config.rewind_assumed_reread_frac,
-            )));
-        }
-        if sw.web_fetch {
-            modules.push(Arc::new(WebFetchModule::new(
+        #[cfg(feature = "ext-web")]
+        if let Some(ref web_cfg) = self.web_config {
+            let caps = provider.web_capabilities(&self.config.model);
+            let resolved = WebModule::resolve(
+                web_cfg,
+                caps,
                 Arc::clone(&cas),
                 sw.cas_handles,
                 self.config.cas_spill_threshold_bytes,
                 self.config.cas_preview_max_bytes,
-            )?));
+            )?;
+            self.config.native_web = resolved.native_web;
+            if !resolved.module.tools().is_empty() {
+                modules.push(Arc::new(resolved.module));
+            }
         }
-        if sw.lsp_diagnostics {
+        #[cfg(feature = "ext-lsp")]
+        if self.lsp_enabled {
             modules.push(Arc::new(LspDiagnosticsModule::new(
                 self.config.workspace_root.clone(),
                 400,
             )));
         }
-        if sw.subagent {
-            // Propagate ALL custom modules + PolicyGuard into child subagents (Opus #2!)
-            let mut inherited_for_child = self.extra_modules.clone();
+        #[cfg(feature = "ext-memory")]
+        if let Some(mem_cfg) = self.memory_config {
+            modules.push(Arc::new(MemoryModule::open(
+                &self.config.workspace_root,
+                mem_cfg,
+            )));
+        }
+        #[cfg(feature = "ext-hooks")]
+        let mut hooks_mod: Option<Arc<dyn Module>> = None;
+        #[cfg(feature = "ext-hooks")]
+        if let Some(ref hooks_cfg) = self.hooks_config {
+            let hm = HooksModule::discover(&self.config.workspace_root, hooks_cfg)?;
+            if !hm.is_empty() {
+                let hm: Arc<dyn Module> = Arc::new(hm);
+                modules.push(Arc::clone(&hm));
+                hooks_mod = Some(hm);
+            }
+        }
+        #[cfg(feature = "ext-claude-plugins")]
+        let mut claude_plugins_mod: Option<Arc<dyn Module>> = None;
+        #[cfg(feature = "ext-claude-plugins")]
+        if let Some(ref plugin_cfg) = self.claude_plugins_config {
+            let pm = ClaudePluginsModule::load(&self.config.workspace_root, plugin_cfg)?;
+            if !pm.is_empty() {
+                let pm: Arc<dyn Module> = Arc::new(pm);
+                modules.push(Arc::clone(&pm));
+                claude_plugins_mod = Some(pm);
+            }
+        }
+        #[cfg(feature = "ext-subagent")]
+        let subagent_mod: Option<Arc<SubagentModule>> = if sw.subagent {
+            // Propagate Hooks, Claude plugins, custom modules, and PolicyGuard into child workers
+            // so fail-closed PreToolUse hooks and policy gates can NEVER be bypassed via workers!
+            let mut inherited_for_child: Vec<Arc<dyn Module>> = Vec::new();
+            #[cfg(feature = "ext-hooks")]
+            if let Some(ref hm) = hooks_mod {
+                inherited_for_child.push(Arc::clone(hm));
+            }
+            #[cfg(feature = "ext-claude-plugins")]
+            if let Some(ref pm) = claude_plugins_mod {
+                inherited_for_child.push(Arc::clone(pm));
+            }
+            inherited_for_child.extend(self.extra_modules.iter().cloned());
             if let Some(ref pm) = policy_mod {
                 inherited_for_child.push(Arc::clone(pm));
             }
-            modules.push(Arc::new(SubagentModule::new(
-                self.config.clone(),
-                Arc::clone(&provider),
-                inherited_for_child,
-            )));
-        }
+            let sm = Arc::new(
+                SubagentModule::new(
+                    self.config.clone(),
+                    Arc::clone(&provider),
+                    inherited_for_child,
+                )
+                .with_provider_configs(self.config.provider_config_paths.clone()),
+            );
+            modules.push(sm.clone());
+            Some(sm)
+        } else {
+            None
+        };
         modules.extend(self.extra_modules);
         // Always run PolicyGuard LAST so `RewriteInput` from earlier modules can never bypass it!
         if let Some(pm) = policy_mod {
@@ -379,7 +579,18 @@ impl CarnotBuilder {
         }
 
         let agent = if let Some(ref resume_path) = self.resume_session {
-            Agent::resume(resume_path, self.config, provider, tools, modules)?
+            if self.fork_session {
+                Agent::resume_forked(
+                    resume_path,
+                    self.config,
+                    provider,
+                    tools,
+                    modules,
+                    self.persist_session,
+                )?
+            } else {
+                Agent::resume(resume_path, self.config, provider, tools, modules)?
+            }
         } else {
             Agent::new(self.config, provider, tools, modules, self.persist_session)?
         };
@@ -387,6 +598,11 @@ impl CarnotBuilder {
         if !descs.is_empty() {
             agent.set_deferred_server_descriptions(descs);
         }
-        Ok(Arc::new(agent))
+        let agent = Arc::new(agent);
+        #[cfg(feature = "ext-subagent")]
+        if let Some(ref sm) = subagent_mod {
+            sm.attach_parent(&agent);
+        }
+        Ok(agent)
     }
 }

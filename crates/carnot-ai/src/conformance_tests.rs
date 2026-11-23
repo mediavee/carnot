@@ -11,6 +11,7 @@
 //!   8. Persistent `subprocess-jsonl` child process across multiple turns + cancellation
 //!   9. Automated Zero-Hardcode CI check over `crates/carnot-ai/src/` and `crates/carnot/src/`!
 
+use crate::anthropic::AnthropicProvider;
 use crate::catalog::{
     ProviderCatalog, ResolvedAuth, ResolvedProviderSpec, SubprocessProviderConfig,
 };
@@ -133,6 +134,7 @@ fn sample_request(model: &str, messages: Vec<Message>) -> ProviderRequest {
         effort: ReasoningEffort::High,
         max_output_tokens: 4096,
         skip_tail_cache_write: false,
+        native_web: Default::default(),
     }
 }
 
@@ -155,9 +157,10 @@ fn spec_for(
             source: "test".into(),
         },
         headers: entry.headers.clone(),
+        query_params: entry.query_params.clone(),
         betas: entry.betas.clone(),
         cache_diagnosis_beta: entry.cache_diagnosis_beta.clone(),
-        native_tool_search: entry.native_tool_search,
+        native_tool_search: entry.native_tool_search.unwrap_or(false),
         compat: entry.compat.clone(),
         usage_map: entry.usage_map.clone(),
         body_patch: entry.body_patch.clone(),
@@ -712,6 +715,7 @@ for line in sys.stdin:
         project_id: None,
         auth: ResolvedAuth::None,
         headers: BTreeMap::new(),
+        query_params: BTreeMap::new(),
         betas: Vec::new(),
         cache_diagnosis_beta: None,
         native_tool_search: false,
@@ -757,6 +761,15 @@ fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
         "openrouter.ai",
         "api.deepseek.com",
         "api.llama.com",
+        "api.groq.com",
+        "api.mistral.ai",
+        "api.fireworks.ai",
+        "api.together.xyz",
+        "api.cerebras.ai",
+        "api.moonshot.ai",
+        "dashscope-intl.aliyuncs.com",
+        "accounts.google.com",
+        "oauth2.googleapis.com",
         "daily-cloudcode-pa",
         "cloudcode-pa.googleapis.com",
         "generativelanguage.googleapis.com",
@@ -773,9 +786,13 @@ fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
         .join("carnot")
         .join("src");
 
-    for dir in [ai_src, facade_src] {
-        for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+    fn scan_dir_recursive(dir: &std::path::Path, forbidden: &[&str]) {
+        for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
             let path = entry.path();
+            if path.is_dir() {
+                scan_dir_recursive(&path, forbidden);
+                continue;
+            }
             if path.extension().and_then(|s| s.to_str()) != Some("rs") {
                 continue;
             }
@@ -792,4 +809,303 @@ fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
             }
         }
     }
+
+    for dir in [ai_src, facade_src] {
+        scan_dir_recursive(&dir, &forbidden);
+    }
+}
+
+#[tokio::test]
+async fn conformance_native_web_search_and_fetch_across_anthropic_openai_and_gemini() {
+    let catalog = ProviderCatalog::embedded().expect("embedded catalog");
+    let nw = carnot_core::NativeWebConfig {
+        search: true,
+        fetch: true,
+        max_uses: Some(4),
+        max_content_tokens: Some(8_000),
+        allowed_domains: vec!["docs.rs".into()],
+        blocked_domains: vec!["evil.example".into()],
+        search_context_size: Some("high".into()),
+    };
+
+    // 1. Anthropic: web_search_20250305 + web_fetch_20250910 BEFORE custom tools so BP1 lands on `Read`,
+    //    allowed_domains takes precedence over blocked_domains, and beta header is sent ONLY when fetch=true!
+    let sse_anth = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_w1\",\"usage\":{\"input_tokens\":10}}}\n\n\
+        event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n\
+        event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+        event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let (anth_url, anth_cap) = spawn_mock_http(vec![(200, vec![], sse_anth.into())]).await;
+    let anth_spec = spec_for(&catalog, "anthropic", anth_url);
+    let anth = AnthropicProvider::from_spec(anth_spec);
+    assert_eq!(
+        anth.web_capabilities("claude-sonnet-5-5"),
+        carnot_core::ProviderWebCapabilities {
+            native_search: true,
+            native_fetch: true,
+        }
+    );
+    let mut anth_req = sample_request("claude-sonnet-5-5", vec![Message::user_text("search")]);
+    anth_req.native_web = nw.clone();
+    let anth_body = anth.build_body(&anth_req);
+    let tools = anth_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("tools");
+    assert_eq!(tools.len(), 3);
+    assert_eq!(
+        tools[0].get("type").and_then(Value::as_str),
+        Some("web_search_20250305")
+    );
+    assert_eq!(tools[0].get("max_uses").and_then(Value::as_u64), Some(4));
+    assert!(tools[0].get("allowed_domains").is_some());
+    assert!(tools[0].get("blocked_domains").is_none());
+    assert_eq!(
+        tools[1].get("type").and_then(Value::as_str),
+        Some("web_fetch_20250910")
+    );
+    assert_eq!(
+        tools[1].get("max_content_tokens").and_then(Value::as_u64),
+        Some(8_000)
+    );
+    // Never attach cache_control onto server tools (BP1 sits on system[0], covering tools + system)
+    assert!(tools[0].get("cache_control").is_none());
+    assert!(tools[1].get("cache_control").is_none());
+    assert!(tools[2].get("cache_control").is_none());
+    assert!(anth_body.pointer("/system/0/cache_control").is_some());
+
+    let mut rx = anth
+        .stream(anth_req, CancellationToken::new())
+        .await
+        .expect("stream");
+    while rx.recv().await.is_some() {}
+    let hdrs = anth_cap.lock().expect("cap")[0].1.clone();
+    assert!(
+        hdrs.to_ascii_lowercase()
+            .contains("anthropic-beta: web-fetch-2025-09-10"),
+        "expected web-fetch beta header when native fetch is active: {hdrs}"
+    );
+
+    // 2. OpenAI Responses: emits `{"type":"web_search","filters":{"allowed_domains":["docs.rs"]},"search_context_size":"high"}`
+    let oai_spec = spec_for(&catalog, "openai-responses", "http://127.0.0.1:9".into());
+    let oai = OpenAiResponsesProvider::from_spec(oai_spec);
+    assert_eq!(
+        oai.web_capabilities("gpt-5.4"),
+        carnot_core::ProviderWebCapabilities {
+            native_search: true,
+            native_fetch: true,
+        }
+    );
+    let mut oai_req = sample_request("gpt-5.4", vec![Message::user_text("search")]);
+    oai_req.native_web = nw.clone();
+    let oai_body = oai.build_body(&oai_req);
+    let oai_tools = oai_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("oai tools");
+    let ws = oai_tools
+        .iter()
+        .find(|t| t.get("type").and_then(Value::as_str) == Some("web_search"))
+        .expect("web_search tool");
+    assert_eq!(
+        ws.pointer("/filters/allowed_domains/0")
+            .and_then(Value::as_str),
+        Some("docs.rs")
+    );
+    assert_eq!(
+        ws.get("search_context_size").and_then(Value::as_str),
+        Some("high")
+    );
+
+    // 3. Gemini 3 emits googleSearch + urlContext alongside functionDeclarations AND formats grounding sources;
+    //    Gemini 2.5 explicitly disables native web in `providers.json` to avoid combined-tool HTTP 400!
+    let sse_gem = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Carnot is fast.\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"groundingChunks\":[{\"web\":{\"uri\":\"https://docs.rs/carnot\",\"title\":\"Carnot Docs\"}}]}}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":5}}\n\n";
+    let (gem_url, _) = spawn_mock_http(vec![(200, vec![], sse_gem.into())]).await;
+    let gem_spec = spec_for(&catalog, "gemini", gem_url);
+    let gem = GoogleProvider::from_spec(gem_spec, false);
+    assert_eq!(
+        gem.web_capabilities("gemini-3-pro-preview"),
+        carnot_core::ProviderWebCapabilities {
+            native_search: true,
+            native_fetch: true,
+        }
+    );
+    assert_eq!(
+        gem.web_capabilities("gemini-2.5-pro"),
+        carnot_core::ProviderWebCapabilities {
+            native_search: false,
+            native_fetch: false,
+        }
+    );
+    let mut gem3_req = sample_request("gemini-3-pro-preview", vec![Message::user_text("search")]);
+    gem3_req.native_web = nw.clone();
+    let gem3_body = gem.build_body(&gem3_req);
+    let gem3_tools = gem3_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("gemini3 tools");
+    assert!(gem3_tools.iter().any(|t| t.get("googleSearch").is_some()));
+    assert!(gem3_tools.iter().any(|t| t.get("urlContext").is_some()));
+
+    let mut gem25_req = sample_request("gemini-2.5-pro", vec![Message::user_text("search")]);
+    gem25_req.native_web = nw;
+    let gem25_body = gem.build_body(&gem25_req);
+    let gem25_tools = gem25_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("gemini25 tools");
+    assert!(!gem25_tools.iter().any(|t| t.get("googleSearch").is_some()));
+    assert!(!gem25_tools.iter().any(|t| t.get("urlContext").is_some()));
+
+    let mut grx = gem
+        .stream(gem3_req, CancellationToken::new())
+        .await
+        .expect("gem stream");
+    let mut final_msg = None;
+    while let Some(ev) = grx.recv().await {
+        if let StreamEvent::Done { message, .. } = ev {
+            final_msg = Some(message);
+        }
+    }
+    let txt = final_msg.expect("done msg").text_concat();
+    assert!(
+        txt.contains("Carnot is fast.") && txt.contains("[Carnot Docs](https://docs.rs/carnot)"),
+        "expected grounded citation footer in Gemini text: {txt}"
+    );
+}
+
+#[tokio::test]
+async fn conformance_oauth_reactive_401_refresh_and_query_params() {
+    use crate::oauth::{AuthStore, OAuthConfig, OAuthFlow, OAuthStoredToken, OAuthTokenManager};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_task = tokio::spawn(async move {
+        // Request 1: chat/completions with stale bearer token -> HTTP 401
+        // Request 2: POST /oauth/token with refresh_token -> HTTP 200 fresh token
+        // Request 3: retry chat/completions with fresh token + query_params -> HTTP 200 SSE
+        for step in 0..3 {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 8192];
+            let n = s.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            match step {
+                0 => {
+                    assert!(req.contains("POST /chat/completions?api-version=2025-04-01 "));
+                    assert!(
+                        req.to_ascii_lowercase()
+                            .contains("authorization: bearer stale-tok")
+                    );
+                    let body = r#"{"error":"token expired"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    s.write_all(resp.as_bytes()).await.expect("write 401");
+                }
+                1 => {
+                    assert!(req.contains("POST /oauth/token "));
+                    assert!(req.contains("grant_type=refresh_token"));
+                    assert!(req.contains("refresh_token=ref-live-1"));
+                    let body = r#"{"access_token":"fresh-tok-2","refresh_token":"ref-live-2","expires_in":3600,"token_type":"Bearer"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    s.write_all(resp.as_bytes()).await.expect("write token");
+                }
+                _ => {
+                    assert!(req.contains("POST /chat/completions?api-version=2025-04-01 "));
+                    assert!(
+                        req.to_ascii_lowercase()
+                            .contains("authorization: bearer fresh-tok-2")
+                    );
+                    let sse = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"refreshed-ok\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    );
+                    s.write_all(resp.as_bytes()).await.expect("write sse");
+                }
+            }
+        }
+    });
+
+    let dir = std::env::temp_dir().join(format!("carnot-oauth-401-{}", uuid::Uuid::new_v4()));
+    let store = AuthStore::open(dir.join("auth.json"));
+    let tok = OAuthStoredToken {
+        access_token: "stale-tok".into(),
+        refresh_token: Some("ref-live-1".into()),
+        token_type: "Bearer".into(),
+        expires_at_epoch_secs: Some(crate::oauth::now_epoch_secs() + 3600),
+        scope: None,
+        client_id: Some("cid".into()),
+        token_url: Some(format!("http://{addr}/oauth/token")),
+        updated_at_epoch_secs: crate::oauth::now_epoch_secs(),
+    };
+    store.save("oauth-test", tok.clone()).expect("save");
+    let manager = Arc::new(OAuthTokenManager::new(
+        "oauth-test",
+        tok,
+        Some(OAuthConfig {
+            flow: OAuthFlow::Pkce,
+            token_url: Some(format!("http://{addr}/oauth/token")),
+            client_id: Some("cid".into()),
+            ..Default::default()
+        }),
+        store.clone(),
+    ));
+
+    let mut qp = BTreeMap::new();
+    qp.insert("api-version".into(), "2025-04-01".into());
+    let spec = ResolvedProviderSpec {
+        provider_id: "oauth-test".into(),
+        api: "openai-completions".into(),
+        base_url: format!("http://{addr}"),
+        fallback_base_urls: Vec::new(),
+        project_id: None,
+        auth: ResolvedAuth::OAuth {
+            manager,
+            source: "oauth:oauth-test".into(),
+        },
+        headers: BTreeMap::new(),
+        query_params: qp,
+        betas: Vec::new(),
+        cache_diagnosis_beta: None,
+        native_tool_search: false,
+        compat: Default::default(),
+        usage_map: Default::default(),
+        body_patch: None,
+        subprocess: None,
+        catalog_models: BTreeMap::new(),
+    };
+
+    let p = OpenAiProvider::from_spec(spec);
+    let mut rx = p
+        .stream(
+            sample_request("gpt-5.4", vec![Message::user_text("hi")]),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("stream after 401 refresh");
+    let mut final_text = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let StreamEvent::Done { message, .. } = ev {
+            final_text = message.text_concat();
+        }
+    }
+    assert_eq!(final_text, "refreshed-ok");
+
+    let persisted = store.get("oauth-test").expect("read").expect("present");
+    assert_eq!(persisted.access_token, "fresh-tok-2");
+    assert_eq!(persisted.refresh_token.as_deref(), Some("ref-live-2"));
+
+    server_task.await.expect("server done");
+    let _ = std::fs::remove_dir_all(&dir);
 }

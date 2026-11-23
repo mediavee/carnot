@@ -12,8 +12,8 @@ use crate::compat::{
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role,
-    StopReason, ToolResultBlock, Usage,
+    CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ProviderWebCapabilities,
+    ReasoningEffort, Result, Role, StopReason, ToolResultBlock, Usage,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -82,6 +82,7 @@ impl AnthropicProvider {
                 source: "direct".into(),
             },
             headers,
+            query_params: BTreeMap::new(),
             betas: Vec::new(),
             cache_diagnosis_beta: Some("cache-diagnosis-2026-04-07".into()),
             native_tool_search: true,
@@ -173,15 +174,72 @@ impl AnthropicProvider {
         let conv_cc = cache_ctrl(req.cache_ttl.conversation_tier());
 
         let has_deferred = req.tools.iter().any(|t| t.defer_loading);
-        let mut tools_json: Vec<Value> =
-            Vec::with_capacity(req.tools.len() + usize::from(has_deferred));
+        let compat = self.spec.effective_compat(&req.model);
+        let want_native_search =
+            req.native_web.search && compat.supports_native_web_search.unwrap_or(false);
+        let want_native_fetch =
+            req.native_web.fetch && compat.supports_native_web_fetch.unwrap_or(false);
+        let mut tools_json: Vec<Value> = Vec::with_capacity(
+            req.tools.len()
+                + usize::from(has_deferred)
+                + usize::from(want_native_search)
+                + usize::from(want_native_fetch),
+        );
         if has_deferred {
             tools_json.push(json!({
                 "type": "tool_search_tool_regex_20251119",
                 "name": "tool_search_tool_regex",
             }));
         }
-        let compat = self.spec.effective_compat(&req.model);
+        if want_native_search {
+            let mut ws = json!({
+                "type": compat
+                    .native_web_search_type
+                    .as_deref()
+                    .unwrap_or("web_search_20250305"),
+                "name": "web_search",
+                "max_uses": req.native_web.max_uses.unwrap_or(5).max(1),
+            });
+            if let Some(m) = ws.as_object_mut() {
+                if !req.native_web.allowed_domains.is_empty() {
+                    m.insert(
+                        "allowed_domains".into(),
+                        json!(req.native_web.allowed_domains),
+                    );
+                } else if !req.native_web.blocked_domains.is_empty() {
+                    m.insert(
+                        "blocked_domains".into(),
+                        json!(req.native_web.blocked_domains),
+                    );
+                }
+            }
+            tools_json.push(ws);
+        }
+        if want_native_fetch {
+            let mut wf = json!({
+                "type": compat
+                    .native_web_fetch_type
+                    .as_deref()
+                    .unwrap_or("web_fetch_20250910"),
+                "name": "web_fetch",
+                "max_uses": req.native_web.max_uses.unwrap_or(5).max(1),
+                "max_content_tokens": req.native_web.max_content_tokens.unwrap_or(12_000).max(512),
+            });
+            if let Some(m) = wf.as_object_mut() {
+                if !req.native_web.allowed_domains.is_empty() {
+                    m.insert(
+                        "allowed_domains".into(),
+                        json!(req.native_web.allowed_domains),
+                    );
+                } else if !req.native_web.blocked_domains.is_empty() {
+                    m.insert(
+                        "blocked_domains".into(),
+                        json!(req.native_web.blocked_domains),
+                    );
+                }
+            }
+            tools_json.push(wf);
+        }
         let allow_eager = compat.supports_eager_input_streaming.unwrap_or(true);
         let require_sig = compat.requires_thinking_signature.unwrap_or(true);
         for t in &req.tools {
@@ -200,17 +258,9 @@ impl AnthropicProvider {
             }
             tools_json.push(obj);
         }
-        // BP1: last non-deferred tool (static prefix tier -> 1h in Hybrid!)
-        if let Some(last_non_deferred) = tools_json
-            .iter_mut()
-            .rev()
-            .find(|v| v.get("defer_loading").and_then(Value::as_bool) != Some(true))
-            && let Some(obj) = last_non_deferred.as_object_mut()
-        {
-            obj.insert("cache_control".to_string(), static_cc.clone());
-        }
-
-        // BP2: static system prompt (static prefix tier -> 1h in Hybrid!)
+        // BP1 (static prefix tier -> 1h in Hybrid): single breakpoint on static system prompt
+        // caches `tools` + `static_system_prompt` together (since both are frozen in Carnot),
+        // freeing a full cache_control slot for Turn-1 (AGENTS.md + workspace-facts + goal) on 1h!
         let system_blocks = vec![json!({
             "type": "text",
             "text": req.static_system_prompt,
@@ -295,22 +345,39 @@ impl AnthropicProvider {
         } else {
             Some(last_idx)
         };
+        let msg_count = wire_messages.len();
         let final_messages: Vec<Value> = wire_messages
             .into_iter()
             .enumerate()
             .map(|(idx, (role, mut blocks, is_cp))| {
-                let want_bp = (is_cp && Some(idx) != rolling_bp_idx && idx != last_idx)
-                    || Some(idx) == rolling_bp_idx;
-                if want_bp {
-                    // A9: attach cache_control ONLY to the last NON-thinking block!
+                // 4-slot monotonic TTL ladder (1h -> 1h -> 5m -> 5m in Hybrid, max 4 blocks total):
+                //   BP1: system[0] (`static_cc` = 1h) — covers tools + static system prompt
+                //   BP2: messages[0] (`static_cc` = 1h) — covers Turn-1 (AGENTS.md + workspace-facts + goal)
+                //   BP3: checkpoint_index > 0 (`conv_cc` = 5m)
+                //   BP4: rolling_bp_idx > 0 (`conv_cc` = 5m)
+                let cc_for_msg: Option<&Value> = if idx == 0 {
+                    if req.skip_tail_cache_write && msg_count == 1 {
+                        None
+                    } else {
+                        Some(&static_cc)
+                    }
+                } else if (is_cp && Some(idx) != rolling_bp_idx && idx != last_idx)
+                    || Some(idx) == rolling_bp_idx
+                {
+                    Some(&conv_cc)
+                } else {
+                    None
+                };
+                if let Some(cc) = cc_for_msg {
+                    // A9: attach cache_control ONLY to the last NON-thinking / non-server-tool-use block!
                     if let Some(target) = blocks.iter_mut().rev().find(|b| {
                         !matches!(
                             b.get("type").and_then(Value::as_str),
-                            Some("thinking" | "redacted_thinking")
+                            Some("thinking" | "redacted_thinking" | "server_tool_use")
                         )
                     }) && let Some(obj) = target.as_object_mut()
                     {
-                        obj.insert("cache_control".into(), conv_cc.clone());
+                        obj.insert("cache_control".into(), cc.clone());
                     }
                 }
                 json!({"role": role, "content": blocks})
@@ -473,7 +540,12 @@ fn encode_blocks(
                 let is_legacy_anthropic = origin.is_none()
                     && matches!(
                         raw.get("type").and_then(Value::as_str),
-                        Some("redacted_thinking" | "server_tool_use" | "web_search_tool_result")
+                        Some(
+                            "redacted_thinking"
+                                | "server_tool_use"
+                                | "web_search_tool_result"
+                                | "web_fetch_tool_result"
+                        )
                     );
                 if can_replay_origin(
                     origin.as_ref(),
@@ -520,6 +592,14 @@ impl Provider for AnthropicProvider {
         self.spec.native_tool_search
     }
 
+    fn web_capabilities(&self, model: &str) -> ProviderWebCapabilities {
+        let compat = self.spec.effective_compat(model);
+        ProviderWebCapabilities {
+            native_search: compat.supports_native_web_search.unwrap_or(false),
+            native_fetch: compat.supports_native_web_fetch.unwrap_or(false),
+        }
+    }
+
     fn effort_preserves_cache(&self, model: &str) -> bool {
         self.supports_effort(model) && self.thinking_mode(model) != Some("budget")
     }
@@ -530,25 +610,22 @@ impl Provider for AnthropicProvider {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<mpsc::Receiver<StreamEvent>>> {
         Box::pin(async move {
-            let url = self
-                .spec
-                .auth
-                .apply_to_url(&format!("{}/v1/messages", self.spec.base_url));
+            let raw_url = format!("{}/v1/messages", self.spec.base_url);
             let body = self.build_body(&request);
-            let mut req_builder = self
-                .client
-                .post(&url)
-                .header("content-type", "application/json");
-            // Explicit auth from data catalog (Bearer OR x-api-key, NEVER both!)
-            req_builder = self.spec.auth.apply_to_request(req_builder);
-            for (k, v) in &self.spec.headers {
-                req_builder = req_builder.header(k.as_str(), v.as_str());
-            }
+            let mut extra_headers: Vec<(String, String)> = Vec::new();
             if !self.spec.headers.contains_key("anthropic-version") {
-                req_builder = req_builder.header("anthropic-version", "2023-06-01");
+                extra_headers.push(("anthropic-version".into(), "2023-06-01".into()));
             }
             // Data-driven betas (empty by default so gateways/Bedrock/Vertex never 400!)
             let mut betas = self.spec.betas.clone();
+            let compat = self.spec.effective_compat(&request.model);
+            if request.native_web.fetch
+                && compat.supports_native_web_fetch.unwrap_or(false)
+                && let Some(ref wf_beta) = compat.native_web_fetch_beta
+                && !betas.iter().any(|b| b == wf_beta)
+            {
+                betas.push(wf_beta.clone());
+            }
             if self.cache_diagnosis
                 && let Some(ref diag_beta) = self.spec.cache_diagnosis_beta
                 && !betas.iter().any(|b| b == diag_beta)
@@ -556,24 +633,18 @@ impl Provider for AnthropicProvider {
                 betas.push(diag_beta.clone());
             }
             if !betas.is_empty() {
-                req_builder = req_builder.header("anthropic-beta", betas.join(","));
+                extra_headers.push(("anthropic-beta".into(), betas.join(",")));
             }
 
-            let send_fut = req_builder.json(&body).send();
-            let resp = tokio::time::timeout(HTTP_HEADERS_TIMEOUT, send_fut)
-                .await
-                .map_err(|_| CarnotError::Provider {
-                    provider: self.spec.provider_id.clone(),
-                    message: "HTTP response headers timeout (300s)".into(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })?
-                .map_err(|e| CarnotError::Provider {
-                    provider: self.spec.provider_id.clone(),
-                    message: e.without_url().to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })?;
+            let resp = crate::send_authorized_json_post(
+                &self.client,
+                &self.spec,
+                &raw_url,
+                &extra_headers,
+                &body,
+                HTTP_HEADERS_TIMEOUT,
+            )
+            .await?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -1031,9 +1102,12 @@ mod tests {
             effort: ReasoningEffort::High,
             max_output_tokens: 32_768,
             skip_tail_cache_write: false,
+            native_web: Default::default(),
         };
         let body = p.build_body(&req);
-        assert!(body.pointer("/tools/0/cache_control").is_some());
+        // BP1 on system[0] covers tools + static system prompt; BP2 on messages[0] covers Turn-1;
+        // BP3/4 on rolling messages. Never attach cache_control onto tools directly.
+        assert!(body.pointer("/tools/0/cache_control").is_none());
         assert!(body.pointer("/system/0/cache_control").is_some());
         assert!(
             body.pointer("/messages/0/content/0/cache_control")
@@ -1047,6 +1121,61 @@ mod tests {
             body.pointer("/messages/1/role").and_then(Value::as_str),
             Some("system")
         );
+    }
+
+    #[test]
+    fn hybrid_4slot_ladder_promotes_turn1_to_1h_with_monotonic_ttls() {
+        let p = AnthropicProvider::new("test-key".into());
+        let req = ProviderRequest {
+            model: "claude-sonnet-5-5".into(),
+            static_system_prompt: "STATIC".into(),
+            tools: vec![ToolSpec {
+                name: "Read".into(),
+                description: "Read file".into(),
+                input_schema: json!({"type": "object"}),
+                defer_loading: false,
+            }],
+            prefix_hash: "abc".into(),
+            session_id: "sess-1".into(),
+            messages: vec![
+                Arc::new(Message::user_text("turn1 workspace facts + AGENTS.md")),
+                Arc::new(Message::assistant_text("a0")),
+                Arc::new(Message::user_text("u1_checkpoint")),
+                Arc::new(Message::assistant_text("a1")),
+                Arc::new(Message::user_text("u2_tail")),
+            ],
+            checkpoint_index: Some(2),
+            cache_ttl: CacheTtl::Hybrid,
+            effort: ReasoningEffort::High,
+            max_output_tokens: 32_768,
+            skip_tail_cache_write: false,
+            native_web: Default::default(),
+        };
+        let body = p.build_body(&req);
+        // Exactly 4 breakpoints with strictly monotonic TTLs: 1h -> 1h -> 5m -> 5m
+        assert_eq!(
+            body.pointer("/system/0/cache_control/ttl")
+                .and_then(Value::as_str),
+            Some("1h")
+        );
+        assert_eq!(
+            body.pointer("/messages/0/content/0/cache_control/ttl")
+                .and_then(Value::as_str),
+            Some("1h")
+        );
+        assert_eq!(
+            body.pointer("/messages/2/content/0/cache_control/ttl")
+                .and_then(Value::as_str),
+            Some("5m")
+        );
+        assert_eq!(
+            body.pointer("/messages/4/content/0/cache_control/ttl")
+                .and_then(Value::as_str),
+            Some("5m")
+        );
+        // Count total cache_control blocks across entire payload (Anthropic hard max = 4)
+        let s = serde_json::to_string(&body).expect("json");
+        assert_eq!(s.matches("\"cache_control\"").count(), 4);
     }
 
     #[test]
@@ -1070,6 +1199,7 @@ mod tests {
             effort: ReasoningEffort::Low,
             max_output_tokens: 64_000,
             skip_tail_cache_write: true,
+            native_web: Default::default(),
         };
         let body = p.build_body(&req);
         assert!(
@@ -1084,6 +1214,197 @@ mod tests {
             body.pointer("/messages/4/content/0/cache_control")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn exhaustive_cache_control_invariants_never_violate_anthropic_rules() {
+        let p = AnthropicProvider::new("test-key".into());
+        let tool_sets: Vec<(Vec<ToolSpec>, carnot_core::NativeWebConfig)> = vec![
+            (vec![], Default::default()),
+            (
+                vec![
+                    ToolSpec {
+                        name: "Read".into(),
+                        description: "Read".into(),
+                        input_schema: json!({"type": "object"}),
+                        defer_loading: false,
+                    },
+                    ToolSpec {
+                        name: "mcp__srv__tool".into(),
+                        description: "Deferred".into(),
+                        input_schema: json!({"type": "object"}),
+                        defer_loading: true,
+                    },
+                ],
+                carnot_core::NativeWebConfig {
+                    search: true,
+                    fetch: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        // Diverse message shapes: plain user, thinking+tool_use assistant, tool_result user,
+        // mid-conversation Role::System notes, and redacted_thinking-only assistant edge cases.
+        let sample_pool: Vec<Arc<Message>> = vec![
+            Arc::new(Message::user_text("turn 1 AGENTS.md + workspace facts")),
+            Arc::new(Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "plan".into(),
+                        signature: Some("sig1".into()),
+                        origin: Some(ContentOrigin::new(
+                            "anthropic-messages",
+                            "anthropic",
+                            "claude-sonnet-5-5",
+                        )),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tu_1".into(),
+                        name: "Read".into(),
+                        input: json!({"file_path": "a.rs"}),
+                        invalid_json: None,
+                        provider_meta: None,
+                        origin: None,
+                    },
+                ],
+            }),
+            Arc::new(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu_1".into(),
+                    content: vec![ToolResultBlock::text("fn main() {}")],
+                    is_error: false,
+                }],
+            }),
+            Arc::new(Message::system_note("[worker-update untrusted]\nping")),
+            Arc::new(Message::assistant_text("step 2 answer")),
+            Arc::new(Message::user_text("follow-up user turn")),
+            Arc::new(Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Opaque {
+                        raw: json!({"type": "redacted_thinking", "data": "abc"}),
+                        origin: Some(ContentOrigin::new(
+                            "anthropic-messages",
+                            "anthropic",
+                            "claude-sonnet-5-5",
+                        )),
+                    },
+                    ContentBlock::Text {
+                        text: "visible reply".into(),
+                    },
+                ],
+            }),
+            Arc::new(Message::user_text("final compaction prompt")),
+        ];
+
+        let mut checked_cases = 0usize;
+        for (tools, native_web) in &tool_sets {
+            for ttl in [CacheTtl::Short5m, CacheTtl::Long1h, CacheTtl::Hybrid] {
+                for skip_tail in [false, true] {
+                    for len in 0..=sample_pool.len() {
+                        let msgs = sample_pool[..len].to_vec();
+                        let mut cps: Vec<Option<usize>> = vec![None];
+                        for cp in 0..=len {
+                            cps.push(Some(cp));
+                        }
+                        for cp in cps {
+                            let req = ProviderRequest {
+                                model: "claude-sonnet-5-5".into(),
+                                static_system_prompt: "STATIC".into(),
+                                tools: tools.clone(),
+                                prefix_hash: "ph".into(),
+                                session_id: "sess".into(),
+                                messages: msgs.clone(),
+                                checkpoint_index: cp,
+                                cache_ttl: ttl,
+                                effort: ReasoningEffort::High,
+                                max_output_tokens: 32_768,
+                                skip_tail_cache_write: skip_tail,
+                                native_web: native_web.clone(),
+                            };
+                            let body = p.build_body(&req);
+
+                            // Collect every cache_control in Anthropic wire evaluation order:
+                            // tools -> system -> messages
+                            let mut seen_ttls: Vec<String> = Vec::new();
+                            if let Some(t_arr) = body.get("tools").and_then(Value::as_array) {
+                                for t in t_arr {
+                                    assert!(
+                                        t.get("cache_control").is_none(),
+                                        "no tool (server or custom) should carry cache_control"
+                                    );
+                                }
+                            }
+                            if let Some(s_arr) = body.get("system").and_then(Value::as_array) {
+                                for sb in s_arr {
+                                    if let Some(cc) = sb.get("cache_control") {
+                                        seen_ttls.push(
+                                            cc.get("ttl")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("5m")
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(m_arr) = body.get("messages").and_then(Value::as_array) {
+                                for m in m_arr {
+                                    if let Some(c_arr) = m.get("content").and_then(Value::as_array)
+                                    {
+                                        for blk in c_arr {
+                                            if let Some(cc) = blk.get("cache_control") {
+                                                let btype = blk
+                                                    .get("type")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or("");
+                                                assert!(
+                                                    !matches!(
+                                                        btype,
+                                                        "thinking"
+                                                            | "redacted_thinking"
+                                                            | "server_tool_use"
+                                                    ),
+                                                    "cache_control must NEVER land on {btype}"
+                                                );
+                                                seen_ttls.push(
+                                                    cc.get("ttl")
+                                                        .and_then(Value::as_str)
+                                                        .unwrap_or("5m")
+                                                        .to_string(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Invariant 1: Anthropic hard maximum of 4 cache_control blocks
+                            assert!(
+                                seen_ttls.len() <= 4,
+                                "exceeded 4 cache_control blocks ({seen_ttls:?}) for ttl={ttl:?} skip={skip_tail} len={len} cp={cp:?}"
+                            );
+                            // Invariant 2: strictly non-increasing TTL order (1h NEVER after 5m!)
+                            let mut saw_5m = false;
+                            for t in &seen_ttls {
+                                if t == "5m" {
+                                    saw_5m = true;
+                                } else if t == "1h" {
+                                    assert!(
+                                        !saw_5m,
+                                        "INVALID Anthropic TTL order (1h after 5m): {seen_ttls:?} for ttl={ttl:?} skip={skip_tail} len={len} cp={cp:?}"
+                                    );
+                                }
+                            }
+                            checked_cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked_cases >= 500, "checked {checked_cases} combinations");
     }
 
     #[test]

@@ -7,12 +7,35 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+ext-web = ["dep:carnot-ext-web"]
+ext-lsp = ["dep:carnot-ext-lsp"]
+ext-subagent = ["dep:carnot-ext-subagent"]
+ext-hooks = ["dep:carnot-ext-hooks"]
+ext-claude-plugins = ["dep:carnot-ext-claude-plugins", "ext-hooks"]
+ext-memory = ["dep:carnot-ext-memory"]
+all-ext = [
+    "ext-web",
+    "ext-lsp",
+    "ext-subagent",
+    "ext-hooks",
+    "ext-claude-plugins",
+    "ext-memory",
+]
+
 [dependencies]
 carnot-agent.workspace = true
 carnot-ai.workspace = true
 carnot-cas.workspace = true
 carnot-core.workspace = true
 carnot-ext.workspace = true
+carnot-ext-claude-plugins = { workspace = true, optional = true }
+carnot-ext-hooks = { workspace = true, optional = true }
+carnot-ext-lsp = { workspace = true, optional = true }
+carnot-ext-memory = { workspace = true, optional = true }
+carnot-ext-subagent = { workspace = true, optional = true }
+carnot-ext-web = { workspace = true, optional = true }
 carnot-mcp.workspace = true
 carnot-protocol.workspace = true
 carnot-tools.workspace = true

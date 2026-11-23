@@ -17,7 +17,10 @@ impl ApiAdapter for FauxApiAdapter {
         )])))
     }
 }
-use carnot_core::{CacheTtl, ContentBlock, Message, ModelPricing, Result, Role, StopReason, Usage};
+use carnot_core::{
+    CacheTtl, ContentBlock, Message, ModelPricing, ProviderWebCapabilities, Result, Role,
+    StopReason, Usage,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -69,6 +72,7 @@ pub struct FauxProvider {
     seen_requests: Arc<Mutex<Vec<ProviderRequest>>>,
     cached_prefix_tokens: Arc<Mutex<u64>>,
     last_prefix_hash: Arc<Mutex<Option<String>>>,
+    web_caps: ProviderWebCapabilities,
 }
 
 impl FauxProvider {
@@ -78,7 +82,13 @@ impl FauxProvider {
             seen_requests: Arc::new(Mutex::new(Vec::new())),
             cached_prefix_tokens: Arc::new(Mutex::new(0)),
             last_prefix_hash: Arc::new(Mutex::new(None)),
+            web_caps: ProviderWebCapabilities::default(),
         }
+    }
+
+    pub fn with_web_capabilities(mut self, caps: ProviderWebCapabilities) -> Self {
+        self.web_caps = caps;
+        self
     }
 
     pub fn recorded_requests(&self) -> Vec<ProviderRequest> {
@@ -92,6 +102,10 @@ impl FauxProvider {
 impl Provider for FauxProvider {
     fn name(&self) -> &str {
         "faux"
+    }
+
+    fn web_capabilities(&self, _model: &str) -> ProviderWebCapabilities {
+        self.web_caps
     }
 
     fn stream(
@@ -127,8 +141,14 @@ impl Provider for FauxProvider {
 
             // Simulate realistic prefix cache hits & writes!
             let (cache_read, cache_write) = {
-                let mut prev_h = self.last_prefix_hash.lock().expect("lock");
-                let mut prev_tok = self.cached_prefix_tokens.lock().expect("lock");
+                let mut prev_h = self
+                    .last_prefix_hash
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut prev_tok = self
+                    .cached_prefix_tokens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let same_static = prev_h.as_deref() == Some(request.prefix_hash.as_str());
                 let cr = if same_static {
                     (*prev_tok).min(est_ctx)

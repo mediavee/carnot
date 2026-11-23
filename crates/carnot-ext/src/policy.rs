@@ -9,74 +9,15 @@
 //!   - Optional append-only JSONL audit trail
 
 use crate::{BoxFuture, Module, ToolGateDecision};
+pub use carnot_cas::redact_secrets;
 use carnot_core::{Result, ToolOutput, ToolResultBlock};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-fn secret_redaction_patterns() -> &'static [(Regex, &'static str)] {
-    static PATS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-    PATS.get_or_init(|| {
-        vec![
-            (
-                Regex::new(r"sk-ant-[A-Za-z0-9_-]{20,}").expect("re"),
-                "[REDACTED:ANTHROPIC_KEY]",
-            ),
-            (
-                Regex::new(r"sk-or-v1-[A-Za-z0-9]{24,}").expect("re"),
-                "[REDACTED:OPENROUTER_KEY]",
-            ),
-            (
-                Regex::new(r"sk-(?:proj-)?[A-Za-z0-9_-]{24,}").expect("re"),
-                "[REDACTED:API_KEY]",
-            ),
-            (
-                Regex::new(r"AIza[0-9A-Za-z_-]{35}").expect("re"),
-                "[REDACTED:GOOGLE_KEY]",
-            ),
-            (
-                Regex::new(r"xai-[A-Za-z0-9_-]{24,}").expect("re"),
-                "[REDACTED:XAI_KEY]",
-            ),
-            (
-                Regex::new(r"gh[pousr]_[A-Za-z0-9]{20,}").expect("re"),
-                "[REDACTED:GITHUB_TOKEN]",
-            ),
-            (
-                Regex::new(r"xox[baprs]-[A-Za-z0-9-]{20,}").expect("re"),
-                "[REDACTED:SLACK_TOKEN]",
-            ),
-            (
-                Regex::new(r"AKIA[0-9A-Z]{16}").expect("re"),
-                "[REDACTED:AWS_ACCESS_KEY]",
-            ),
-            (
-                Regex::new(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]{20,}").expect("re"),
-                "Authorization: Bearer [REDACTED:BEARER_TOKEN]",
-            ),
-            (
-                Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----")
-                    .expect("re"),
-                "[REDACTED:PRIVATE_KEY]",
-            ),
-        ]
-    })
-}
-
-/// Redacts well-known API keys, tokens, and PEM private keys from text.
-pub fn redact_secrets(input: &str) -> String {
-    let mut out = input.to_string();
-    for (re, repl) in secret_redaction_patterns() {
-        if re.is_match(&out) {
-            out = re.replace_all(&out, *repl).into_owned();
-        }
-    }
-    out
-}
 
 #[derive(Debug)]
 pub struct PolicyGuardModule {

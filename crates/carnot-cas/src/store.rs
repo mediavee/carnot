@@ -61,6 +61,7 @@ impl CasStore {
             return Ok(loc);
         }
         let local_root = self.workspace_root.join(".carnot").join("h");
+        let already_existed = local_root.is_dir();
         let probe_nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -77,13 +78,21 @@ impl CasStore {
                 .is_ok();
         let computed = if local_ok {
             ensure_git_exclude(&self.workspace_root);
+            if already_existed {
+                // Lazy one-shot hygiene: prune CAS blobs older than 7 days so `.carnot/h/` never grows unbounded.
+                let _ = gc_dir_older_than(&local_root, Duration::from_secs(7 * 24 * 3600));
+            }
             CasLocation {
                 root: local_root,
                 display_prefix: ".carnot/h".to_string(),
             }
         } else {
             let fallback_root = Self::fallback_root(&self.workspace_root);
+            let fb_existed = fallback_root.is_dir();
             fs::create_dir_all(&fallback_root)?;
+            if fb_existed {
+                let _ = gc_dir_older_than(&fallback_root, Duration::from_secs(7 * 24 * 3600));
+            }
             let display_prefix = fallback_root.to_string_lossy().to_string();
             CasLocation {
                 root: fallback_root,
@@ -193,29 +202,33 @@ impl CasStore {
                 }
             }
         };
-        let now = SystemTime::now();
-        let mut removed = 0usize;
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("log") {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata()
-                && let Ok(modified) = meta.modified()
-                && let Ok(age) = now.duration_since(modified)
-                && age > max_age
-                && fs::remove_file(&path).is_ok()
-            {
-                removed += 1;
-            }
-        }
-        Ok(removed)
+        gc_dir_older_than(&dir, max_age)
     }
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
+}
+
+fn gc_dir_older_than(dir: &Path, max_age: Duration) -> Result<usize> {
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("log") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && let Ok(age) = now.duration_since(modified)
+            && age > max_age
+            && fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Appends `.carnot/` to the repo's exact git exclude file in pure Rust (0 subprocesses!)

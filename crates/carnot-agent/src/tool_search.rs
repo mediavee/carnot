@@ -20,9 +20,43 @@ use tokio_util::sync::CancellationToken;
 pub const TOOL_SEARCH_NAME: &str = "ToolSearch";
 pub const CALL_DEFERRED_TOOL_NAME: &str = "CallDeferredTool";
 
+/// Max number of non-MCP deferred tools promoted directly to eager tools on providers without
+/// native `defer_loading` (OpenAI, Gemini, local models).
+///
+/// Rationale (hybrid Pi + Claude Code):
+///   - Providers WITH native `defer_loading` (Anthropic) keep `defer_loading: true` on the wire
+///     (0 static schema tokens + 1-step server tool search).
+///   - Providers WITHOUT native `defer_loading` pay ~240 static tokens + 1 extra LLM round-trip
+///     for `ToolSearch` + `CallDeferredTool`, which costs MORE than exposing 1..=6 small built-in
+///     extension tools (`AskUser`, `MemorySave`, `MemorySearch`, `LspQuery`, ...) directly.
+///   - Whenever MCP tools (`mcp__*`) OR >6 deferred tools are present, the cache-invariant
+///     `ToolSearch` + `CallDeferredTool` fallback engages automatically.
+pub const DIRECT_PROMOTE_MAX_DEFERRED: usize = 6;
+
+/// Returns `true` when non-MCP deferred tools should be promoted directly onto the wire instead
+/// of routing through the 2-step `ToolSearch` + `CallDeferredTool` indirection.
+pub fn should_promote_deferred_directly(
+    all_specs: &[ToolSpec],
+    supports_native_tool_search: bool,
+) -> bool {
+    if supports_native_tool_search {
+        return false;
+    }
+    let mut deferred_count = 0usize;
+    for s in all_specs {
+        if s.defer_loading {
+            if s.name.starts_with("mcp__") {
+                return false;
+            }
+            deferred_count += 1;
+        }
+    }
+    deferred_count > 0 && deferred_count <= DIRECT_PROMOTE_MAX_DEFERRED
+}
+
 /// Filters tool specs for the currently active provider so live cross-provider model switches
-/// (Anthropic native `defer_loading` <-> non-Anthropic `ToolSearch` + `CallDeferredTool`)
-/// always expose the right deferred-tool interface without mutating `ToolRegistry`.
+/// (Anthropic native `defer_loading` <-> non-Anthropic direct promotion / `ToolSearch` fallback)
+/// always expose the optimal deferred-tool interface without mutating `ToolRegistry`.
 pub fn effective_tools_for_provider(
     all_specs: &[ToolSpec],
     supports_native_tool_search: bool,
@@ -32,6 +66,16 @@ pub fn effective_tools_for_provider(
             .iter()
             .filter(|s| s.name != TOOL_SEARCH_NAME && s.name != CALL_DEFERRED_TOOL_NAME)
             .cloned()
+            .collect()
+    } else if should_promote_deferred_directly(all_specs, false) {
+        all_specs
+            .iter()
+            .filter(|s| s.name != TOOL_SEARCH_NAME && s.name != CALL_DEFERRED_TOOL_NAME)
+            .map(|s| {
+                let mut cloned = s.clone();
+                cloned.defer_loading = false;
+                cloned
+            })
             .collect()
     } else {
         all_specs.to_vec()
@@ -479,5 +523,31 @@ mod tests {
                 .iter()
                 .any(|s| s.name == CALL_DEFERRED_TOOL_NAME)
         );
+
+        // Small non-MCP deferred sets (<=6) on non-native providers promote directly (Pi-style,
+        // avoiding 2-step ToolSearch+CallDeferredTool overhead for e.g. AskUser + Memory).
+        let small_builtin: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(DummyDeferredTool {
+                name: "AskUser",
+                desc: "Ask clarifying questions",
+            }),
+            Arc::new(DummyDeferredTool {
+                name: "MemorySave",
+                desc: "Persist memory",
+            }),
+        ];
+        let mut small_specs: Vec<ToolSpec> = small_builtin.iter().map(|t| t.spec()).collect();
+        small_specs.push(ToolSearchTool::new(&small_builtin).spec());
+        small_specs.push(CallDeferredTool::new(&small_builtin).spec());
+
+        let promoted = effective_tools_for_provider(&small_specs, false);
+        assert!(!promoted.iter().any(|s| s.name == TOOL_SEARCH_NAME));
+        assert!(!promoted.iter().any(|s| s.name == CALL_DEFERRED_TOOL_NAME));
+        assert!(promoted.iter().all(|s| !s.defer_loading));
+        assert!(promoted.iter().any(|s| s.name == "AskUser"));
+
+        // Anthropic still keeps them deferred natively (0 static schema tokens!)
+        let anthropic_small = effective_tools_for_provider(&small_specs, true);
+        assert!(anthropic_small.iter().all(|s| s.defer_loading));
     }
 }

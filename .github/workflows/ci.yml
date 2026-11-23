@@ -21,8 +21,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Clippy (-D warnings)
+      - name: Check minimal carnot-tools (no tree-sitter)
+        run: cargo check -p carnot-tools --no-default-features
+      - name: Clippy default (pure core)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy all-features (core + all extensions)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -35,9 +39,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run workspace test suite
+      - name: Run workspace test suite (pure core)
         run: cargo test --workspace
+      - name: Run workspace test suite (all extensions)
+        run: cargo test --workspace --all-features
       - name: Prefix invariance & doctor gate
         run: |
-          cargo run --bin carnot -- audit-prefix
-          cargo run --bin carnot -- doctor
+          cargo run --bin carnot --features all-ext -- audit-prefix
+          cargo run --bin carnot --features all-ext -- doctor

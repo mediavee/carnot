@@ -16,8 +16,8 @@ use crate::compat::{
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role,
-    StopReason, ToolResultBlock, Usage,
+    CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ProviderWebCapabilities,
+    ReasoningEffort, Result, Role, StopReason, ToolResultBlock, Usage,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -186,7 +186,7 @@ impl OpenAiResponsesProvider {
             }
         }
 
-        let tools: Vec<Value> = req
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
             .filter(|t| !t.defer_loading)
@@ -199,6 +199,27 @@ impl OpenAiResponsesProvider {
                 })
             })
             .collect();
+
+        let want_native_web = (req.native_web.search || req.native_web.fetch)
+            && (compat.supports_native_web_search.unwrap_or(false)
+                || compat.supports_native_web_fetch.unwrap_or(false));
+        if want_native_web {
+            let mut ws = json!({ "type": "web_search" });
+            if let Some(m) = ws.as_object_mut() {
+                if !req.native_web.allowed_domains.is_empty() {
+                    m.insert(
+                        "filters".into(),
+                        json!({ "allowed_domains": req.native_web.allowed_domains }),
+                    );
+                }
+                if let Some(ref sz) = req.native_web.search_context_size
+                    && matches!(sz.as_str(), "low" | "medium" | "high")
+                {
+                    m.insert("search_context_size".into(), json!(sz));
+                }
+            }
+            tools.push(ws);
+        }
 
         let store = compat.store.unwrap_or(false);
         let mut body = json!({
@@ -256,47 +277,40 @@ impl Provider for OpenAiResponsesProvider {
         &self.spec.provider_id
     }
 
+    fn web_capabilities(&self, model: &str) -> ProviderWebCapabilities {
+        let compat = self.spec.effective_compat(model);
+        ProviderWebCapabilities {
+            native_search: compat.supports_native_web_search.unwrap_or(false),
+            native_fetch: compat.supports_native_web_fetch.unwrap_or(false),
+        }
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<mpsc::Receiver<StreamEvent>>> {
         Box::pin(async move {
-            let url = self
-                .spec
-                .auth
-                .apply_to_url(&format!("{}/responses", self.spec.base_url));
+            let raw_url = format!("{}/responses", self.spec.base_url);
             let body = self.build_body(&request);
-            let mut rb = self
-                .client
-                .post(&url)
-                .header("content-type", "application/json");
-            rb = self.spec.auth.apply_to_request(rb);
-            for (k, v) in &self.spec.headers {
-                rb = rb.header(k.as_str(), v.as_str());
-            }
+            let mut extra_headers: Vec<(String, String)> = Vec::new();
             let compat = self.spec.effective_compat(&request.model);
             if let Some(ref hdr) = compat.session_id_header {
-                rb = rb.header(
-                    hdr.as_str(),
+                extra_headers.push((
+                    hdr.clone(),
                     session_cache_key(&request.prefix_hash, &request.session_id),
-                );
+                ));
             }
 
-            let resp = tokio::time::timeout(HTTP_HEADERS_TIMEOUT, rb.json(&body).send())
-                .await
-                .map_err(|_| CarnotError::Provider {
-                    provider: self.spec.provider_id.clone(),
-                    message: "HTTP response headers timeout (300s)".into(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })?
-                .map_err(|e| CarnotError::Provider {
-                    provider: self.spec.provider_id.clone(),
-                    message: e.without_url().to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })?;
+            let resp = crate::send_authorized_json_post(
+                &self.client,
+                &self.spec,
+                &raw_url,
+                &extra_headers,
+                &body,
+                HTTP_HEADERS_TIMEOUT,
+            )
+            .await?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -433,7 +447,7 @@ impl Provider for OpenAiResponsesProvider {
                                     v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                                 if let Some(item) = v.get("item") {
                                     match item.get("type").and_then(Value::as_str) {
-                                        Some("reasoning") => {
+                                        Some("reasoning" | "web_search_call") => {
                                             opaque_items.push(item.clone());
                                         }
                                         Some("function_call") => {

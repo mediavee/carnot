@@ -796,20 +796,21 @@ impl Usage {
     }
 }
 
-/// Live thermodynamic telemetry for the running session.
+/// Live runtime telemetry for the running session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThermodynamicMetrics {
     pub turns: u64,
     pub requests: u64,
     pub context_auc_tokens: u64,
     pub total_usage: Usage,
-    pub rewinds_applied: u32,
+    pub compactions_applied: u32,
     pub heat_shed_tokens: u64,
     pub cas_handles_created: u64,
     pub cas_bytes_spilled: u64,
-    pub daemon_advisories: u32,
     pub prefix_cache_hits: u64,
     pub prefix_cache_misses: u64,
+    #[serde(default)]
+    pub cache_breaks: u64,
     pub eager_tools_started: u64,
     pub parallel_edits_executed: u64,
     pub edit_attempts: u64,
@@ -870,6 +871,8 @@ pub enum AgentEvent {
         call_id: String,
         tool: String,
         eager: bool,
+        #[serde(default)]
+        input: serde_json::Value,
     },
     ToolUpdate {
         call_id: String,
@@ -880,12 +883,8 @@ pub enum AgentEvent {
         tool: String,
         is_error: bool,
         duration_ms: u64,
-    },
-    RewindApplied {
-        checkpoint_index: usize,
-        shed_tokens: u64,
-        receipt_tokens: u64,
-        expected_net_usd: f64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output_preview: String,
     },
     CompactionApplied {
         mode: String,
@@ -893,7 +892,7 @@ pub enum AgentEvent {
         tokens_after: u64,
         semantic_llm: bool,
     },
-    DaemonAdvisory {
+    ModuleAdvisory {
         signal: String,
         message: String,
     },
@@ -901,6 +900,25 @@ pub enum AgentEvent {
         prefix_hash: String,
         stable: bool,
         note: Option<String>,
+    },
+    /// Emitted when the live runtime prefix-freeze detector observes an unexpected drift in the
+    /// static prefix (`system` + `tools` + `native_web`) or reused conversation message prefix.
+    CacheBreakDetected {
+        turn: u64,
+        reason: String,
+        expected_hash: String,
+        actual_hash: String,
+    },
+    /// Live fleet worker lifecycle/activity telemetry pushed to the coordinator's `EventLog`
+    /// (feeds TUI status bar, `/fleet`, ACP, HTTP SSE, and RPC without polling).
+    WorkerUpdated {
+        worker: String,
+        state: String,
+        model: String,
+        turns: u64,
+        tools_called: u64,
+        cost_usd: f64,
+        activity: String,
     },
     UsageRecorded {
         turn: u64,
@@ -918,9 +936,59 @@ pub enum AgentEvent {
     EventsTruncated {
         dropped_through_seq: u64,
     },
+    /// Interactive tool permission requested by an attached `PermissionBroker` (RPC/HTTP/UI).
+    PermissionRequested {
+        request_id: String,
+        call_id: String,
+        tool: String,
+        input: serde_json::Value,
+    },
+    PermissionResolved {
+        request_id: String,
+        allowed: bool,
+    },
+    /// Structured clarifying question(s) raised by the agent via `AskUser`.
+    UserQuestionRequested {
+        request_id: String,
+        questions: Vec<UserQuestion>,
+    },
+    UserQuestionAnswered {
+        request_id: String,
+    },
     Error {
         message: String,
     },
+}
+
+/// Option for a multiple-choice interactive user question (`AskUser`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Structured interactive question raised by the agent via `AskUser`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestion {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<UserQuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// Answer returned by the user/host for one `UserQuestion`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionAnswer {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// Complete stop reason taxonomy (Anthropic Opus/Sonnet 5.5 + OpenAI).
@@ -948,13 +1016,11 @@ pub enum Profile {
     Carnot,
 }
 
-/// Toggleable switches for every Carnot module.
+/// Toggleable switches for every core Carnot module.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModuleSwitches {
-    pub rewind_receipt: bool,
     pub cas_handles: bool,
     pub adaptive_yield: bool,
-    pub maxwell_daemon: bool,
     pub tx_edit_syntax: bool,
     pub exec_microskills: bool,
     pub prefix_guard: bool,
@@ -963,10 +1029,6 @@ pub struct ModuleSwitches {
     pub sandbox_network: bool,
     pub compaction: bool,
     #[serde(default)]
-    pub web_fetch: bool,
-    #[serde(default)]
-    pub lsp_diagnostics: bool,
-    #[serde(default)]
     pub subagent: bool,
 }
 
@@ -974,10 +1036,8 @@ impl ModuleSwitches {
     pub fn from_profile(profile: Profile) -> Self {
         match profile {
             Profile::Minimal => Self {
-                rewind_receipt: false,
                 cas_handles: false,
                 adaptive_yield: false,
-                maxwell_daemon: false,
                 tx_edit_syntax: false,
                 exec_microskills: false,
                 prefix_guard: true,
@@ -985,15 +1045,11 @@ impl ModuleSwitches {
                 sandbox: false,
                 sandbox_network: false,
                 compaction: true,
-                web_fetch: false,
-                lsp_diagnostics: false,
                 subagent: false,
             },
-            Profile::Standard => Self {
-                rewind_receipt: false,
+            Profile::Standard | Profile::Carnot => Self {
                 cas_handles: true,
                 adaptive_yield: true,
-                maxwell_daemon: false,
                 tx_edit_syntax: true,
                 exec_microskills: true,
                 prefix_guard: true,
@@ -1001,24 +1057,6 @@ impl ModuleSwitches {
                 sandbox: true,
                 sandbox_network: false,
                 compaction: true,
-                web_fetch: false,
-                lsp_diagnostics: false,
-                subagent: false,
-            },
-            Profile::Carnot => Self {
-                rewind_receipt: true,
-                cas_handles: true,
-                adaptive_yield: true,
-                maxwell_daemon: true,
-                tx_edit_syntax: true,
-                exec_microskills: true,
-                prefix_guard: true,
-                eager_read: true,
-                sandbox: true,
-                sandbox_network: false,
-                compaction: true,
-                web_fetch: false,
-                lsp_diagnostics: false,
                 subagent: false,
             },
         }
@@ -1028,6 +1066,50 @@ impl ModuleSwitches {
 impl Default for ModuleSwitches {
     fn default() -> Self {
         Self::from_profile(Profile::Carnot)
+    }
+}
+
+/// Provider-native server-side web tool capabilities (populated declaratively from `providers.json`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderWebCapabilities {
+    /// Provider supports native server-side web search (Anthropic `web_search`, OpenAI Responses
+    /// `web_search`, Gemini `googleSearch`).
+    pub native_search: bool,
+    /// Provider supports native server-side URL fetch (Anthropic `web_fetch`, OpenAI Responses
+    /// `web_search`, Gemini `urlContext`).
+    pub native_fetch: bool,
+}
+
+/// Configuration for provider-native server-side web search & fetch tools.
+///
+/// Pure data in `carnot-core`; populated by `carnot-ext-web` (or directly via `CarnotConfig`)
+/// and serialized cleanly by each protocol adapter in `carnot-ai`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWebConfig {
+    #[serde(default)]
+    pub search: bool,
+    #[serde(default)]
+    pub fetch: bool,
+    /// Maximum server-side web tool invocations per turn (e.g. Anthropic `max_uses`; default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    /// Token cap for server-side fetched pages (e.g. Anthropic `max_content_tokens`; default 12 000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_content_tokens: Option<u32>,
+    /// Optional hostname allowlist (no scheme, e.g. `docs.rs`). Takes precedence over `blocked_domains`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
+    /// Optional hostname blocklist (no scheme, e.g. `example.com`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_domains: Vec<String>,
+    /// Optional search context size hint (`"low"`, `"medium"`, `"high"` — OpenAI Responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_context_size: Option<String>,
+}
+
+impl NativeWebConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.search || self.fetch
     }
 }
 
@@ -1063,11 +1145,11 @@ pub struct CarnotConfig {
     pub compaction_tail_budget_tokens: u64,
     pub cas_spill_threshold_bytes: usize,
     pub cas_preview_max_bytes: usize,
+    /// Redact well-known credentials/tokens BEFORE spilling tool outputs to `.carnot/h/` on disk.
+    #[serde(default = "default_true")]
+    pub redact_cas_secrets: bool,
     pub bash_yield_ms: u64,
     pub bash_max_timeout_ms: u64,
-    pub rewind_min_heat_tokens: u64,
-    pub rewind_max_per_session: u32,
-    pub rewind_assumed_reread_frac: f64,
     pub idle_turn_circuit_breaker: u32,
     pub autonomous_gates: Vec<String>,
     pub modules: ModuleSwitches,
@@ -1087,11 +1169,28 @@ pub struct CarnotConfig {
     /// Must be explicitly opted-in to execute workspace-local `.mcp.json` (blocks MCPoison RCE).
     #[serde(default)]
     pub trust_workspace_mcp: bool,
+    /// Explicit drop-in file extension paths (`--ext <file>`) to load via JSON-RPC stdio (`carnot-ext/1`).
+    #[serde(default)]
+    pub extension_paths: Vec<PathBuf>,
+    /// Must be explicitly opted-in to execute workspace-local `.carnot/extensions/` (blocks repo RCE).
+    #[serde(default)]
+    pub trust_workspace_extensions: bool,
+    /// Provider-native server-side web search / fetch configuration (wired by `carnot-ext-web` or SDK).
+    #[serde(default)]
+    pub native_web: NativeWebConfig,
+    /// Register the deferred interactive `AskUser` tool (`defer_loading: true`, 0 static tokens).
+    /// Enabled automatically on interactive surfaces (ACP, RPC, HTTP, REPL); false in headless `-p`.
+    #[serde(default)]
+    pub enable_ask_user: bool,
     /// Maximum subagent recursion depth (0 = root agent only; default 1 = root -> child).
     #[serde(default)]
     pub subagent_depth: u8,
     pub subagent_max_depth: u8,
     pub subagent_max_cost_usd: f64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_tokens_continuations() -> u8 {
@@ -1134,11 +1233,9 @@ impl CarnotConfig {
             compaction_tail_budget_tokens: default_compaction_tail_budget_tokens(),
             cas_spill_threshold_bytes: 8_192,
             cas_preview_max_bytes: 3_200,
+            redact_cas_secrets: true,
             bash_yield_ms: 60_000,
             bash_max_timeout_ms: 3_600_000,
-            rewind_min_heat_tokens: 80_000,
-            rewind_max_per_session: 12,
-            rewind_assumed_reread_frac: 0.15,
             idle_turn_circuit_breaker: 3,
             autonomous_gates: Vec::new(),
             modules: ModuleSwitches::default(),
@@ -1148,6 +1245,10 @@ impl CarnotConfig {
             skills_dirs: Vec::new(),
             provider_config_paths: Vec::new(),
             trust_workspace_mcp: false,
+            extension_paths: Vec::new(),
+            trust_workspace_extensions: false,
+            native_web: NativeWebConfig::default(),
+            enable_ask_user: false,
             subagent_depth: 0,
             subagent_max_depth: 1,
             subagent_max_cost_usd: 2.0,

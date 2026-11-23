@@ -7,24 +7,18 @@ license.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = ["web"]
-web = ["dep:reqwest", "dep:url", "dep:futures", "dep:webpki-root-certs"]
-
 [dependencies]
 blake3.workspace = true
 carnot-cas.workspace = true
 carnot-core.workspace = true
 carnot-sandbox.workspace = true
 carnot-tools.workspace = true
-futures = { workspace = true, optional = true }
 regex.workspace = true
-reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-url = { workspace = true, optional = true }
+
+[dev-dependencies]
 uuid.workspace = true
-webpki-root-certs = { workspace = true, optional = true }

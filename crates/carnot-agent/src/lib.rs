@@ -4,13 +4,12 @@
 //!   - Opus I4 Lossless monotone-`seq` `EventLog` (immune to slow-reader `Lagged` disconnects)
 //!   - Mid-turn `steer()` injection preserving `tool_result`-first ordering
 //!   - Safe `StopReason` (`MaxTokens`, `Refusal`, `ContextWindowExceeded`) & malformed tool-JSON guards
-//!   - Module lifecycle orchestration, automatic Rewind-Receipt, and live thermodynamic telemetry
+//!   - Module lifecycle orchestration and live thermodynamic telemetry
 
 pub mod compaction;
 pub mod event_log;
 mod scheduler;
 mod segment;
-pub mod subagent;
 pub mod tool_search;
 
 use crate::compaction::{
@@ -21,16 +20,17 @@ use crate::scheduler::{ActiveEager, EagerLaunch, ScheduledCall, partition_confli
 use crate::segment::SegmentTracker;
 
 pub use event_log::{EventLog, EventStream};
-pub use subagent::SubagentModule;
 
 use carnot_ai::{Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, Message, ReasoningEffort,
-    Result, Role, StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolResultBlock,
-    Usage,
+    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, Message, NativeWebConfig,
+    ReasoningEffort, Result, Role, StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput,
+    ToolResultBlock, ToolSpec, Usage,
 };
 use carnot_ext::{
     BoundaryAction, Module, PermissionBroker, ToolGateDecision, TurnBoundarySnapshot,
+    UserQuestionBroker,
+    ask_user::{AskUserModule, SharedQuestionBroker},
     prefix_guard::static_system_prompt,
 };
 use carnot_session::SessionStore;
@@ -38,9 +38,67 @@ use carnot_tools::ToolRegistry;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
+
+pub(crate) fn add_cost_micros(counter: &AtomicU64, cost_usd: f64) {
+    if cost_usd.is_finite() && cost_usd > 0.0 {
+        let micros = (cost_usd * 1_000_000.0).round() as u64;
+        if micros > 0 {
+            counter.fetch_add(micros, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Snapshot captured from a parent `Agent` to construct a prompt-cache-warm forked child.
+#[derive(Debug, Clone)]
+pub struct ForkSnapshot {
+    pub messages: Vec<Arc<Message>>,
+    pub checkpoint_index: Option<usize>,
+    pub cache_key_id: String,
+    pub tool_specs: Vec<ToolSpec>,
+    pub native_web: NativeWebConfig,
+}
+
+#[derive(Debug, Clone)]
+struct PrefixFingerprint {
+    provider: String,
+    model: String,
+    static_hash: String,
+    msg_count: usize,
+    msg_prefix_hash: String,
+}
+
+fn compute_wire_static_hash(
+    static_system_prompt: &str,
+    wire_tools: &[ToolSpec],
+    native_web: &NativeWebConfig,
+) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(static_system_prompt.as_bytes());
+    h.update(&[0u8]);
+    if let Ok(tb) = serde_json::to_vec(wire_tools) {
+        h.update(&tb);
+    }
+    h.update(&[0u8]);
+    if let Ok(nb) = serde_json::to_vec(native_web) {
+        h.update(&nb);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn compute_messages_prefix_hash(messages: &[Arc<Message>]) -> String {
+    let mut h = blake3::Hasher::new();
+    for m in messages {
+        if let Ok(b) = serde_json::to_vec(m.as_ref()) {
+            h.update(&(b.len() as u64).to_le_bytes());
+            h.update(&b);
+        }
+    }
+    h.finalize().to_hex().to_string()
+}
 
 /// Output of a completed `Agent::prompt()` run.
 #[derive(Debug, Clone)]
@@ -68,6 +126,7 @@ pub struct Agent {
     modules: Vec<Arc<dyn Module>>,
     session: Mutex<SessionStore>,
     metrics: Mutex<ThermodynamicMetrics>,
+    total_cost_micros: Arc<AtomicU64>,
     events: Arc<EventLog>,
     run_lock: Mutex<()>,
     cancel_current: Mutex<CancellationToken>,
@@ -75,9 +134,15 @@ pub struct Agent {
     raw_user_goal: Mutex<Option<String>>,
     user_instructions: Mutex<Vec<String>>,
     pending_steers: Mutex<Vec<String>>,
+    pending_system_notes: Mutex<Vec<String>>,
+    steer_notify: Arc<Notify>,
     pending_follow_ups: Mutex<VecDeque<String>>,
     permission_broker: Mutex<Option<Arc<dyn PermissionBroker>>>,
+    question_broker: SharedQuestionBroker,
     deferred_server_descriptions: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    /// Live runtime prefix-freeze fingerprint checked before every provider request (< 5 µs)
+    /// to detect unexpected static-prefix or reused-history cache breaks immediately.
+    last_prefix_state: Mutex<Option<PrefixFingerprint>>,
 }
 
 impl Agent {
@@ -85,9 +150,13 @@ impl Agent {
         config: CarnotConfig,
         provider: Arc<dyn Provider>,
         mut tools: ToolRegistry,
-        modules: Vec<Arc<dyn Module>>,
+        mut modules: Vec<Arc<dyn Module>>,
         persist_session: bool,
     ) -> Result<Self> {
+        let question_broker: SharedQuestionBroker = Arc::new(Mutex::new(None));
+        if config.enable_ask_user {
+            modules.push(Arc::new(AskUserModule::new(Arc::clone(&question_broker))));
+        }
         for m in &modules {
             for t in m.tools() {
                 tools.register(t);
@@ -107,13 +176,22 @@ impl Agent {
             provider.supports_native_tool_search(),
         );
         let session_dir = persist_session.then_some(config.session_dir.as_path());
-        let session = SessionStore::create(
+        let session = SessionStore::create_with_workspace(
             session_dir,
+            Some(config.workspace_root.clone()),
             config.model.clone(),
             static_system_prompt().to_string(),
             tool_specs,
         )?;
-        Self::from_session(config, provider, tools, modules, session, false)
+        Self::from_session(
+            config,
+            provider,
+            tools,
+            modules,
+            session,
+            false,
+            question_broker,
+        )
     }
 
     /// Resumes an existing crash-safe JSONL v2 session from disk (`carnot --resume` & ACP `session/load`).
@@ -122,8 +200,12 @@ impl Agent {
         config: CarnotConfig,
         provider: Arc<dyn Provider>,
         mut tools: ToolRegistry,
-        modules: Vec<Arc<dyn Module>>,
+        mut modules: Vec<Arc<dyn Module>>,
     ) -> Result<Self> {
+        let question_broker: SharedQuestionBroker = Arc::new(Mutex::new(None));
+        if config.enable_ask_user {
+            modules.push(Arc::new(AskUserModule::new(Arc::clone(&question_broker))));
+        }
         for m in &modules {
             for t in m.tools() {
                 tools.register(t);
@@ -136,7 +218,131 @@ impl Agent {
         }
         let session = SessionStore::load(session_path)?;
         let already_started = !session.active_messages().is_empty();
-        Self::from_session(config, provider, tools, modules, session, already_started)
+        Self::from_session(
+            config,
+            provider,
+            tools,
+            modules,
+            session,
+            already_started,
+            question_broker,
+        )
+    }
+
+    /// Forks a saved JSONL v2 session from disk into a brand-new session (`carnot --resume <id> --fork`),
+    /// leaving the original session file untouched while preserving the warm prompt-cache prefix.
+    pub fn resume_forked(
+        session_path: &Path,
+        config: CarnotConfig,
+        provider: Arc<dyn Provider>,
+        mut tools: ToolRegistry,
+        mut modules: Vec<Arc<dyn Module>>,
+        persist_session: bool,
+    ) -> Result<Self> {
+        let question_broker: SharedQuestionBroker = Arc::new(Mutex::new(None));
+        if config.enable_ask_user {
+            modules.push(Arc::new(AskUserModule::new(Arc::clone(&question_broker))));
+        }
+        for m in &modules {
+            for t in m.tools() {
+                tools.register(t);
+            }
+        }
+        let deferred = tools.deferred_tools();
+        if !deferred.is_empty() {
+            tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
+            tools.register(Arc::new(tool_search::CallDeferredTool::new(&deferred)));
+        }
+        let original = SessionStore::load_readonly(session_path)?;
+        let session_dir = persist_session.then_some(config.session_dir.as_path());
+        let forked = original.fork(session_dir)?;
+        let already_started = !forked.active_messages().is_empty();
+        Self::from_session(
+            config,
+            provider,
+            tools,
+            modules,
+            forked,
+            already_started,
+            question_broker,
+        )
+    }
+
+    /// Creates a new `Agent` initialized from a parent conversation snapshot (zero-copy `Arc<Message>`
+    /// fork for prompt-cache-warm `Subagent` execution or programmatic branching).
+    pub fn new_forked(
+        config: CarnotConfig,
+        provider: Arc<dyn Provider>,
+        tools: ToolRegistry,
+        modules: Vec<Arc<dyn Module>>,
+        persist_session: bool,
+        parent_messages: &[Arc<Message>],
+        checkpoint_index: Option<usize>,
+    ) -> Result<Self> {
+        Self::new_forked_with_cache_key(
+            config,
+            provider,
+            tools,
+            modules,
+            persist_session,
+            parent_messages,
+            checkpoint_index,
+            None,
+        )
+    }
+
+    /// Creates a forked `Agent` that also inherits the parent's `cache_key_id` so OpenAI
+    /// `prompt_cache_key` shards stay hot on the forked branch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_forked_with_cache_key(
+        config: CarnotConfig,
+        provider: Arc<dyn Provider>,
+        mut tools: ToolRegistry,
+        mut modules: Vec<Arc<dyn Module>>,
+        persist_session: bool,
+        parent_messages: &[Arc<Message>],
+        checkpoint_index: Option<usize>,
+        inherited_cache_key_id: Option<String>,
+    ) -> Result<Self> {
+        let question_broker: SharedQuestionBroker = Arc::new(Mutex::new(None));
+        if config.enable_ask_user {
+            modules.push(Arc::new(AskUserModule::new(Arc::clone(&question_broker))));
+        }
+        for m in &modules {
+            for t in m.tools() {
+                tools.register(t);
+            }
+        }
+        let deferred = tools.deferred_tools();
+        if !deferred.is_empty() {
+            tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
+            tools.register(Arc::new(tool_search::CallDeferredTool::new(&deferred)));
+        }
+        let tool_specs = tool_search::effective_tools_for_provider(
+            &tools.specs(),
+            provider.supports_native_tool_search(),
+        );
+        let session_dir = persist_session.then_some(config.session_dir.as_path());
+        let session = SessionStore::from_forked_snapshot_with_cache_key(
+            session_dir,
+            Some(config.workspace_root.clone()),
+            config.model.clone(),
+            static_system_prompt().to_string(),
+            tool_specs,
+            parent_messages,
+            checkpoint_index,
+            inherited_cache_key_id,
+        )?;
+        let already_started = !session.active_messages().is_empty();
+        Self::from_session(
+            config,
+            provider,
+            tools,
+            modules,
+            session,
+            already_started,
+            question_broker,
+        )
     }
 
     fn from_session(
@@ -144,12 +350,37 @@ impl Agent {
         provider: Arc<dyn Provider>,
         tools: ToolRegistry,
         modules: Vec<Arc<dyn Module>>,
-        session: SessionStore,
+        mut session: SessionStore,
         turn1_already_injected: bool,
+        question_broker: SharedQuestionBroker,
     ) -> Result<Self> {
         let (hydrated_goal, hydrated_followups) =
             hydrate_anchors_from_session(session.active_messages());
         let events = Arc::new(EventLog::new());
+
+        // Detect tool-set drift on `--resume` / `--resume --fork` (e.g. session originally ran with
+        // `--web` and was resumed without it): refresh `prefix_hash` so `prompt_cache_key` stays
+        // accurate and emit `PrefixAudit { stable: false }`.
+        let live_wire_tools = tool_search::effective_tools_for_provider(
+            &tools.specs(),
+            provider.supports_native_tool_search(),
+        );
+        if let Ok(live_hash) = carnot_session::compute_static_prefix_hash(
+            &session.static_system_prompt,
+            &live_wire_tools,
+        ) && live_hash != session.prefix_hash
+        {
+            let old_hash = session.prefix_hash.clone();
+            session.prefix_hash = live_hash.clone();
+            events.push(AgentEvent::PrefixAudit {
+                prefix_hash: live_hash,
+                stable: false,
+                note: Some(format!(
+                    "session resumed with a different tool set than saved header ({old_hash}); provider prompt cache will cold-start"
+                )),
+            });
+        }
+
         events.push(AgentEvent::SessionStarted {
             session_id: session.session_id.clone(),
             model: config.model.clone(),
@@ -171,6 +402,7 @@ impl Agent {
             modules,
             session: Mutex::new(session),
             metrics: Mutex::new(ThermodynamicMetrics::default()),
+            total_cost_micros: Arc::new(AtomicU64::new(0)),
             events,
             run_lock: Mutex::new(()),
             cancel_current: Mutex::new(CancellationToken::new()),
@@ -178,9 +410,13 @@ impl Agent {
             raw_user_goal: Mutex::new(hydrated_goal),
             user_instructions: Mutex::new(hydrated_followups),
             pending_steers: Mutex::new(Vec::new()),
+            pending_system_notes: Mutex::new(Vec::new()),
+            steer_notify: Arc::new(Notify::new()),
             pending_follow_ups: Mutex::new(VecDeque::new()),
             permission_broker: Mutex::new(None),
+            question_broker,
             deferred_server_descriptions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            last_prefix_state: Mutex::new(None),
         })
     }
 
@@ -212,6 +448,7 @@ impl Agent {
         *self.turn1_injected.lock().await = has_msgs;
         *self.raw_user_goal.lock().await = hydrated_goal;
         *self.user_instructions.lock().await = hydrated_followups;
+        *self.last_prefix_state.lock().await = None;
         self.tools.reset_read_tracker();
         Ok(sid)
     }
@@ -221,9 +458,166 @@ impl Agent {
         self.session.lock().await.active_messages().to_vec()
     }
 
-    /// Attaches an interactive `PermissionBroker` (e.g. ACP `session/request_permission`).
+    /// Returns a sanitized zero-copy snapshot `(active_messages, checkpoint_index)` safe to seed
+    /// a forked session or forked subagent — even while a parent tool call is in flight.
+    pub async fn snapshot_for_fork(&self) -> (Vec<Arc<Message>>, Option<usize>) {
+        let s = self.session.lock().await;
+        let msgs = SessionStore::sanitize_fork_messages(s.active_messages());
+        let cp = s.checkpoint_index().filter(|&idx| idx < msgs.len());
+        (msgs, cp)
+    }
+
+    /// Returns a full prompt-cache-warm fork snapshot including `cache_key_id`, canonical tool
+    /// specs, and `native_web` config so forked subagents share a 100% byte-identical wire prefix
+    /// with the coordinator even when optional extensions or MCP servers are active.
+    pub async fn fork_snapshot_with_prefix(&self) -> ForkSnapshot {
+        let s = self.session.lock().await;
+        let messages = SessionStore::sanitize_fork_messages(s.active_messages());
+        let checkpoint_index = s.checkpoint_index().filter(|&idx| idx < messages.len());
+        let cache_key_id = s.cache_key_id.clone();
+        drop(s);
+        ForkSnapshot {
+            messages,
+            checkpoint_index,
+            cache_key_id,
+            tool_specs: self.tools.specs(),
+            native_web: self.config.native_web.clone(),
+        }
+    }
+
+    /// Forks this live session into a brand-new session ID (persisting a new JSONL file if the
+    /// current session is persisted) and switches this `Agent` onto the fork while leaving the
+    /// original session file untouched on disk.
+    pub async fn fork_session(&self) -> Result<(String, Option<std::path::PathBuf>)> {
+        let Ok(_guard) = self.run_lock.try_lock() else {
+            return Err(CarnotError::Session(
+                "agent is busy running a prompt; cancel first before forking session".into(),
+            ));
+        };
+        let (forked, new_id, new_path, new_prefix, cur_model, sanitized_shrank) = {
+            let s = self.session.lock().await;
+            let prev_len = s.active_messages().len();
+            let dir = s.path.as_ref().and_then(|p| p.parent());
+            let forked = s.fork(dir)?;
+            let shrank = forked.active_messages().len() != prev_len;
+            let new_id = forked.session_id.clone();
+            let new_path = forked.path.clone();
+            let new_prefix = forked.prefix_hash.clone();
+            let cur_model = self.runtime.lock().await.model.clone();
+            (forked, new_id, new_path, new_prefix, cur_model, shrank)
+        };
+        *self.session.lock().await = forked;
+        if sanitized_shrank {
+            *self.last_prefix_state.lock().await = None;
+        }
+        self.events.push(AgentEvent::SessionStarted {
+            session_id: new_id.clone(),
+            model: cur_model,
+            prefix_hash: new_prefix,
+        });
+        Ok((new_id, new_path))
+    }
+
+    /// Returns the currently active `Provider` (reflects live `/model` switches).
+    pub async fn current_provider(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.runtime.lock().await.provider)
+    }
+
+    /// Attaches an interactive `PermissionBroker` (e.g. ACP `session/request_permission`, RPC/HTTP).
     pub async fn set_permission_broker(&self, broker: Arc<dyn PermissionBroker>) {
         *self.permission_broker.lock().await = Some(broker);
+    }
+
+    /// Detaches any active `PermissionBroker` (returns to auto-allow outside `PolicyGuard`/hooks).
+    pub async fn clear_permission_broker(&self) {
+        *self.permission_broker.lock().await = None;
+    }
+
+    /// Returns the currently attached `PermissionBroker`, if any (used by child workers so they
+    /// delegate approvals to the parent broker instead of bypassing user consent!).
+    pub async fn permission_broker(&self) -> Option<Arc<dyn PermissionBroker>> {
+        self.permission_broker.lock().await.clone()
+    }
+
+    /// Returns a clone of the current run's `CancellationToken` so module hooks (such as reactive
+    /// fleet waiting in `on_turn_boundary`) cancel immediately on `Esc` / `abort()`.
+    pub async fn current_cancel_token(&self) -> CancellationToken {
+        self.cancel_current.lock().await.clone()
+    }
+
+    /// Rolls up external cost (e.g. from background/orchestrated child workers) into this agent's
+    /// cumulative session metrics and lock-free atomic counter so `max_cost_usd` and fleet budgets
+    /// reflect true combined spend.
+    pub async fn record_external_cost(&self, cost_usd: f64) {
+        if cost_usd.is_finite() && cost_usd > 0.0 {
+            self.metrics.lock().await.total_usage.cost_usd += cost_usd;
+            add_cost_micros(&self.total_cost_micros, cost_usd);
+        }
+    }
+
+    /// Returns a shared handle to this agent's monotonic micro-dollar total cost counter
+    /// (includes own turns, compaction calls, and rolled-up external worker costs).
+    pub fn total_cost_micros_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.total_cost_micros)
+    }
+
+    /// Returns a shared `Notify` fired whenever a human `steer()` is queued, allowing reactive
+    /// turn-boundary waits (e.g. fleet orchestration) to wake immediately on user intervention.
+    pub fn steer_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.steer_notify)
+    }
+
+    /// True if at least one human `steer()` is waiting to be delivered.
+    pub async fn has_pending_steers(&self) -> bool {
+        !self.pending_steers.lock().await.is_empty()
+    }
+
+    /// Queues an untrusted/internal system note (such as a worker update or fleet heartbeat)
+    /// delivered as `Message::system_note` without user-steer authority or compaction pinning.
+    pub async fn queue_system_note(&self, note: impl Into<String>) {
+        let msg = note.into();
+        if !msg.trim().is_empty() {
+            self.pending_system_notes.lock().await.push(msg);
+        }
+    }
+
+    /// Pops one queued steer or follow-up message if present (used by worker lifecycle loops so
+    /// messages queued right as a turn finishes are never stranded while transitioning to idle).
+    pub async fn take_pending_wakeup(&self) -> Option<String> {
+        {
+            let mut steers = self.pending_steers.lock().await;
+            if !steers.is_empty() {
+                return Some(std::mem::take(&mut *steers).join("\n"));
+            }
+        }
+        self.pending_follow_ups.lock().await.pop_front()
+    }
+
+    /// Returns `(eager_tool_names, deferred_tool_names)` registered on this agent.
+    pub fn tool_names(&self) -> (Vec<String>, Vec<String>) {
+        let mut eager = Vec::new();
+        let mut deferred = Vec::new();
+        for s in self.tools.specs() {
+            if s.defer_loading {
+                deferred.push(s.name);
+            } else {
+                eager.push(s.name);
+            }
+        }
+        eager.sort();
+        deferred.sort();
+        (eager, deferred)
+    }
+
+    /// Attaches an interactive `UserQuestionBroker` for the deferred `AskUser` tool.
+    pub async fn set_question_broker(&self, broker: Arc<dyn UserQuestionBroker>) {
+        *self.question_broker.lock().await = Some(broker);
+    }
+
+    /// Pushes an external structured event (e.g. `PermissionRequested`, `UserQuestionRequested`)
+    /// into this agent's lossless ring-buffered `EventLog`.
+    pub fn emit_event(&self, event: AgentEvent) {
+        self.events.push(event);
     }
 
     /// True if a `prompt()` run is currently active (used by HTTP server to return 409 Conflict — N5).
@@ -252,6 +646,7 @@ impl Agent {
         let msg = message.into();
         if !msg.trim().is_empty() {
             self.pending_steers.lock().await.push(msg);
+            self.steer_notify.notify_waiters();
         }
     }
 
@@ -286,6 +681,8 @@ impl Agent {
         if let Some(mo) = max_output_tokens {
             rt.max_output_tokens = mo;
         }
+        drop(rt);
+        *self.last_prefix_state.lock().await = None;
         Ok(())
     }
 
@@ -354,7 +751,7 @@ impl Agent {
         let _run_guard = self.run_lock.lock().await;
         let (eff_cfg, eff_provider) = self.effective_config_and_provider().await;
         let seg = SegmentTracker::default();
-        execute_compaction(
+        let res = execute_compaction(
             CompactionMode::Manual,
             &eff_cfg,
             &eff_provider,
@@ -362,6 +759,7 @@ impl Agent {
             &self.modules,
             &self.session,
             &self.metrics,
+            &self.total_cost_micros,
             &self.events,
             &self.raw_user_goal,
             &self.user_instructions,
@@ -369,7 +767,11 @@ impl Agent {
             focus,
             CancellationToken::new(),
         )
-        .await
+        .await;
+        if res.is_ok() {
+            *self.last_prefix_state.lock().await = None;
+        }
+        res
     }
 
     async fn run_before_gates(
@@ -417,11 +819,44 @@ impl Agent {
         }
     }
 
-    /// Runs a user prompt through the full multi-turn agent loop until completion or halt.
+    /// Runs a user text prompt through the full multi-turn agent loop until completion or halt.
     /// Serialized per agent (N5) and guaranteed to always emit a terminal `RunSettled` or `Error` event (N8).
     pub async fn prompt(&self, user_prompt: impl Into<String>) -> Result<RunOutcome> {
+        self.prompt_with_cancel(user_prompt, CancellationToken::new())
+            .await
+    }
+
+    /// Runs a user text prompt bound to an external `CancellationToken` (e.g. a worker lifecycle
+    /// or parent tool cancellation token) so cancellation fired right before the run starts is
+    /// never lost.
+    pub async fn prompt_with_cancel(
+        &self,
+        user_prompt: impl Into<String>,
+        external_cancel: CancellationToken,
+    ) -> Result<RunOutcome> {
+        self.prompt_blocks_with_cancel(
+            vec![ContentBlock::Text {
+                text: user_prompt.into(),
+            }],
+            external_cancel,
+        )
+        .await
+    }
+
+    /// Runs a multimodal user prompt (text + images) through the full multi-turn agent loop.
+    pub async fn prompt_blocks(&self, user_blocks: Vec<ContentBlock>) -> Result<RunOutcome> {
+        self.prompt_blocks_with_cancel(user_blocks, CancellationToken::new())
+            .await
+    }
+
+    /// Runs a multimodal user prompt bound to an external `CancellationToken`.
+    pub async fn prompt_blocks_with_cancel(
+        &self,
+        user_blocks: Vec<ContentBlock>,
+        external_cancel: CancellationToken,
+    ) -> Result<RunOutcome> {
         let _run_guard = self.run_lock.lock().await;
-        match self.prompt_inner(user_prompt.into()).await {
+        match self.prompt_inner(user_blocks, external_cancel).await {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
                 self.events.push(AgentEvent::Error {
@@ -432,9 +867,31 @@ impl Agent {
         }
     }
 
-    async fn prompt_inner(&self, mut initial_text: String) -> Result<RunOutcome> {
-        let cancel = CancellationToken::new();
+    async fn prompt_inner(
+        &self,
+        user_blocks: Vec<ContentBlock>,
+        external_cancel: CancellationToken,
+    ) -> Result<RunOutcome> {
+        let cancel = external_cancel.child_token();
         *self.cancel_current.lock().await = cancel.clone();
+        if cancel.is_cancelled() {
+            return Err(CarnotError::Cancelled);
+        }
+
+        // Extract text portion for Tier-0 sacred objective anchor (preserving any image blocks intact!)
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut extra_blocks: Vec<ContentBlock> = Vec::new();
+        for b in user_blocks {
+            match b {
+                ContentBlock::Text { text } => {
+                    if !text.is_empty() {
+                        text_parts.push(text);
+                    }
+                }
+                other => extra_blocks.push(other),
+            }
+        }
+        let mut initial_text = text_parts.join("\n");
 
         // Capture full verbatim user objective BEFORE Turn-1 `[workspace-facts]`/`AGENTS.md` injection
         // (and track any subsequent follow-up prompts so compaction NEVER drops user requirements!)
@@ -463,22 +920,43 @@ impl Agent {
                         turn1_blocks.push(ctx);
                     }
                 }
-                let deferred_descs = self
-                    .deferred_server_descriptions
+                let supports_native_ts = self
+                    .runtime
                     .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
-                if let Some(dir) = tool_search::format_deferred_tools_directory(
-                    &self.tools.deferred_tools(),
-                    &deferred_descs,
+                    .await
+                    .provider
+                    .supports_native_tool_search();
+                if !tool_search::should_promote_deferred_directly(
+                    &self.tools.specs(),
+                    supports_native_ts,
                 ) {
-                    turn1_blocks.push(dir);
+                    let deferred_descs = self
+                        .deferred_server_descriptions
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    if let Some(dir) = tool_search::format_deferred_tools_directory(
+                        &self.tools.deferred_tools(),
+                        &deferred_descs,
+                    ) {
+                        turn1_blocks.push(dir);
+                    }
                 }
                 if !turn1_blocks.is_empty() {
-                    initial_text = format!("{}\n\n{initial_text}", turn1_blocks.join("\n\n"));
+                    if initial_text.is_empty() {
+                        initial_text = turn1_blocks.join("\n\n");
+                    } else {
+                        initial_text = format!("{}\n\n{initial_text}", turn1_blocks.join("\n\n"));
+                    }
                 }
             }
         }
+
+        let mut initial_content: Vec<ContentBlock> = Vec::with_capacity(1 + extra_blocks.len());
+        if !initial_text.is_empty() || extra_blocks.is_empty() {
+            initial_content.push(ContentBlock::Text { text: initial_text });
+        }
+        initial_content.extend(extra_blocks);
 
         // Cold-cache opportunistic tool-result pruning (inspired by Hermes):
         // ONLY when the provider's rolling prompt cache is ALREADY expired (zero cache breaks,
@@ -507,6 +985,7 @@ impl Agent {
             };
             if reclaimed > 0 {
                 self.tools.reset_read_tracker();
+                *self.last_prefix_state.lock().await = None;
                 self.metrics.lock().await.heat_shed_tokens += (reclaimed as u64) / 4;
             }
         }
@@ -514,7 +993,10 @@ impl Agent {
         // Record user turn and mark Checkpoint C at the user boundary
         {
             let mut s = self.session.lock().await;
-            s.push_message(Message::user_text(initial_text))?;
+            s.push_message(Message {
+                role: Role::User,
+                content: initial_content,
+            })?;
             s.mark_checkpoint("user_turn")?;
         }
 
@@ -526,6 +1008,8 @@ impl Agent {
         let mut last_compaction_turn: Option<u64> = None;
         let mut consecutive_stream_retries: u32 = 0;
         let mut consecutive_max_tokens: u8 = 0;
+        let mut consecutive_pause_turns: u8 = 0;
+        let mut idle_turn_streak: u32 = 0;
         let mut empty_reply_retried = false;
 
         for _step in 0..self.config.max_turns {
@@ -571,16 +1055,95 @@ impl Agent {
                     static_system_prompt: proj.static_system_prompt,
                     tools: wire_tools,
                     prefix_hash: proj.prefix_hash,
-                    session_id: s.session_id.clone(),
+                    session_id: proj.cache_key_id,
                     messages: proj.messages,
                     checkpoint_index: proj.checkpoint_index,
                     cache_ttl: eff_cfg.cache_ttl,
                     effort: eff_cfg.effort,
                     max_output_tokens: eff_cfg.max_output_tokens,
                     skip_tail_cache_write: false,
+                    native_web: eff_cfg.native_web.clone(),
                 };
                 (req, turn_num, ctx_est)
             };
+
+            // Live runtime prefix-freeze verification (< 5 µs BLAKE3): catches any unexpected
+            // mutation in `system + tools + native_web` OR in previously sent message prefixes!
+            {
+                let prov_name = active_provider.name().to_string();
+                let static_hash = compute_wire_static_hash(
+                    &req.static_system_prompt,
+                    &req.tools,
+                    &req.native_web,
+                );
+                let mut prev_guard = self.last_prefix_state.lock().await;
+                let mut detected_break: Option<(String, String, String)> = None;
+                if let Some(ref prev) = *prev_guard
+                    && prev.provider == prov_name
+                    && prev.model == req.model
+                {
+                    if prev.static_hash != static_hash {
+                        detected_break = Some((
+                            "static prefix (system/tools/native_web) mutated mid-session".into(),
+                            prev.static_hash.clone(),
+                            static_hash.clone(),
+                        ));
+                    } else if req.messages.len() < prev.msg_count {
+                        detected_break = Some((
+                            format!(
+                                "conversation history shrank unexpectedly ({} -> {} messages) without compaction",
+                                prev.msg_count,
+                                req.messages.len()
+                            ),
+                            prev.msg_prefix_hash.clone(),
+                            compute_messages_prefix_hash(&req.messages),
+                        ));
+                    } else {
+                        let reused_hash =
+                            compute_messages_prefix_hash(&req.messages[..prev.msg_count]);
+                        if reused_hash != prev.msg_prefix_hash {
+                            detected_break = Some((
+                                format!(
+                                    "reused conversation prefix (first {} messages) mutated mid-session",
+                                    prev.msg_count
+                                ),
+                                prev.msg_prefix_hash.clone(),
+                                reused_hash,
+                            ));
+                        }
+                    }
+                } else {
+                    self.events.push(AgentEvent::PrefixAudit {
+                        prefix_hash: static_hash.clone(),
+                        stable: true,
+                        note: None,
+                    });
+                }
+                if let Some((reason, expected_hash, actual_hash)) = detected_break {
+                    self.metrics.lock().await.cache_breaks += 1;
+                    tracing::warn!(
+                        target: "carnot::cache",
+                        turn = turn_num,
+                        reason = %reason,
+                        expected = %expected_hash,
+                        actual = %actual_hash,
+                        "unexpected_cache_break_detected"
+                    );
+                    self.events.push(AgentEvent::CacheBreakDetected {
+                        turn: turn_num,
+                        reason,
+                        expected_hash,
+                        actual_hash,
+                    });
+                }
+                *prev_guard = Some(PrefixFingerprint {
+                    provider: prov_name,
+                    model: req.model.clone(),
+                    static_hash,
+                    msg_count: req.messages.len(),
+                    msg_prefix_hash: compute_messages_prefix_hash(&req.messages),
+                });
+            }
 
             self.events.push(AgentEvent::TurnStart {
                 turn: turn_num,
@@ -655,6 +1218,7 @@ impl Agent {
                                         call_id: id.clone(),
                                         tool: name.clone(),
                                         eager: true,
+                                        input: eff_input.clone(),
                                     });
                                     self.metrics.lock().await.eager_tools_started += 1;
                                     let c = cancel.clone();
@@ -770,6 +1334,7 @@ impl Agent {
                     m.prefix_cache_misses += 1;
                 }
                 m.total_usage.add_assign(&usage);
+                add_cost_micros(&self.total_cost_micros, usage.cost_usd);
                 tracing::info!(
                     target: "carnot::cache",
                     turn = turn_num,
@@ -1026,6 +1591,7 @@ impl Agent {
                             call_id: call.call_id.clone(),
                             tool: call.tool_name.clone(),
                             eager: false,
+                            input: call.effective_input.clone(),
                         });
                         let tool_opt = self.tools.get(&call.tool_name);
                         let c = cancel.clone();
@@ -1082,11 +1648,13 @@ impl Agent {
                     self.record_segment_facts(&tool_name, &effective_input, &out, &mut seg)
                         .await;
 
+                    let output_preview = clip_utf8_preview(&out.text_only(), 8_192);
                     self.events.push(AgentEvent::ToolEnd {
                         call_id: call_id.clone(),
                         tool: tool_name,
                         is_error: out.is_error,
                         duration_ms: dur_ms,
+                        output_preview,
                     });
 
                     result_blocks.push(ContentBlock::ToolResult {
@@ -1118,6 +1686,16 @@ impl Agent {
                     role: Role::User,
                     content: result_blocks,
                 })?;
+
+                // If aborted mid-tool, paired `tool_result`s are now safely persisted — exit cleanly
+                // without firing `Stop` / turn-boundary hooks on an aborted turn!
+                if cancel.is_cancelled() {
+                    self.events.push(AgentEvent::TurnEnd {
+                        turn: turn_num,
+                        stop_reason: StopReason::Aborted,
+                    });
+                    return Err(CarnotError::Cancelled);
+                }
             }
 
             self.events.push(AgentEvent::TurnEnd {
@@ -1125,79 +1703,65 @@ impl Agent {
                 stop_reason,
             });
 
-            // Evaluate turn-boundary modules (Maxwell's Daemon + Rewind-Receipt)
-            let (tokens_since_cp, total_ctx_est) = {
-                let s = self.session.lock().await;
-                (
-                    s.tokens_since_checkpoint(),
-                    s.project_context().estimated_tokens(),
-                )
-            };
-
-            let snap = TurnBoundarySnapshot {
-                turn_index: turn_num,
-                tokens_since_checkpoint: tokens_since_cp,
-                total_context_tokens: total_ctx_est,
-                had_edit_in_segment: seg.had_edit,
-                had_tool_call_in_turn: had_tools,
-                verified_green_command: seg.verified_green_cmd.clone(),
-                verified_green_summary: seg.verified_green_summary.clone(),
-                files_read_in_segment: seg.files_read.clone(),
-                files_edited_in_segment: seg.files_edited.clone(),
-                handles_created_in_segment: seg.handles_created.clone(),
-                last_assistant_text: last_text,
-                failed_attempts_summary: seg.failed_attempts.clone(),
-            };
-
+            // Built-in lightweight idle-turn circuit breaker (prevents runaway autonomous/gate loops).
+            // Never count provider server-side `PauseTurn` (e.g. native web_search/web_fetch loops) as idle!
             let mut should_halt = false;
-            for m in &self.modules {
-                match m.on_turn_boundary(&snap).await? {
-                    BoundaryAction::Continue => {}
-                    BoundaryAction::AppendAdvisory { signal, message } => {
-                        self.metrics.lock().await.daemon_advisories += 1;
-                        self.session
-                            .lock()
-                            .await
-                            .push_message(Message::system_note(message.clone()))?;
-                        self.events
-                            .push(AgentEvent::DaemonAdvisory { signal, message });
+            if stop_reason == StopReason::PauseTurn {
+                consecutive_pause_turns = consecutive_pause_turns.saturating_add(1);
+                if consecutive_pause_turns > 8 {
+                    halted_reason = Some(format!(
+                        "server pause_turn cap reached ({consecutive_pause_turns} consecutive continuations)"
+                    ));
+                    should_halt = true;
+                }
+            } else {
+                consecutive_pause_turns = 0;
+                if !had_tools {
+                    idle_turn_streak += 1;
+                    if self.config.idle_turn_circuit_breaker > 0
+                        && idle_turn_streak >= self.config.idle_turn_circuit_breaker
+                    {
+                        halted_reason = Some(format!(
+                            "idle circuit breaker triggered ({idle_turn_streak} consecutive turns without tool calls)"
+                        ));
+                        should_halt = true;
                     }
-                    BoundaryAction::TriggerRewind {
-                        shed_tokens,
-                        expected_net_usd,
-                        receipt_text,
-                    } => {
-                        let cp = self.session.lock().await.checkpoint_index();
-                        if let Some(cp_idx) = cp {
-                            let receipt_tokens = (receipt_text.len() as u64 / 4).max(120);
-                            if self
-                                .session
+                } else {
+                    idle_turn_streak = 0;
+                }
+            }
+
+            // Evaluate turn-boundary module hooks
+            if !should_halt && !self.modules.is_empty() {
+                let total_ctx_est = self.session.lock().await.effective_context_tokens();
+                let snap = TurnBoundarySnapshot {
+                    turn_index: turn_num,
+                    total_context_tokens: total_ctx_est,
+                    had_edit_in_segment: seg.had_edit,
+                    had_tool_call_in_turn: had_tools,
+                    files_read_in_segment: seg.files_read.clone(),
+                    files_edited_in_segment: seg.files_edited.clone(),
+                    handles_created_in_segment: seg.handles_created.clone(),
+                    last_assistant_text: last_text,
+                    failed_attempts_summary: seg.failed_attempts.clone(),
+                };
+
+                for m in &self.modules {
+                    match m.on_turn_boundary(&snap).await? {
+                        BoundaryAction::Continue => {}
+                        BoundaryAction::AppendAdvisory { signal, message } => {
+                            self.session
                                 .lock()
                                 .await
-                                .apply_rewind(cp_idx, shed_tokens, expected_net_usd, receipt_text)
-                                .is_ok()
-                            {
-                                // Critical Red-Team guardrail: reset read-tracker after rewind!
-                                self.tools.reset_read_tracker();
-                                seg.reset();
-                                {
-                                    let mut met = self.metrics.lock().await;
-                                    met.rewinds_applied += 1;
-                                    met.heat_shed_tokens += shed_tokens;
-                                }
-                                self.events.push(AgentEvent::RewindApplied {
-                                    checkpoint_index: cp_idx,
-                                    shed_tokens,
-                                    receipt_tokens,
-                                    expected_net_usd,
-                                });
-                            }
+                                .push_message(Message::system_note(message.clone()))?;
+                            self.events
+                                .push(AgentEvent::ModuleAdvisory { signal, message });
                         }
-                    }
-                    BoundaryAction::Halt { reason } => {
-                        halted_reason = Some(reason);
-                        should_halt = true;
-                        break;
+                        BoundaryAction::Halt { reason } => {
+                            halted_reason = Some(reason);
+                            should_halt = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1224,7 +1788,20 @@ impl Agent {
                 break;
             }
 
-            if !had_tools {
+            if had_tools {
+                // Flush any untrusted/internal system notes queued by `on_turn_boundary`
+                // (e.g. worker inbox messages) so the next LLM turn sees them immediately.
+                let notes: Vec<String> = {
+                    let mut q = self.pending_system_notes.lock().await;
+                    std::mem::take(&mut *q)
+                };
+                if !notes.is_empty() {
+                    self.session
+                        .lock()
+                        .await
+                        .push_message(Message::system_note(notes.join("\n\n")))?;
+                }
+            } else {
                 // Anthropic server-side `pause_turn`: continue the loop without requiring a new user turn (A5)
                 if stop_reason == StopReason::PauseTurn {
                     continue;
@@ -1243,16 +1820,42 @@ impl Agent {
                     continue;
                 }
 
-                // If a mid-turn steer arrived before settling, deliver it and continue!
+                // Deliver queued human steers (with user authority) and/or internal system notes
+                // (e.g. untrusted worker updates — never tagged `[user-steer]` or pinned to `user_instructions`).
                 let steers: Vec<String> = {
                     let mut q = self.pending_steers.lock().await;
                     std::mem::take(&mut *q)
                 };
-                if !steers.is_empty() {
-                    self.session
-                        .lock()
-                        .await
-                        .push_message(Message::user_text(steers.join("\n")))?;
+                let notes: Vec<String> = {
+                    let mut q = self.pending_system_notes.lock().await;
+                    std::mem::take(&mut *q)
+                };
+                if !steers.is_empty() || !notes.is_empty() {
+                    idle_turn_streak = 0;
+                    if !steers.is_empty() {
+                        {
+                            let mut followups = self.user_instructions.lock().await;
+                            for st in &steers {
+                                followups.push(clip_anchor_text(st, 4_000));
+                                if followups.len() > 16 {
+                                    followups.remove(0);
+                                }
+                            }
+                        }
+                        self.session
+                            .lock()
+                            .await
+                            .push_message(Message::user_text(format!(
+                                "[user-steer]\n{}",
+                                steers.join("\n")
+                            )))?;
+                    }
+                    if !notes.is_empty() {
+                        self.session
+                            .lock()
+                            .await
+                            .push_message(Message::system_note(notes.join("\n\n")))?;
+                    }
                     continue;
                 }
 
@@ -1312,14 +1915,6 @@ impl Agent {
         seg: &mut SegmentTracker,
     ) {
         let mut metrics = self.metrics.lock().await;
-        // Roll subagent spend into parent metrics so `--max-cost-usd` can never be bypassed!
-        if tool_name == "Subagent"
-            && let Some(child_cost) = out.details.get("cost_usd").and_then(|v| v.as_f64())
-            && child_cost.is_finite()
-            && child_cost > 0.0
-        {
-            metrics.total_usage.cost_usd += child_cost;
-        }
         seg.record_tool_outcome(tool_name, input, out, &mut metrics);
     }
 
@@ -1357,6 +1952,7 @@ impl Agent {
             &self.modules,
             &self.session,
             &self.metrics,
+            &self.total_cost_micros,
             &self.events,
             &self.raw_user_goal,
             &self.user_instructions,
@@ -1365,6 +1961,7 @@ impl Agent {
             cancel,
         )
         .await?;
+        *self.last_prefix_state.lock().await = None;
         Ok(())
     }
 }
@@ -1407,6 +2004,18 @@ fn is_repetition_dominated(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Bounded UTF-8 preview helper for `AgentEvent::ToolEnd::output_preview` (ACP/RPC/SSE UIs).
+fn clip_utf8_preview(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// Convenience helper returning a `ToolResultBlock` vector for external callers.

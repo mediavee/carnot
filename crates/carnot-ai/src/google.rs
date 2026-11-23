@@ -25,8 +25,8 @@ use crate::compat::{
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role, StopReason,
-    ToolResultBlock, Usage,
+    CarnotError, ContentBlock, ContentOrigin, Message, ProviderWebCapabilities, ReasoningEffort,
+    Result, Role, StopReason, ToolResultBlock, Usage,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -350,10 +350,20 @@ impl GoogleProvider {
             "contents": contents,
             "generationConfig": gen_cfg,
         });
-        if !decls.is_empty()
+        let mut tools_arr: Vec<Value> = Vec::new();
+        if !decls.is_empty() {
+            tools_arr.push(json!({ "functionDeclarations": decls }));
+        }
+        if req.native_web.search && compat.supports_native_web_search.unwrap_or(false) {
+            tools_arr.push(json!({ "googleSearch": {} }));
+        }
+        if req.native_web.fetch && compat.supports_native_web_fetch.unwrap_or(false) {
+            tools_arr.push(json!({ "urlContext": {} }));
+        }
+        if !tools_arr.is_empty()
             && let Some(obj) = inner.as_object_mut()
         {
-            obj.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
+            obj.insert("tools".into(), Value::Array(tools_arr));
         }
         inner
     }
@@ -413,6 +423,14 @@ impl Provider for GoogleProvider {
         &self.spec.provider_id
     }
 
+    fn web_capabilities(&self, model: &str) -> ProviderWebCapabilities {
+        let compat = self.spec.effective_compat(model);
+        ProviderWebCapabilities {
+            native_search: compat.supports_native_web_search.unwrap_or(false),
+            native_fetch: compat.supports_native_web_fetch.unwrap_or(false),
+        }
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,
@@ -434,54 +452,29 @@ impl Provider for GoogleProvider {
             let mut last_err: Option<CarnotError> = None;
 
             for (idx, raw_url) in urls.iter().enumerate() {
-                let url = self.spec.auth.apply_to_url(raw_url);
-                let mut rb = self
-                    .client
-                    .post(&url)
-                    .header("content-type", "application/json");
-                rb = self.spec.auth.apply_to_request(rb);
-                for (k, v) in &self.spec.headers {
-                    rb = rb.header(k.as_str(), v.as_str());
-                }
-
-                let send_res =
-                    match tokio::time::timeout(HTTP_HEADERS_TIMEOUT, rb.json(&body).send()).await {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(e)) => {
-                            let err = CarnotError::Provider {
-                                provider: self.spec.provider_id.clone(),
-                                message: e.without_url().to_string(),
-                                retryable: true,
-                                retry_after_ms: None,
-                            };
-                            if idx + 1 < urls.len() {
-                                tracing::warn!(
-                                    provider = %self.spec.provider_id,
-                                    "endpoint network error; trying fallback_base_urls"
-                                );
-                                last_err = Some(err);
-                                continue;
-                            }
-                            return Err(err);
+                let send_res = match crate::send_authorized_json_post(
+                    &self.client,
+                    &self.spec,
+                    raw_url,
+                    &[],
+                    &body,
+                    HTTP_HEADERS_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        if idx + 1 < urls.len() {
+                            tracing::warn!(
+                                provider = %self.spec.provider_id,
+                                "endpoint error; trying fallback_base_urls"
+                            );
+                            last_err = Some(err);
+                            continue;
                         }
-                        Err(_) => {
-                            let err = CarnotError::Provider {
-                                provider: self.spec.provider_id.clone(),
-                                message: "HTTP response headers timeout (90s)".into(),
-                                retryable: true,
-                                retry_after_ms: None,
-                            };
-                            if idx + 1 < urls.len() {
-                                tracing::warn!(
-                                    provider = %self.spec.provider_id,
-                                    "endpoint timed out; trying fallback_base_urls"
-                                );
-                                last_err = Some(err);
-                                continue;
-                            }
-                            return Err(err);
-                        }
-                    };
+                        return Err(err);
+                    }
+                };
 
                 let status = send_res.status();
                 if status.is_success() {
@@ -539,6 +532,7 @@ impl Provider for GoogleProvider {
                 let mut thinking_acc = String::new();
                 let mut thinking_sig: Option<String> = None;
                 let mut tool_blocks: Vec<ContentBlock> = Vec::new();
+                let mut grounding_sources: Vec<(String, String)> = Vec::new();
                 let mut usage = Usage::default();
                 let mut stop_reason = StopReason::EndTurn;
                 let mut saw_any_candidate = false;
@@ -658,6 +652,29 @@ impl Provider for GoogleProvider {
                                     _ => StopReason::EndTurn,
                                 };
                             }
+                            if let Some(chunks) = cand
+                                .pointer("/groundingMetadata/groundingChunks")
+                                .and_then(Value::as_array)
+                            {
+                                for chunk in chunks {
+                                    if grounding_sources.len() >= 10 {
+                                        break;
+                                    }
+                                    if let Some(uri) =
+                                        chunk.pointer("/web/uri").and_then(Value::as_str)
+                                        && !uri.is_empty()
+                                        && !grounding_sources.iter().any(|(_, u)| u == uri)
+                                    {
+                                        let title = chunk
+                                            .pointer("/web/title")
+                                            .and_then(Value::as_str)
+                                            .filter(|t| !t.trim().is_empty())
+                                            .unwrap_or(uri);
+                                        grounding_sources
+                                            .push((title.to_string(), uri.to_string()));
+                                    }
+                                }
+                            }
                             if let Some(parts) =
                                 cand.pointer("/content/parts").and_then(Value::as_array)
                             {
@@ -745,6 +762,19 @@ impl Provider for GoogleProvider {
                     return;
                 }
 
+                let missing_sources: Vec<&(String, String)> = grounding_sources
+                    .iter()
+                    .filter(|(_, uri)| !text_acc.contains(uri.as_str()))
+                    .collect();
+                if !missing_sources.is_empty() && tool_blocks.is_empty() {
+                    let mut footer = String::from("\n\nSources:\n");
+                    for (title, uri) in missing_sources {
+                        footer.push_str(&format!("- [{title}]({uri})\n"));
+                    }
+                    text_acc.push_str(&footer);
+                    let _ = tx.send(StreamEvent::TextDelta(footer)).await;
+                }
+
                 let mut blocks: Vec<ContentBlock> = Vec::new();
                 if !thinking_acc.is_empty() || thinking_sig.is_some() {
                     blocks.push(ContentBlock::Thinking {
@@ -794,6 +824,7 @@ mod tests {
             project_id: None,
             auth: ResolvedAuth::None,
             headers: BTreeMap::new(),
+            query_params: BTreeMap::new(),
             betas: vec![],
             cache_diagnosis_beta: None,
             native_tool_search: false,

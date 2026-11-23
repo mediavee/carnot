@@ -11,17 +11,33 @@ workspace = true
 name = "carnot"
 path = "src/main.rs"
 
+[features]
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:similar"]
+ext-web = ["carnot/ext-web"]
+ext-lsp = ["carnot/ext-lsp"]
+ext-subagent = ["carnot/ext-subagent"]
+ext-hooks = ["carnot/ext-hooks"]
+ext-claude-plugins = ["carnot/ext-claude-plugins"]
+ext-memory = ["carnot/ext-memory"]
+all-ext = [
+    "ext-web",
+    "ext-lsp",
+    "ext-subagent",
+    "ext-hooks",
+    "ext-claude-plugins",
+    "ext-memory",
+]
+
 [dependencies]
 carnot.workspace = true
-carnot-cas.workspace = true
-carnot-core.workspace = true
 carnot-ext.workspace = true
-carnot-mcp.workspace = true
 carnot-tools.workspace = true
 clap.workspace = true
+crossterm = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
 serde_json.workspace = true
+similar = { workspace = true, optional = true }
 tokio.workspace = true
-tokio-util.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
-uuid.workspace = true
+unicode-width = { workspace = true, optional = true }

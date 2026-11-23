@@ -12,6 +12,7 @@ carnot-agent.workspace = true
 carnot-ai.workspace = true
 carnot-core.workspace = true
 carnot-ext.workspace = true
+carnot-session.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

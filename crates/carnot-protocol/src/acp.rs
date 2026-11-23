@@ -1,24 +1,25 @@
 //! Agent Client Protocol (ACP) JSON-RPC 2.0 transport over stdio — Zed / T3 Code compliant:
 //!   - Full ACP v1/v2 surface: `initialize`, `authenticate`, `session/new` (per-session `cwd` +
 //!     `configOptions` for model & `thought_level` + `available_commands_update`),
-//!     `session/set_config_option`, `session/set_model`, `session/prompt` (incl. `/compact`),
-//!     `session/cancel`, `session/steer`, `session/list`, `session/load`/`session/resume`,
-//!     `session/close`, `session/events`
-//!   - Emits canonical ACP `sessionUpdate` payloads (`agent_message_chunk`, `agent_thought_chunk`,
-//!     `tool_call`, `tool_call_update`, `usage_update`, `available_commands_update`)
-//!   - Bidirectional `AcpPermissionBroker` (`session/request_permission` client callback routed via
-//!     pending JSON-RPC response map — fixes Opus #3!)
-//!   - Concurrent `session/prompt` so `session/cancel`, `session/steer`, and permission replies
-//!     execute immediately mid-run (N4 + Opus #3)
-//!   - Real `session/load` backed by `carnot-session` JSONL replay with non-blocking busy check and
-//!     strict `session_dir` confinement (Opus #7)
+//!     `session/set_config_option`, `session/set_model`, `session/prompt` (multimodal text + images + `/compact`),
+//!     `session/cancel`, `session/steer`, `session/list` (real workspace `cwd` from JSONL headers),
+//!     `session/load`/`session/resume`, `session/close`, `session/events`
+//!   - True multi-session routing keyed by `sessionId` (concurrent sessions never overwrite each other)
+//!   - Rich ACP `sessionUpdate` payloads (`agent_message_chunk`, `agent_thought_chunk`, `tool_call` with
+//!     `kind`/`title`/`rawInput`/`locations`, `tool_call_update` with `content`/`rawOutput`, `usage_update`,
+//!     `available_commands_update`)
+//!   - Per-session bidirectional `AcpPermissionBroker` (`session/request_permission`)
 
 use carnot_agent::Agent;
 use carnot_ai::Provider;
-use carnot_core::{AgentEvent, CarnotError, EventEnvelope, ReasoningEffort, Result, Role};
-use carnot_ext::{BoxFuture, PermissionBroker, ToolGateDecision};
+use carnot_core::{
+    AgentEvent, CarnotError, ContentBlock, EventEnvelope, ReasoningEffort, Result, Role,
+    UserQuestion, UserQuestionAnswer,
+};
+use carnot_ext::{BoxFuture, PermissionBroker, ToolGateDecision, UserQuestionBroker};
+use carnot_session::read_session_header;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,14 +196,31 @@ fn available_commands_frame(session_id: &str) -> Value {
     })
 }
 
-/// Bidirectional ACP `session/request_permission` broker (activated when the ACP client declares
-/// `clientCapabilities.permissionRequests = true` during `initialize`).
+/// Per-session bidirectional ACP `session/request_permission` broker with `allow_always` session cache.
 #[derive(Debug)]
 struct AcpPermissionBroker {
-    session_id: Arc<Mutex<String>>,
+    session_id: String,
     stdout: Arc<Mutex<tokio::io::Stdout>>,
     next_req_id: Arc<AtomicU64>,
     pending: PendingReplies,
+    allowed_always: Mutex<HashSet<String>>,
+}
+
+impl AcpPermissionBroker {
+    fn new(
+        session_id: String,
+        stdout: Arc<Mutex<tokio::io::Stdout>>,
+        next_req_id: Arc<AtomicU64>,
+        pending: PendingReplies,
+    ) -> Self {
+        Self {
+            session_id,
+            stdout,
+            next_req_id,
+            pending,
+            allowed_always: Mutex::new(HashSet::new()),
+        }
+    }
 }
 
 impl PermissionBroker for AcpPermissionBroker {
@@ -215,16 +233,26 @@ impl PermissionBroker for AcpPermissionBroker {
         let call_id = call_id.to_string();
         let tool_name = tool_name.to_string();
         let input = input.clone();
+        let sid = self.session_id.clone();
         Box::pin(async move {
-            // Pure local reads do not need interactive user prompts
+            let effective_tool = if tool_name == "CallDeferredTool" {
+                input
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&tool_name)
+                    .to_string()
+            } else {
+                tool_name
+            };
+            // Pure local reads & interactive AskUser do not need redundant permission prompts
             if matches!(
-                tool_name.as_str(),
-                "Read" | "Grep" | "ToolSearch" | "LspQuery" | "WebSearch"
-            ) {
+                effective_tool.as_str(),
+                "Read" | "Grep" | "ToolSearch" | "AskUser" | "MemorySearch" | "LspQuery"
+            ) || self.allowed_always.lock().await.contains(&effective_tool)
+            {
                 return Ok(ToolGateDecision::Allow);
             }
             let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-            let sid = self.session_id.lock().await.clone();
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(req_id, tx);
 
@@ -236,11 +264,13 @@ impl PermissionBroker for AcpPermissionBroker {
                     "sessionId": sid,
                     "toolCall": {
                         "toolCallId": call_id,
-                        "title": tool_name,
+                        "title": format_tool_title(&effective_tool, &input),
+                        "kind": acp_tool_kind(&effective_tool),
                         "rawInput": input,
                     },
                     "options": [
                         { "optionId": "allow_once", "name": "Allow once", "kind": "allow_once" },
+                        { "optionId": "allow_always", "name": format!("Always allow {effective_tool} in session"), "kind": "allow_always" },
                         { "optionId": "reject_once", "name": "Reject", "kind": "reject_once" }
                     ]
                 }
@@ -282,7 +312,10 @@ impl PermissionBroker for AcpPermissionBroker {
                 .and_then(|o| o.get("optionId"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if selected && opt_id.starts_with("allow") {
+            if selected && opt_id == "allow_always" {
+                self.allowed_always.lock().await.insert(effective_tool);
+                Ok(ToolGateDecision::Allow)
+            } else if selected && opt_id.starts_with("allow") {
                 Ok(ToolGateDecision::Allow)
             } else {
                 Ok(ToolGateDecision::Deny {
@@ -293,13 +326,175 @@ impl PermissionBroker for AcpPermissionBroker {
     }
 }
 
+/// Per-session bidirectional ACP `AskUser` broker: tries `carnot/ask_user` first and gracefully
+/// falls back to standard `session/request_permission` option buttons on generic ACP clients!
+#[derive(Debug)]
+struct AcpQuestionBroker {
+    session_id: String,
+    stdout: Arc<Mutex<tokio::io::Stdout>>,
+    next_req_id: Arc<AtomicU64>,
+    pending: PendingReplies,
+}
+
+impl UserQuestionBroker for AcpQuestionBroker {
+    fn ask<'a>(
+        &'a self,
+        request_id: &'a str,
+        questions: &'a [UserQuestion],
+    ) -> BoxFuture<'a, Result<Vec<UserQuestionAnswer>>> {
+        let sid = self.session_id.clone();
+        let req_tag = request_id.to_string();
+        let qs = questions.to_vec();
+        Box::pin(async move {
+            let rpc_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = oneshot::channel();
+            self.pending.lock().await.insert(rpc_id, tx);
+
+            let frame = json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "method": "carnot/ask_user",
+                "params": {
+                    "sessionId": sid,
+                    "requestId": req_tag,
+                    "questions": qs,
+                }
+            });
+            if let Err(e) = write_frame(&self.stdout, &frame).await {
+                self.pending.lock().await.remove(&rpc_id);
+                return Err(CarnotError::Tool {
+                    tool: "AskUser".into(),
+                    message: format!("ACP ask_user write failed: {e}"),
+                });
+            }
+
+            let resp = match tokio::time::timeout(Duration::from_secs(300), rx).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(_)) => {
+                    return Err(CarnotError::Tool {
+                        tool: "AskUser".into(),
+                        message: "ACP client disconnected before answering question".into(),
+                    });
+                }
+                Err(_) => {
+                    self.pending.lock().await.remove(&rpc_id);
+                    return Err(CarnotError::Tool {
+                        tool: "AskUser".into(),
+                        message: "ACP ask_user timed out (300s)".into(),
+                    });
+                }
+            };
+
+            // If client returned `-32601 Method not found`, fall back to standard `session/request_permission`
+            // so even generic ACP clients (e.g. Zed) can answer multiple-choice questions natively!
+            if let Some(err) = resp.get("error") {
+                let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+                if code == -32601
+                    && let Some(first) = qs.first()
+                    && !first.options.is_empty()
+                {
+                    let fb_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+                    let (ftx, frx) = oneshot::channel();
+                    self.pending.lock().await.insert(fb_id, ftx);
+                    let opts: Vec<Value> = first
+                        .options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, o)| {
+                            json!({
+                                "optionId": format!("opt_{i}"),
+                                "name": o.label,
+                                "kind": "allow_once",
+                            })
+                        })
+                        .collect();
+                    let fb_frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": fb_id,
+                        "method": "session/request_permission",
+                        "params": {
+                            "sessionId": sid,
+                            "toolCall": {
+                                "toolCallId": req_tag,
+                                "title": first.question,
+                                "kind": "other",
+                                "rawInput": { "questions": qs },
+                            },
+                            "options": opts,
+                        }
+                    });
+                    if write_frame(&self.stdout, &fb_frame).await.is_ok()
+                        && let Ok(Ok(fb_resp)) =
+                            tokio::time::timeout(Duration::from_secs(300), frx).await
+                    {
+                        let chosen_idx = fb_resp
+                            .pointer("/result/outcome/optionId")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.strip_prefix("opt_"))
+                            .and_then(|n| n.parse::<usize>().ok());
+                        if let Some(idx) = chosen_idx
+                            && let Some(opt) = first.options.get(idx)
+                        {
+                            return Ok(vec![UserQuestionAnswer {
+                                id: first.id.clone(),
+                                selected: vec![opt.label.clone()],
+                                text: None,
+                            }]);
+                        }
+                    }
+                }
+                let msg = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ACP client rejected ask_user");
+                return Err(CarnotError::Tool {
+                    tool: "AskUser".into(),
+                    message: msg.to_string(),
+                });
+            }
+
+            let answers_val = resp
+                .pointer("/result/answers")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let answers: Vec<UserQuestionAnswer> =
+                serde_json::from_value(answers_val).unwrap_or_default();
+            Ok(answers)
+        })
+    }
+}
+
+/// Resolves the target session `Agent` by explicit `params.sessionId` or current default session.
+fn resolve_session_agent(
+    sessions: &HashMap<String, Arc<Agent>>,
+    default_sid: &str,
+    params: &Value,
+) -> std::result::Result<(String, Arc<Agent>), (i32, String)> {
+    if let Some(req_sid) = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sessions
+            .get(req_sid)
+            .map(|a| (req_sid.to_string(), Arc::clone(a)))
+            .ok_or_else(|| (-32004, format!("unknown ACP sessionId `{req_sid}`")))
+    } else {
+        sessions
+            .get(default_sid)
+            .map(|a| (default_sid.to_string(), Arc::clone(a)))
+            .ok_or_else(|| (-32004, "no active ACP session".into()))
+    }
+}
+
 /// Starts a stdio ACP server bound to a single pre-built `Agent` (backwards-compatible entry point).
 pub async fn serve_acp_stdio(agent: Arc<Agent>) -> Result<()> {
     serve_acp_stdio_inner(agent, None).await
 }
 
-/// Starts a full-featured stdio ACP server with dynamic per-session `cwd` creation, live model
-/// picker advertising, and live multi-provider model switching (`T3 Code` / `Zed` compliant).
+/// Starts a full-featured stdio ACP server with dynamic per-session `cwd` creation, true multi-session
+/// routing, live model picker advertising, and live multi-provider model switching (`T3 Code` / `Zed` compliant).
 pub async fn serve_acp_stdio_with_host(
     initial_agent: Arc<Agent>,
     host: Arc<dyn AcpHost>,
@@ -315,8 +510,13 @@ async fn serve_acp_stdio_inner(
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let pending_replies: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
     let next_client_req_id = Arc::new(AtomicU64::new(100_000));
-    let mut agent = initial_agent;
-    let active_sid = Arc::new(Mutex::new(agent.session_id().await));
+
+    let initial_sid = initial_agent.session_id().await;
+    let default_session_dir = initial_agent.config.session_dir.clone();
+    let default_workspace_root = initial_agent.config.workspace_root.clone();
+    let mut sessions: HashMap<String, Arc<Agent>> = HashMap::new();
+    sessions.insert(initial_sid.clone(), initial_agent);
+    let mut default_sid = initial_sid;
     let mut client_wants_perms = false;
 
     let mut lines = stdin.lines();
@@ -330,7 +530,7 @@ async fn serve_acp_stdio_inner(
             continue;
         };
 
-        // Route incoming JSON-RPC responses (e.g. client reply to `session/request_permission`) — Opus #3!
+        // Route incoming JSON-RPC responses (e.g. client reply to `session/request_permission`)
         if msg.get("method").is_none() && msg.get("id").is_some() {
             if let Some(id_num) = msg.get("id").and_then(Value::as_u64)
                 && let Some(tx) = pending_replies.lock().await.remove(&id_num)
@@ -347,7 +547,21 @@ async fn serve_acp_stdio_inner(
 
         if method == "session/prompt" {
             prompt_tasks.retain(|h| !h.is_finished());
-            if agent.is_busy() {
+            let (sid, ag) = match resolve_session_agent(&sessions, &default_sid, &params) {
+                Ok(pair) => pair,
+                Err((code, message)) => {
+                    if has_id {
+                        let err_frame = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {"code": code, "message": message}
+                        });
+                        write_frame(&stdout, &err_frame).await?;
+                    }
+                    continue;
+                }
+            };
+            if ag.is_busy() {
                 if has_id {
                     let busy_frame = json!({
                         "jsonrpc": "2.0",
@@ -358,15 +572,16 @@ async fn serve_acp_stdio_inner(
                 }
                 continue;
             }
-            let prompt_text = extract_acp_prompt(&params);
-            let ag = agent.clone();
+            let prompt_blocks = extract_acp_prompt_blocks(&params);
+            let prompt_text_only = prompt_blocks_text(&prompt_blocks);
             let out = stdout.clone();
             prompt_tasks.push(tokio::spawn(async move {
-                let sid = ag.session_id().await;
-
                 // Handle `/compact [focus]` slash command natively inside ACP!
-                let trimmed = prompt_text.trim();
-                if trimmed == "/compact" || trimmed.starts_with("/compact ") {
+                let trimmed = prompt_text_only.trim();
+                let has_images = prompt_blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }));
+                if !has_images && (trimmed == "/compact" || trimmed.starts_with("/compact ")) {
                     let focus = trimmed
                         .strip_prefix("/compact")
                         .map(str::trim)
@@ -436,57 +651,101 @@ async fn serve_acp_stdio_inner(
                             env.event,
                             AgentEvent::RunSettled { .. } | AgentEvent::Error { .. }
                         );
-                        if matches!(env.event, AgentEvent::UsageRecorded { .. }) {
-                            let used = ag_obs.current_context_tokens().await;
-                            let size = ag_obs.current_context_window().await;
-                            let met = ag_obs.metrics().await;
-                            let uframe = json!({
-                                "jsonrpc": "2.0",
-                                "method": "session/update",
-                                "params": {
-                                    "sessionId": sid_obs,
-                                    "seq": env.seq,
-                                    "update": {
-                                        "sessionUpdate": "usage_update",
-                                        "used": used,
-                                        "size": size,
-                                        "cost": {
-                                            "amount": met.total_usage.cost_usd,
-                                            "currency": "USD",
+                        match &env.event {
+                            AgentEvent::UsageRecorded { .. } => {
+                                let used = ag_obs.current_context_tokens().await;
+                                let size = ag_obs.current_context_window().await;
+                                let met = ag_obs.metrics().await;
+                                let uframe = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sid_obs,
+                                        "seq": env.seq,
+                                        "update": {
+                                            "sessionUpdate": "usage_update",
+                                            "used": used,
+                                            "size": size,
+                                            "cost": {
+                                                "amount": met.total_usage.cost_usd,
+                                                "currency": "USD",
+                                            }
                                         }
                                     }
+                                });
+                                let _ = write_frame(&out_writer, &uframe).await;
+                            }
+                            AgentEvent::CompactionApplied {
+                                mode,
+                                tokens_before,
+                                tokens_after,
+                                semantic_llm,
+                            } => {
+                                let kind = if *semantic_llm {
+                                    "semantic"
+                                } else {
+                                    "deterministic"
+                                };
+                                let thought = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sid_obs,
+                                        "seq": env.seq,
+                                        "update": {
+                                            "sessionUpdate": "agent_thought_chunk",
+                                            "content": {
+                                                "type": "text",
+                                                "text": format!("[carnot:compact:{mode}/{kind}] {tokens_before} -> {tokens_after} tokens"),
+                                            }
+                                        }
+                                    }
+                                });
+                                let _ = write_frame(&out_writer, &thought).await;
+                                let size = ag_obs.current_context_window().await;
+                                let met = ag_obs.metrics().await;
+                                let uframe = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sid_obs,
+                                        "seq": env.seq,
+                                        "update": {
+                                            "sessionUpdate": "usage_update",
+                                            "used": *tokens_after,
+                                            "size": size,
+                                            "cost": {
+                                                "amount": met.total_usage.cost_usd,
+                                                "currency": "USD",
+                                            }
+                                        }
+                                    }
+                                });
+                                let _ = write_frame(&out_writer, &uframe).await;
+                            }
+                            _ => {
+                                if let Some(notif) = acp_update_frame(&sid_obs, &env) {
+                                    let _ = write_frame(&out_writer, &notif).await;
                                 }
-                            });
-                            let _ = write_frame(&out_writer, &uframe).await;
-                        } else if let Some(notif) = acp_update_frame(&sid_obs, &env) {
-                            let _ = write_frame(&out_writer, &notif).await;
+                            }
                         }
                         if is_done {
                             break;
                         }
                     }
                 });
-                let outcome = ag.prompt(prompt_text).await;
+                let outcome = ag.prompt_blocks(prompt_blocks).await;
                 let _ = pump.await;
                 let frame = match outcome {
                     Ok(o) => {
-                        let stop = if let Some(ref hr) = o.halted_reason {
-                            if hr.contains("MaxTokens") {
-                                "max_tokens"
-                            } else if hr.contains("Refusal") {
-                                "refusal"
-                            } else {
-                                "end_turn"
-                            }
-                        } else {
-                            "end_turn"
-                        };
+                        let stop = map_acp_stop_reason(o.halted_reason.as_deref());
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": {
                                 "stopReason": stop,
                                 "finalText": o.final_text,
+                                "haltedReason": o.halted_reason,
                                 "metrics": o.metrics,
                                 "latestSeq": ag.latest_event_seq(),
                             }
@@ -520,15 +779,23 @@ async fn serve_acp_stdio_inner(
                     })
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if client_wants_perms {
-                    agent
-                        .set_permission_broker(Arc::new(AcpPermissionBroker {
-                            session_id: Arc::clone(&active_sid),
-                            stdout: Arc::clone(&stdout),
-                            next_req_id: Arc::clone(&next_client_req_id),
-                            pending: Arc::clone(&pending_replies),
-                        }))
+                for (sid, ag) in &sessions {
+                    ag.set_question_broker(Arc::new(AcpQuestionBroker {
+                        session_id: sid.clone(),
+                        stdout: Arc::clone(&stdout),
+                        next_req_id: Arc::clone(&next_client_req_id),
+                        pending: Arc::clone(&pending_replies),
+                    }))
+                    .await;
+                    if client_wants_perms {
+                        ag.set_permission_broker(Arc::new(AcpPermissionBroker::new(
+                            sid.clone(),
+                            Arc::clone(&stdout),
+                            Arc::clone(&next_client_req_id),
+                            Arc::clone(&pending_replies),
+                        )))
                         .await;
+                    }
                 }
                 Ok(json!({
                     "protocolVersion": 1,
@@ -540,6 +807,7 @@ async fn serve_acp_stdio_inner(
                     "agentCapabilities": {
                         "loadSession": true,
                         "permissionRequests": true,
+                        "askUser": true,
                         "mcpCapabilities": { "http": true, "sse": true },
                         "promptCapabilities": { "embeddedContext": true, "image": true },
                         "sessionCapabilities": { "list": {}, "resume": {} }
@@ -563,145 +831,168 @@ async fn serve_acp_stdio_inner(
                     .cloned()
                     .unwrap_or_default();
 
-                if let Some(ref h) = host {
-                    let target_cwd = req_cwd.unwrap_or_else(|| agent.config.workspace_root.clone());
-                    let cur_model = agent.current_model().await;
-                    let cur_effort = agent.current_effort().await;
+                let active_ag = if let Some(ref h) = host {
+                    let prev_ag = sessions.get(&default_sid).cloned();
+                    let target_cwd = req_cwd.unwrap_or_else(|| {
+                        prev_ag
+                            .as_ref()
+                            .map(|a| a.config.workspace_root.clone())
+                            .unwrap_or_else(|| default_workspace_root.clone())
+                    });
+                    let (cur_model, cur_effort) = match prev_ag {
+                        Some(ref a) => (
+                            Some(a.current_model().await),
+                            Some(a.current_effort().await),
+                        ),
+                        None => (None, None),
+                    };
                     match h
-                        .create_agent_for_cwd(
-                            target_cwd,
-                            Some(cur_model),
-                            Some(cur_effort),
-                            req_mcp_servers,
-                        )
+                        .create_agent_for_cwd(target_cwd, cur_model, cur_effort, req_mcp_servers)
                         .await
                     {
                         Ok(new_agent) => {
+                            let new_sid = new_agent.session_id().await;
+                            new_agent
+                                .set_question_broker(Arc::new(AcpQuestionBroker {
+                                    session_id: new_sid.clone(),
+                                    stdout: Arc::clone(&stdout),
+                                    next_req_id: Arc::clone(&next_client_req_id),
+                                    pending: Arc::clone(&pending_replies),
+                                }))
+                                .await;
                             if client_wants_perms {
                                 new_agent
-                                    .set_permission_broker(Arc::new(AcpPermissionBroker {
-                                        session_id: Arc::clone(&active_sid),
-                                        stdout: Arc::clone(&stdout),
-                                        next_req_id: Arc::clone(&next_client_req_id),
-                                        pending: Arc::clone(&pending_replies),
-                                    }))
+                                    .set_permission_broker(Arc::new(AcpPermissionBroker::new(
+                                        new_sid.clone(),
+                                        Arc::clone(&stdout),
+                                        Arc::clone(&next_client_req_id),
+                                        Arc::clone(&pending_replies),
+                                    )))
                                     .await;
                             }
-                            agent = new_agent;
+                            sessions.insert(new_sid.clone(), Arc::clone(&new_agent));
+                            default_sid = new_sid;
+                            Ok(new_agent)
                         }
-                        Err(e) => {
-                            let err = (-32000, format!("failed to start session: {e}"));
-                            if has_id {
-                                let frame = json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "error": {"code": err.0, "message": err.1}
-                                });
-                                write_frame(&stdout, &frame).await?;
-                            }
-                            continue;
-                        }
+                        Err(e) => Err((-32000, format!("failed to start session: {e}"))),
                     }
-                }
-
-                let sid = agent.session_id().await;
-                *active_sid.lock().await = sid.clone();
-                post_send_commands_sid = Some(sid.clone());
-                let cur_model = agent.current_model().await;
-                let cur_effort = agent.current_effort().await;
-                let avail = host
-                    .as_ref()
-                    .map(|h| h.available_models())
-                    .unwrap_or_default();
-                let (config_options, models_state) =
-                    build_config_options(&cur_model, cur_effort, &avail);
-                let prefix_hash = agent.prefix_hash().await;
-                Ok(json!({
-                    "sessionId": sid,
-                    "configOptions": config_options,
-                    "models": models_state,
-                    "_meta": {
-                        "carnot": {
-                            "model": cur_model,
-                            "prefixHash": prefix_hash,
-                            "latestSeq": agent.latest_event_seq(),
-                            "modules": agent.config.modules,
-                        }
-                    }
-                }))
-            }
-            "session/set_config_option" => {
-                let config_id = params
-                    .get("configId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-                let value = params
-                    .get("value")
-                    .or_else(|| params.get("optionId"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-
-                let apply_res: std::result::Result<(), (i32, String)> = match config_id {
-                    "model" => {
-                        if value.is_empty() {
-                            Err((-32602, "model value must not be empty".into()))
-                        } else if let Some(ref h) = host {
-                            match h.resolve_model(value) {
-                                Ok(resolved) => agent
-                                    .set_model(
-                                        value.to_string(),
-                                        resolved.provider,
-                                        resolved.context_window,
-                                        resolved.max_output_tokens,
-                                    )
-                                    .await
-                                    .map_err(|e| (-32001, e.to_string())),
-                                Err(e) => Err((-32602, e.to_string())),
-                            }
-                        } else {
-                            Err((-32601, "dynamic model switching requires AcpHost".into()))
-                        }
-                    }
-                    "thought_level" => match parse_acp_effort(value) {
-                        Some(eff) => {
-                            agent.set_effort(eff).await;
-                            Ok(())
-                        }
-                        None => Err((-32602, format!("unsupported thought_level `{value}`"))),
-                    },
-                    other => Err((-32602, format!("unknown configId `{other}`"))),
+                } else {
+                    sessions
+                        .get(&default_sid)
+                        .cloned()
+                        .ok_or_else(|| (-32004, "no active ACP session".into()))
                 };
 
-                match apply_res {
-                    Ok(()) => {
-                        let cur_model = agent.current_model().await;
-                        let cur_effort = agent.current_effort().await;
+                match active_ag {
+                    Ok(ag) => {
+                        let sid = ag.session_id().await;
+                        post_send_commands_sid = Some(sid.clone());
+                        let cur_model = ag.current_model().await;
+                        let cur_effort = ag.current_effort().await;
                         let avail = host
                             .as_ref()
                             .map(|h| h.available_models())
                             .unwrap_or_default();
-                        let (config_options, _) =
+                        let (config_options, models_state) =
                             build_config_options(&cur_model, cur_effort, &avail);
-                        Ok(json!({ "configOptions": config_options }))
+                        let prefix_hash = ag.prefix_hash().await;
+                        Ok(json!({
+                            "sessionId": sid,
+                            "configOptions": config_options,
+                            "models": models_state,
+                            "_meta": {
+                                "carnot": {
+                                    "model": cur_model,
+                                    "prefixHash": prefix_hash,
+                                    "latestSeq": ag.latest_event_seq(),
+                                    "modules": ag.config.modules,
+                                }
+                            }
+                        }))
                     }
                     Err(e) => Err(e),
                 }
             }
-            "session/set_model" => {
-                let model_id = params
-                    .get("modelId")
-                    .or_else(|| params.get("model"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-                if model_id.is_empty() {
-                    Err((-32602, "modelId must not be empty".into()))
-                } else if let Some(ref h) = host {
-                    match h.resolve_model(model_id) {
-                        Ok(resolved) => {
-                            match agent
+            "session/set_config_option" => {
+                match resolve_session_agent(&sessions, &default_sid, &params) {
+                    Err(e) => Err(e),
+                    Ok((_, ag)) => {
+                        let config_id = params
+                            .get("configId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+                        let value = params
+                            .get("value")
+                            .or_else(|| params.get("optionId"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+
+                        let apply_res: std::result::Result<(), (i32, String)> = match config_id {
+                            "model" => {
+                                if value.is_empty() {
+                                    Err((-32602, "model value must not be empty".into()))
+                                } else if let Some(ref h) = host {
+                                    match h.resolve_model(value) {
+                                        Ok(resolved) => ag
+                                            .set_model(
+                                                value.to_string(),
+                                                resolved.provider,
+                                                resolved.context_window,
+                                                resolved.max_output_tokens,
+                                            )
+                                            .await
+                                            .map_err(|e| (-32001, e.to_string())),
+                                        Err(e) => Err((-32602, e.to_string())),
+                                    }
+                                } else {
+                                    Err((-32601, "dynamic model switching requires AcpHost".into()))
+                                }
+                            }
+                            "thought_level" => match parse_acp_effort(value) {
+                                Some(eff) => {
+                                    ag.set_effort(eff).await;
+                                    Ok(())
+                                }
+                                None => {
+                                    Err((-32602, format!("unsupported thought_level `{value}`")))
+                                }
+                            },
+                            other => Err((-32602, format!("unknown configId `{other}`"))),
+                        };
+
+                        match apply_res {
+                            Ok(()) => {
+                                let cur_model = ag.current_model().await;
+                                let cur_effort = ag.current_effort().await;
+                                let avail = host
+                                    .as_ref()
+                                    .map(|h| h.available_models())
+                                    .unwrap_or_default();
+                                let (config_options, _) =
+                                    build_config_options(&cur_model, cur_effort, &avail);
+                                Ok(json!({ "configOptions": config_options }))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                }
+            }
+            "session/set_model" => match resolve_session_agent(&sessions, &default_sid, &params) {
+                Err(e) => Err(e),
+                Ok((_, ag)) => {
+                    let model_id = params
+                        .get("modelId")
+                        .or_else(|| params.get("model"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    if model_id.is_empty() {
+                        Err((-32602, "modelId must not be empty".into()))
+                    } else if let Some(ref h) = host {
+                        match h.resolve_model(model_id) {
+                            Ok(resolved) => match ag
                                 .set_model(
                                     model_id.to_string(),
                                     resolved.provider,
@@ -711,7 +1002,7 @@ async fn serve_acp_stdio_inner(
                                 .await
                             {
                                 Ok(()) => {
-                                    let cur_effort = agent.current_effort().await;
+                                    let cur_effort = ag.current_effort().await;
                                     let avail = h.available_models();
                                     let (config_options, models_state) =
                                         build_config_options(model_id, cur_effort, &avail);
@@ -721,96 +1012,140 @@ async fn serve_acp_stdio_inner(
                                     }))
                                 }
                                 Err(e) => Err((-32001, e.to_string())),
-                            }
+                            },
+                            Err(e) => Err((-32602, e.to_string())),
                         }
-                        Err(e) => Err((-32602, e.to_string())),
+                    } else {
+                        Err((-32601, "dynamic model switching requires AcpHost".into()))
                     }
-                } else {
-                    Err((-32601, "dynamic model switching requires AcpHost".into()))
                 }
-            }
+            },
             "session/list" => {
-                let sessions = list_recent_sessions(&agent.config.session_dir, 30);
-                Ok(json!({ "sessions": sessions }))
+                let sessions_list =
+                    list_recent_sessions(&default_session_dir, &default_workspace_root, 30);
+                Ok(json!({ "sessions": sessions_list }))
             }
             "session/load" | "session/resume" => {
-                if agent.is_busy() {
-                    Err((
+                let raw_sid = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let target_ag = sessions.get(&default_sid).cloned();
+                match target_ag {
+                    None => Err((-32004, "no active ACP session".into())),
+                    Some(ag) if ag.is_busy() => Err((
                         -32001,
                         "agent is busy running a prompt; call session/cancel first".into(),
-                    ))
-                } else {
-                    let raw_sid = params
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    match resolve_confined_session_path(&agent.config.session_dir, raw_sid) {
-                        Err(e) => Err((-32602, e.to_string())),
-                        Ok(path) => match agent.load_session(&path).await {
-                            Ok(sid) => {
-                                *active_sid.lock().await = sid.clone();
-                                post_send_commands_sid = Some(sid.clone());
-                                let history = agent.active_messages().await;
-                                for msg in history {
-                                    let txt = msg.text_concat();
-                                    if txt.is_empty() {
-                                        continue;
+                    )),
+                    Some(ag) => {
+                        match resolve_confined_session_path(&ag.config.session_dir, raw_sid) {
+                            Err(e) => Err((-32602, e.to_string())),
+                            Ok(path) => match ag.load_session(&path).await {
+                                Ok(sid) => {
+                                    ag.set_question_broker(Arc::new(AcpQuestionBroker {
+                                        session_id: sid.clone(),
+                                        stdout: Arc::clone(&stdout),
+                                        next_req_id: Arc::clone(&next_client_req_id),
+                                        pending: Arc::clone(&pending_replies),
+                                    }))
+                                    .await;
+                                    if client_wants_perms {
+                                        ag.set_permission_broker(Arc::new(
+                                            AcpPermissionBroker::new(
+                                                sid.clone(),
+                                                Arc::clone(&stdout),
+                                                Arc::clone(&next_client_req_id),
+                                                Arc::clone(&pending_replies),
+                                            ),
+                                        ))
+                                        .await;
                                     }
-                                    let update_kind = match msg.role {
-                                        Role::User => "user_message_chunk",
-                                        _ => "agent_message_chunk",
-                                    };
-                                    let notif = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "session/update",
-                                        "params": {
-                                            "sessionId": sid,
-                                            "update": {
-                                                "sessionUpdate": update_kind,
-                                                "content": { "type": "text", "text": txt },
-                                            }
+                                    sessions.insert(sid.clone(), Arc::clone(&ag));
+                                    default_sid = sid.clone();
+                                    post_send_commands_sid = Some(sid.clone());
+                                    let history = ag.active_messages().await;
+                                    for msg in history {
+                                        let txt = msg.text_concat();
+                                        let trimmed = txt.trim();
+                                        if trimmed.is_empty() || trimmed.starts_with("[carnot:") {
+                                            continue;
                                         }
-                                    });
-                                    let _ = write_frame(&stdout, &notif).await;
+                                        let update_kind = match msg.role {
+                                            Role::User => "user_message_chunk",
+                                            _ => "agent_message_chunk",
+                                        };
+                                        let notif = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "session/update",
+                                            "params": {
+                                                "sessionId": sid,
+                                                "update": {
+                                                    "sessionUpdate": update_kind,
+                                                    "content": { "type": "text", "text": txt },
+                                                }
+                                            }
+                                        });
+                                        let _ = write_frame(&stdout, &notif).await;
+                                    }
+                                    let cur_model = ag.current_model().await;
+                                    let cur_effort = ag.current_effort().await;
+                                    let avail = host
+                                        .as_ref()
+                                        .map(|h| h.available_models())
+                                        .unwrap_or_default();
+                                    let (config_options, models_state) =
+                                        build_config_options(&cur_model, cur_effort, &avail);
+                                    Ok(json!({
+                                        "sessionId": sid,
+                                        "loaded": true,
+                                        "configOptions": config_options,
+                                        "models": models_state,
+                                    }))
                                 }
-                                let cur_model = agent.current_model().await;
-                                let cur_effort = agent.current_effort().await;
-                                let avail = host
-                                    .as_ref()
-                                    .map(|h| h.available_models())
-                                    .unwrap_or_default();
-                                let (config_options, models_state) =
-                                    build_config_options(&cur_model, cur_effort, &avail);
-                                Ok(json!({
-                                    "sessionId": sid,
-                                    "loaded": true,
-                                    "configOptions": config_options,
-                                    "models": models_state,
-                                }))
-                            }
-                            Err(e) => Err((-32000, e.to_string())),
-                        },
+                                Err(e) => Err((-32000, e.to_string())),
+                            },
+                        }
                     }
                 }
             }
-            "session/close" => {
-                agent.abort().await;
-                Ok(json!({}))
-            }
-            "session/steer" => {
-                let text = extract_acp_prompt(&params);
-                agent.steer(text).await;
-                Ok(json!({"queued": true}))
-            }
-            "session/events" => {
-                let after = params.get("afterSeq").and_then(Value::as_u64).unwrap_or(0);
-                let events = agent.event_log().replay_after(after);
-                Ok(json!({"events": events, "latestSeq": agent.latest_event_seq()}))
-            }
-            "session/cancel" => {
-                agent.abort().await;
-                Ok(json!({"cancelled": true}))
-            }
+            "session/close" => match resolve_session_agent(&sessions, &default_sid, &params) {
+                Ok((sid, ag)) => {
+                    ag.abort().await;
+                    if sessions.len() > 1 {
+                        sessions.remove(&sid);
+                        if default_sid == sid
+                            && let Some(next_key) = sessions.keys().next().cloned()
+                        {
+                            default_sid = next_key;
+                        }
+                    }
+                    Ok(json!({}))
+                }
+                Err(e) => Err(e),
+            },
+            "session/steer" => match resolve_session_agent(&sessions, &default_sid, &params) {
+                Ok((_, ag)) => {
+                    let blocks = extract_acp_prompt_blocks(&params);
+                    ag.steer(prompt_blocks_text(&blocks)).await;
+                    Ok(json!({"queued": true}))
+                }
+                Err(e) => Err(e),
+            },
+            "session/events" => match resolve_session_agent(&sessions, &default_sid, &params) {
+                Ok((_, ag)) => {
+                    let after = params.get("afterSeq").and_then(Value::as_u64).unwrap_or(0);
+                    let events = ag.event_log().replay_after(after);
+                    Ok(json!({"events": events, "latestSeq": ag.latest_event_seq()}))
+                }
+                Err(e) => Err(e),
+            },
+            "session/cancel" => match resolve_session_agent(&sessions, &default_sid, &params) {
+                Ok((_, ag)) => {
+                    ag.abort().await;
+                    Ok(json!({"cancelled": true}))
+                }
+                Err(e) => Err(e),
+            },
             _ => Err((-32601, format!("unsupported ACP method: {method}"))),
         };
 
@@ -837,7 +1172,25 @@ async fn serve_acp_stdio_inner(
     Ok(())
 }
 
-fn list_recent_sessions(session_dir: &Path, limit: usize) -> Vec<Value> {
+fn map_acp_stop_reason(halted_reason: Option<&str>) -> &'static str {
+    let Some(hr) = halted_reason else {
+        return "end_turn";
+    };
+    if hr.contains("MaxTokens") {
+        "max_tokens"
+    } else if hr.contains("Refusal") {
+        "refusal"
+    } else if hr.contains("max_turns")
+        || hr.contains("cost budget")
+        || hr.contains("idle circuit breaker")
+    {
+        "max_turn_requests"
+    } else {
+        "end_turn"
+    }
+}
+
+fn list_recent_sessions(session_dir: &Path, fallback_cwd: &Path, limit: usize) -> Vec<Value> {
     let Ok(rd) = std::fs::read_dir(session_dir) else {
         return Vec::new();
     };
@@ -859,17 +1212,27 @@ fn list_recent_sessions(session_dir: &Path, limit: usize) -> Vec<Value> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        let header = read_session_header(&path);
+        let cwd = header
+            .as_ref()
+            .and_then(|h| h.workspace_root.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| fallback_cwd.display().to_string());
+        let title = match header {
+            Some(ref h) => format!("Carnot ({}) {}", h.model, &stem[..8.min(stem.len())]),
+            None => format!("Carnot session {stem}"),
+        };
         out.push(json!({
             "sessionId": stem,
-            "cwd": session_dir.display().to_string(),
-            "title": format!("Carnot session {stem}"),
+            "cwd": cwd,
+            "title": title,
         }));
     }
     out
 }
 
 /// Strictly confines `session/load` to a single filename inside `session_dir` (blocks `..`, `/`
-/// traversal, absolute paths, and symlink escapes — Opus #7!).
+/// traversal, absolute paths, and symlink escapes).
 fn resolve_confined_session_path(session_dir: &Path, raw: &str) -> Result<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.contains('\0') {
@@ -907,29 +1270,148 @@ fn resolve_confined_session_path(session_dir: &Path, raw: &str) -> Result<PathBu
     Ok(canon_file)
 }
 
-fn extract_acp_prompt(params: &Value) -> String {
+/// Extracts multimodal ACP prompt blocks (`text`, `resource`, `image`) into `Vec<ContentBlock>`.
+fn extract_acp_prompt_blocks(params: &Value) -> Vec<ContentBlock> {
     if let Some(s) = params.get("prompt").and_then(Value::as_str) {
-        return s.to_string();
+        return vec![ContentBlock::Text {
+            text: s.to_string(),
+        }];
     }
     if let Some(arr) = params.get("prompt").and_then(Value::as_array) {
-        let mut parts = Vec::new();
+        let mut blocks = Vec::new();
         for b in arr {
+            let kind = b.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "image" {
+                let data = b.get("data").and_then(Value::as_str);
+                let mime = b
+                    .get("mimeType")
+                    .or_else(|| b.get("mediaType"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                if let Some(d) = data
+                    && !d.is_empty()
+                {
+                    blocks.push(ContentBlock::Image {
+                        media_type: mime.to_string(),
+                        data_base64: d.to_string(),
+                    });
+                    continue;
+                }
+                if let Some(uri) = b.get("uri").and_then(Value::as_str)
+                    && let Some(rest) = uri.strip_prefix("data:")
+                    && let Some((meta, b64)) = rest.split_once(";base64,")
+                    && !b64.is_empty()
+                {
+                    blocks.push(ContentBlock::Image {
+                        media_type: if meta.is_empty() {
+                            mime.to_string()
+                        } else {
+                            meta.to_string()
+                        },
+                        data_base64: b64.to_string(),
+                    });
+                    continue;
+                }
+            }
             if let Some(txt) = b.get("text").and_then(Value::as_str) {
-                parts.push(txt.to_string());
+                blocks.push(ContentBlock::Text {
+                    text: txt.to_string(),
+                });
             } else if let Some(res) = b.get("resource") {
                 let uri = res.get("uri").and_then(Value::as_str).unwrap_or("resource");
                 if let Some(txt) = res.get("text").and_then(Value::as_str) {
-                    parts.push(format!("[embedded:{uri}]\n{txt}"));
+                    blocks.push(ContentBlock::Text {
+                        text: format!("[embedded:{uri}]\n{txt}"),
+                    });
                 }
             }
         }
-        return parts.join("\n");
+        return blocks;
     }
-    params
-        .get("message")
+    if let Some(msg) = params.get("message").and_then(Value::as_str) {
+        return vec![ContentBlock::Text {
+            text: msg.to_string(),
+        }];
+    }
+    Vec::new()
+}
+
+fn prompt_blocks_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn acp_tool_kind(tool: &str) -> &'static str {
+    match tool {
+        "Read" => "read",
+        "Edit" | "Write" => "edit",
+        "Grep" | "ToolSearch" => "search",
+        "Bash" => "execute",
+        _ => "other",
+    }
+}
+
+fn format_tool_title(tool: &str, input: &Value) -> String {
+    let worker_prefix = input
+        .get("_carnot_worker")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+        .filter(|s| !s.is_empty())
+        .map(|w| format!("[worker:{w}] "))
+        .unwrap_or_default();
+    let base = match tool {
+        "Read" | "Edit" | "Write" => {
+            if let Some(fp) = input.get("file_path").and_then(Value::as_str) {
+                format!("{tool} {fp}")
+            } else {
+                tool.to_string()
+            }
+        }
+        "Bash" => {
+            if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+                let first = cmd.lines().next().unwrap_or(cmd).trim();
+                let clipped: String = first.chars().take(72).collect();
+                format!("Bash: {clipped}")
+            } else if let Some(job) = input.get("job").and_then(Value::as_str) {
+                format!("Bash ({job})")
+            } else {
+                tool.to_string()
+            }
+        }
+        "Grep" => {
+            if let Some(pat) = input.get("pattern").and_then(Value::as_str) {
+                let clipped: String = pat.chars().take(48).collect();
+                format!("Grep `{clipped}`")
+            } else {
+                tool.to_string()
+            }
+        }
+        _ => tool.to_string(),
+    };
+    format!("{worker_prefix}{base}")
+}
+
+fn extract_tool_locations(input: &Value) -> Option<Vec<Value>> {
+    let path = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let mut loc = json!({ "path": path });
+    if let Some(line) = input
+        .get("start_line")
+        .or_else(|| input.get("offset"))
+        .and_then(Value::as_u64)
+        && let Some(obj) = loc.as_object_mut()
+    {
+        obj.insert("line".into(), json!(line));
+    }
+    Some(vec![loc])
 }
 
 /// Maps `AgentEvent` to standard ACP `sessionUpdate` union (Zed / T3 Code) + `_meta.carnot`.
@@ -948,13 +1430,24 @@ fn acp_update_frame(session_id: &str, env: &EventEnvelope) -> Option<Value> {
             call_id,
             tool,
             eager,
-        } => json!({
-            "sessionUpdate": "tool_call",
-            "toolCallId": call_id,
-            "title": tool,
-            "status": "in_progress",
-            "_meta": { "carnot": { "eager": eager } },
-        }),
+            input,
+        } => {
+            let mut u = json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": call_id,
+                "title": format_tool_title(tool, input),
+                "kind": acp_tool_kind(tool),
+                "status": "in_progress",
+                "rawInput": input,
+                "_meta": { "carnot": { "tool": tool, "eager": eager } },
+            });
+            if let Some(locs) = extract_tool_locations(input)
+                && let Some(obj) = u.as_object_mut()
+            {
+                obj.insert("locations".into(), json!(locs));
+            }
+            u
+        }
         AgentEvent::ToolUpdate { call_id, message } => json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": call_id,
@@ -966,24 +1459,29 @@ fn acp_update_frame(session_id: &str, env: &EventEnvelope) -> Option<Value> {
             tool,
             is_error,
             duration_ms,
-        } => json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": call_id,
-            "title": tool,
-            "status": if *is_error { "failed" } else { "completed" },
-            "_meta": { "carnot": { "durationMs": duration_ms } },
-        }),
-        AgentEvent::DaemonAdvisory { signal, message } => json!({
+            output_preview,
+        } => {
+            let mut u = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": call_id,
+                "title": tool,
+                "status": if *is_error { "failed" } else { "completed" },
+                "_meta": { "carnot": { "durationMs": duration_ms } },
+            });
+            if !output_preview.is_empty()
+                && let Some(obj) = u.as_object_mut()
+            {
+                obj.insert(
+                    "content".into(),
+                    json!([{ "type": "content", "content": { "type": "text", "text": output_preview } }]),
+                );
+                obj.insert("rawOutput".into(), json!(output_preview));
+            }
+            u
+        }
+        AgentEvent::ModuleAdvisory { signal, message } => json!({
             "sessionUpdate": "agent_thought_chunk",
             "content": { "type": "text", "text": format!("[carnot:{signal}] {message}") },
-        }),
-        AgentEvent::RewindApplied {
-            shed_tokens,
-            expected_net_usd,
-            ..
-        } => json!({
-            "sessionUpdate": "agent_thought_chunk",
-            "content": { "type": "text", "text": format!("[carnot:rewind] shed ~{shed_tokens} tokens (net save ~${expected_net_usd:.4})") },
         }),
         _ => return None,
     };
@@ -1002,6 +1500,10 @@ fn acp_update_frame(session_id: &str, env: &EventEnvelope) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carnot_ai::faux::{FauxProvider, ScriptedTurn};
+    use carnot_cas::CasStore;
+    use carnot_core::CarnotConfig;
+    use carnot_tools::ToolRegistry;
 
     #[test]
     fn resolve_confined_session_path_blocks_traversal() {
@@ -1045,5 +1547,113 @@ mod tests {
             models_state["availableModels"].as_array().expect("m").len(),
             2
         );
+    }
+
+    #[test]
+    fn extracts_multimodal_images_text_and_embedded_resources() {
+        let params = json!({
+            "prompt": [
+                { "type": "text", "text": "Inspect this screenshot" },
+                { "type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo=" },
+                { "type": "resource", "resource": { "uri": "file:///a.rs", "text": "fn main() {}" } }
+            ]
+        });
+        let blocks = extract_acp_prompt_blocks(&params);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], ContentBlock::Text { .. }));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Image { media_type, data_base64 }
+                if media_type == "image/png" && data_base64 == "iVBORw0KGgo="
+        ));
+        assert!(matches!(blocks[2], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn emits_rich_acp_tool_call_with_kind_raw_input_locations_and_output() {
+        let start_env = EventEnvelope {
+            seq: 10,
+            event: AgentEvent::ToolStart {
+                call_id: "call_1".into(),
+                tool: "Edit".into(),
+                eager: false,
+                input: json!({ "file_path": "src/lib.rs", "start_line": 42, "end_line": 45 }),
+            },
+        };
+        let frame = acp_update_frame("sess-1", &start_env).expect("tool_call frame");
+        let upd = &frame["params"]["update"];
+        assert_eq!(upd["sessionUpdate"], "tool_call");
+        assert_eq!(upd["kind"], "edit");
+        assert_eq!(upd["title"], "Edit src/lib.rs");
+        assert_eq!(upd["rawInput"]["file_path"], "src/lib.rs");
+        assert_eq!(upd["locations"][0]["path"], "src/lib.rs");
+        assert_eq!(upd["locations"][0]["line"], 42);
+
+        let end_env = EventEnvelope {
+            seq: 11,
+            event: AgentEvent::ToolEnd {
+                call_id: "call_1".into(),
+                tool: "Edit".into(),
+                is_error: false,
+                duration_ms: 14,
+                output_preview: "Edited src/lib.rs (1 replacement(s)).".into(),
+            },
+        };
+        let end_frame = acp_update_frame("sess-1", &end_env).expect("tool_call_update");
+        let eupd = &end_frame["params"]["update"];
+        assert_eq!(eupd["sessionUpdate"], "tool_call_update");
+        assert_eq!(eupd["status"], "completed");
+        assert_eq!(eupd["rawOutput"], "Edited src/lib.rs (1 replacement(s)).");
+        assert_eq!(
+            eupd["content"][0]["content"]["text"],
+            "Edited src/lib.rs (1 replacement(s))."
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_session_routing_and_session_list_real_cwd() {
+        let base = std::env::temp_dir().join(format!("carnot-acp-multi-{}", uuid::Uuid::new_v4()));
+        let ws_a = base.join("ws_a");
+        let ws_b = base.join("ws_b");
+        let sdir = base.join("sessions");
+        std::fs::create_dir_all(&ws_a).expect("ws_a");
+        std::fs::create_dir_all(&ws_b).expect("ws_b");
+
+        let mk_agent = |ws: PathBuf| {
+            let mut cfg = CarnotConfig::new(ws.clone());
+            cfg.session_dir = sdir.clone();
+            cfg.modules.sandbox = false;
+            let cas = Arc::new(CasStore::open(&ws).expect("cas"));
+            let tools = ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+            let faux = Arc::new(FauxProvider::new(vec![ScriptedTurn::text("ok")]));
+            Arc::new(Agent::new(cfg, faux, tools, Vec::new(), true).expect("agent"))
+        };
+
+        let ag_a = mk_agent(ws_a.clone());
+        let ag_b = mk_agent(ws_b.clone());
+        let sid_a = ag_a.session_id().await;
+        let sid_b = ag_b.session_id().await;
+
+        let mut map = HashMap::new();
+        map.insert(sid_a.clone(), ag_a);
+        map.insert(sid_b.clone(), ag_b);
+
+        let (resolved_b, _) =
+            resolve_session_agent(&map, &sid_a, &json!({"sessionId": sid_b})).expect("route b");
+        assert_eq!(resolved_b, sid_b);
+        assert!(resolve_session_agent(&map, &sid_a, &json!({"sessionId": "missing"})).is_err());
+
+        // Verify `list_recent_sessions` reports the real persisted workspace_root (`ws_a` / `ws_b`),
+        // NEVER `~/.carnot/sessions`!
+        let listed = list_recent_sessions(&sdir, &ws_a, 10);
+        assert_eq!(listed.len(), 2);
+        let cwds: Vec<&str> = listed
+            .iter()
+            .filter_map(|v| v.get("cwd").and_then(Value::as_str))
+            .collect();
+        assert!(cwds.contains(&ws_a.display().to_string().as_str()));
+        assert!(cwds.contains(&ws_b.display().to_string().as_str()));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

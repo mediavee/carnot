@@ -44,7 +44,7 @@ impl EventLog {
 
     pub fn push(&self, event: AgentEvent) -> EventEnvelope {
         let env = {
-            let mut st = self.state.lock().expect("event_log lock");
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let seq = st.next_seq;
             st.next_seq += 1;
             let env = EventEnvelope { seq, event };
@@ -59,7 +59,7 @@ impl EventLog {
     }
 
     pub fn latest_seq(&self) -> u64 {
-        let st = self.state.lock().expect("event_log lock");
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.next_seq.saturating_sub(1)
     }
 
@@ -81,7 +81,7 @@ impl EventLog {
 
     /// Snapshot of all retained events with `seq > after_seq` (O(1) indexing + `EventsTruncated` on wrap).
     pub fn replay_after(&self, after_seq: u64) -> Vec<EventEnvelope> {
-        let st = self.state.lock().expect("event_log lock");
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         let Some(oldest) = st.ring.front() else {
             return out;
@@ -127,7 +127,7 @@ impl EventStream {
             // concurrent `notify_waiters()` between unlock and `.await` can NEVER be lost!
             notified.as_mut().enable();
             {
-                let st = self.log.state.lock().expect("event_log lock");
+                let st = self.log.state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(oldest) = st.ring.front() {
                     // N12 gap detection: emit gap signal even if `cursor == 0` when seq 1 was evicted!
                     if oldest.seq > 1 && self.cursor + 1 < oldest.seq {

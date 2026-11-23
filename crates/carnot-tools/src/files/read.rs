@@ -73,10 +73,12 @@ impl Tool for ReadTool {
             let offset = input
                 .get("offset")
                 .and_then(Value::as_u64)
+                .filter(|&v| v > 0)
                 .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
             let limit = input
                 .get("limit")
                 .and_then(Value::as_u64)
+                .filter(|&v| v > 0)
                 .map(|v| usize::try_from(v).unwrap_or(MAX_READ_LINES));
             let symbol = input
                 .get("symbol")
@@ -252,7 +254,7 @@ impl Tool for ReadTool {
                 // Check disk-coherent ReadTracker on RAW unnumbered lines (F2/F3/F4)
                 let delta = tracker
                     .lock()
-                    .expect("lock")
+                    .unwrap_or_else(|e| e.into_inner())
                     .check_reread(&path, &raw_slice, (start, end));
                 match delta {
                     ReadDelta::UnchangedStub(stub) => {
@@ -262,7 +264,7 @@ impl Tool for ReadTool {
                     ReadDelta::UnifiedDiff(diff_txt) => {
                         tracker
                             .lock()
-                            .expect("lock")
+                            .unwrap_or_else(|e| e.into_inner())
                             .record(&path, &raw_slice, (start, end));
                         return Ok(ToolOutput::ok_text(diff_txt)
                             .with_details(json!({"file_path": raw_path, "mode": "diff"})));
@@ -270,7 +272,7 @@ impl Tool for ReadTool {
                     ReadDelta::FullNeeded => {
                         tracker
                             .lock()
-                            .expect("lock")
+                            .unwrap_or_else(|e| e.into_inner())
                             .record(&path, &raw_slice, (start, end));
                     }
                 }

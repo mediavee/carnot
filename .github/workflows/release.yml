@@ -36,7 +36,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin carnot
+          cargo build --release --target ${{ matrix.target }} --bin carnot --features all-ext
           cp target/${{ matrix.target }}/release/carnot ${{ matrix.artifact }}
           shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
       - uses: actions/upload-artifact@v4

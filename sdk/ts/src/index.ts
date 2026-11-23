@@ -6,10 +6,9 @@ export interface ThermodynamicMetrics {
   turns: number;
   requests: number;
   context_auc_tokens: number;
-  rewinds_applied: number;
+  compactions_applied: number;
   heat_shed_tokens: number;
   cas_handles_created: number;
-  daemon_advisories: number;
   prefix_cache_hits: number;
   prefix_cache_misses: number;
   eager_tools_started: number;
@@ -88,6 +87,38 @@ export class CarnotHttpClient {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   }
 
+  async followUp(message: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/v1/follow-up`, {
+      method: "POST",
+      headers: this.authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ message }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  }
+
+  async compact(focus?: string): Promise<{
+    tokens_before: number;
+    tokens_after: number;
+    semantic_llm: boolean;
+  }> {
+    const res = await fetch(`${this.baseUrl}/v1/compact`, {
+      method: "POST",
+      headers: this.authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(focus ? { focus } : {}),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async undo(): Promise<{ reverted: string | null }> {
+    const res = await fetch(`${this.baseUrl}/v1/undo`, {
+      method: "POST",
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
   async *promptStream(prompt: string): AsyncGenerator<EventEnvelope> {
     const res = await fetch(`${this.baseUrl}/v1/prompt`, {
       method: "POST",
@@ -104,6 +135,41 @@ export class CarnotHttpClient {
     });
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
     yield* parseSseStream(res.body);
+  }
+
+  async listPending(): Promise<{ permissions: unknown[]; questions: unknown[] }> {
+    const res = await fetch(`${this.baseUrl}/v1/pending`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async respondPermission(
+    requestId: string,
+    decision: "allow_once" | "allow_always" | "deny",
+    reason?: string,
+  ): Promise<{ resolved: boolean }> {
+    const res = await fetch(`${this.baseUrl}/v1/permissions`, {
+      method: "POST",
+      headers: this.authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ request_id: requestId, decision, reason }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async respondQuestion(
+    requestId: string,
+    answers: Array<{ id: string; selected?: string[]; text?: string }>,
+  ): Promise<{ resolved: boolean }> {
+    const res = await fetch(`${this.baseUrl}/v1/questions`, {
+      method: "POST",
+      headers: this.authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ request_id: requestId, answers }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
   }
 
   async abort(): Promise<void> {

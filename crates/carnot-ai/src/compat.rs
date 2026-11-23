@@ -310,6 +310,12 @@ pub fn apply_usage_map(usage_json: &Value, map: &UsageMap, out: &mut Usage) {
         .and_then(|ptr| usage_json.pointer(ptr))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write = map
+        .cache_write_ptr
+        .as_deref()
+        .and_then(|ptr| usage_json.pointer(ptr))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let raw_out = usage_json
         .pointer(&map.output_ptr)
         .and_then(Value::as_u64)
@@ -322,8 +328,9 @@ pub fn apply_usage_map(usage_json: &Value, map: &UsageMap, out: &mut Usage) {
         .unwrap_or(0);
 
     out.cache_read_tokens = cached;
+    out.cache_write_5m_tokens = cache_write;
     out.input_tokens = if map.cached_included_in_input {
-        raw_in.saturating_sub(cached)
+        raw_in.saturating_sub(cached.saturating_add(cache_write))
     } else {
         raw_in
     };

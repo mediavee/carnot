@@ -1,8 +1,9 @@
-//! Pi/Lythe-compatible Host JSON-RPC 2.0 transport over stdio with concurrent `steer`/`abort`
-//! (fixes Opus N4!) and lossless `EventLog` streaming (I4).
+//! Pi/Lythe-compatible Host JSON-RPC 2.0 transport over stdio with concurrent `steer`/`abort`,
+//! busy protection, `follow_up`/`compact`/`undo`, and lossless `EventLog` streaming.
 
+use crate::interaction::ChannelInteractionBroker;
 use carnot_agent::Agent;
-use carnot_core::Result;
+use carnot_core::{Result, UserQuestionAnswer};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,6 +19,9 @@ async fn write_frame(stdout: &Arc<Mutex<tokio::io::Stdout>>, frame: &Value) -> s
 }
 
 pub async fn serve_rpc_stdio(agent: Arc<Agent>) -> Result<()> {
+    let broker = ChannelInteractionBroker::new(Arc::clone(&agent));
+    agent.set_question_broker(broker.clone()).await;
+
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut lines = stdin.lines();
@@ -33,7 +37,7 @@ pub async fn serve_rpc_stdio(agent: Arc<Agent>) -> Result<()> {
         }
     });
 
-    // Track spawned prompt runs so stdin stays responsive to `steer`, `abort`, `get_state`, `ping` (N4!)
+    // Track spawned prompt runs so stdin stays responsive to `steer`, `follow_up`, `abort`, `get_state`, `ping`
     let mut prompt_tasks: Vec<JoinHandle<()>> = Vec::new();
 
     while let Some(line) = lines.next_line().await? {
@@ -48,6 +52,16 @@ pub async fn serve_rpc_stdio(agent: Arc<Agent>) -> Result<()> {
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
         if method == "prompt" {
+            prompt_tasks.retain(|h| !h.is_finished());
+            if agent.is_busy() {
+                let busy = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32001, "message": "agent is busy running a prompt; use steer, follow_up, or abort"}
+                });
+                write_frame(&stdout, &busy).await?;
+                continue;
+            }
             let text = params
                 .get("message")
                 .or_else(|| params.get("prompt"))
@@ -85,6 +99,50 @@ pub async fn serve_rpc_stdio(agent: Arc<Agent>) -> Result<()> {
                 agent.steer(text).await;
                 json!({"jsonrpc": "2.0", "id": id, "result": {"queued": true}})
             }
+            "follow_up" => {
+                let text = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                agent.follow_up(text).await;
+                json!({"jsonrpc": "2.0", "id": id, "result": {"queued": true}})
+            }
+            "compact" => {
+                let focus = params
+                    .get("focus")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                match agent.compact_now_with_focus(focus).await {
+                    Ok((before, after, semantic)) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tokens_before": before,
+                            "tokens_after": after,
+                            "semantic_llm": semantic,
+                        }
+                    }),
+                    Err(e) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32000, "message": e.to_string()}
+                    }),
+                }
+            }
+            "undo" => match agent.undo_last_edit() {
+                Ok(path) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "reverted": path.map(|p| p.display().to_string()) }
+                }),
+                Err(e) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": e.to_string()}
+                }),
+            },
             "replay_events" => {
                 let after_seq = params.get("after_seq").and_then(Value::as_u64).unwrap_or(0);
                 let events = agent.event_log().replay_after(after_seq);
@@ -92,11 +150,12 @@ pub async fn serve_rpc_stdio(agent: Arc<Agent>) -> Result<()> {
             }
             "get_state" => {
                 let sid = agent.session_id().await;
+                let model = agent.current_model().await;
                 let ph = agent.prefix_hash().await;
                 let met = agent.metrics().await;
                 json!({"jsonrpc": "2.0", "id": id, "result": {
                     "session_id": sid,
-                    "model": agent.config.model,
+                    "model": model,
                     "prefix_hash": ph,
                     "latest_seq": agent.latest_event_seq(),
                     "busy": agent.is_busy(),
@@ -107,6 +166,49 @@ pub async fn serve_rpc_stdio(agent: Arc<Agent>) -> Result<()> {
             "get_metrics" => {
                 let met = agent.metrics().await;
                 json!({"jsonrpc": "2.0", "id": id, "result": met})
+            }
+            "set_require_approval" => {
+                let require = params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if require {
+                    agent.set_permission_broker(broker.clone()).await;
+                }
+                json!({"jsonrpc": "2.0", "id": id, "result": {"require_approval": require}})
+            }
+            "list_pending" => {
+                let pending = broker.list_pending().await;
+                json!({"jsonrpc": "2.0", "id": id, "result": pending})
+            }
+            "respond_permission" => {
+                let req_id = params
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let decision = params
+                    .get("decision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("deny");
+                let reason = params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let ok = broker.respond_permission(req_id, decision, reason).await;
+                json!({"jsonrpc": "2.0", "id": id, "result": {"resolved": ok}})
+            }
+            "respond_question" => {
+                let req_id = params
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let answers: Vec<UserQuestionAnswer> = params
+                    .get("answers")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let ok = broker.respond_question(req_id, answers).await;
+                json!({"jsonrpc": "2.0", "id": id, "result": {"resolved": ok}})
             }
             "abort" => {
                 agent.abort().await;

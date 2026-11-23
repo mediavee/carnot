@@ -239,13 +239,22 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
            (subpath (param \"DENY_SECRETS\"))\n\
            (literal (param \"DENY_ZSHENV\"))\n\
            (literal (param \"DENY_ZSHRC\"))\n\
+           (literal (param \"DENY_ZSH_HIST\"))\n\
+           (literal (param \"DENY_BASH_HIST\"))\n\
+           (literal (param \"DENY_PY_HIST\"))\n\
+           (literal (param \"DENY_PSQL_HIST\"))\n\
+           (literal (param \"DENY_HOME_ENV\"))\n\
+           (literal (param \"DENY_PYPIRC\"))\n\
            (subpath (param \"DENY_CLAUDE\"))\n\
            (subpath (param \"DENY_CODEX\"))\n\
            (subpath (param \"DENY_AGENTSAFE\"))\n\
            (subpath (param \"DENY_DOCKER\"))\n\
            (subpath (param \"DENY_KUBE\"))\n\
+           (subpath (param \"DENY_OP\"))\n\
+           (subpath (param \"DENY_KEYCHAINS\"))\n\
            (literal (param \"DENY_NETRC\"))\n\
            (literal (param \"DENY_GIT_CREDS\"))\n\
+           (literal (param \"DENY_CONFIG_GIT_CREDS\"))\n\
            (literal (param \"DENY_NPMRC\"))\n\
            (literal (param \"DENY_CARGO_CREDS\"))\n\
            (literal (param \"DENY_CARGO_CREDS_TOML\"))\n\
@@ -284,6 +293,26 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
         .arg(format!("DENY_ZSHENV={}", home.join(".zshenv").display()));
     c.arg("-D")
         .arg(format!("DENY_ZSHRC={}", home.join(".zshrc").display()));
+    c.arg("-D").arg(format!(
+        "DENY_ZSH_HIST={}",
+        home.join(".zsh_history").display()
+    ));
+    c.arg("-D").arg(format!(
+        "DENY_BASH_HIST={}",
+        home.join(".bash_history").display()
+    ));
+    c.arg("-D").arg(format!(
+        "DENY_PY_HIST={}",
+        home.join(".python_history").display()
+    ));
+    c.arg("-D").arg(format!(
+        "DENY_PSQL_HIST={}",
+        home.join(".psql_history").display()
+    ));
+    c.arg("-D")
+        .arg(format!("DENY_HOME_ENV={}", home.join(".env").display()));
+    c.arg("-D")
+        .arg(format!("DENY_PYPIRC={}", home.join(".pypirc").display()));
     c.arg("-D")
         .arg(format!("DENY_CLAUDE={}", home.join(".claude").display()));
     c.arg("-D")
@@ -297,10 +326,20 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
     c.arg("-D")
         .arg(format!("DENY_KUBE={}", home.join(".kube").display()));
     c.arg("-D")
+        .arg(format!("DENY_OP={}", home.join(".config/op").display()));
+    c.arg("-D").arg(format!(
+        "DENY_KEYCHAINS={}",
+        home.join("Library/Keychains").display()
+    ));
+    c.arg("-D")
         .arg(format!("DENY_NETRC={}", home.join(".netrc").display()));
     c.arg("-D").arg(format!(
         "DENY_GIT_CREDS={}",
         home.join(".git-credentials").display()
+    ));
+    c.arg("-D").arg(format!(
+        "DENY_CONFIG_GIT_CREDS={}",
+        home.join(".config/git/credentials").display()
     ));
     c.arg("-D")
         .arg(format!("DENY_NPMRC={}", home.join(".npmrc").display()));
@@ -443,6 +482,7 @@ fn build_linux_bwrap_command(
             ".config/agentsafe",
             ".docker",
             ".kube",
+            ".config/op",
         ] {
             let p = home.join(rel);
             if p.is_dir() {
@@ -452,12 +492,19 @@ fn build_linux_bwrap_command(
         for rel_file in [
             ".netrc",
             ".git-credentials",
+            ".config/git/credentials",
             ".npmrc",
+            ".pypirc",
+            ".env",
             ".cargo/credentials.toml",
             ".cargo/credentials",
             ".carnot/server.token",
             ".zshenv",
             ".zshrc",
+            ".zsh_history",
+            ".bash_history",
+            ".python_history",
+            ".psql_history",
         ] {
             let p = home.join(rel_file);
             if p.is_file() {

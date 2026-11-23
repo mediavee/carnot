@@ -25,8 +25,14 @@ pub enum SessionEntry {
     Header {
         version: u32,
         session_id: String,
+        /// Stable provider cache-routing key inherited across `--fork`, `/fork`, and forked
+        /// subagents so OpenAI `prompt_cache_key` shards stay warm on forked branches.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_key_id: Option<String>,
         created_unix_ms: u64,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<PathBuf>,
         static_system_prompt: String,
         tools: Vec<ToolSpec>,
         prefix_hash: String,
@@ -80,6 +86,7 @@ pub struct ProjectedContext {
     pub static_system_prompt: String,
     pub tools: Vec<ToolSpec>,
     pub prefix_hash: String,
+    pub cache_key_id: String,
     pub messages: Vec<Arc<Message>>,
     pub checkpoint_index: Option<usize>,
 }
@@ -131,16 +138,56 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Lightweight metadata read from line 1 of a persisted session JSONL (used by ACP `session/list`).
+#[derive(Debug, Clone)]
+pub struct SessionHeaderSummary {
+    pub session_id: String,
+    pub model: String,
+    pub workspace_root: Option<PathBuf>,
+    pub created_unix_ms: u64,
+}
+
+/// Reads only the first line (`Header`) of a session JSONL file without loading the full trace.
+pub fn read_session_header(path: &Path) -> Option<SessionHeaderSummary> {
+    use std::io::{BufRead, BufReader};
+    let f = File::open(path).ok()?;
+    let mut reader = BufReader::new(f);
+    let mut first_line = String::new();
+    let n = reader.read_line(&mut first_line).ok()?;
+    if n == 0 {
+        return None;
+    }
+    match serde_json::from_str::<SessionEntry>(first_line.trim()).ok()? {
+        SessionEntry::Header {
+            session_id,
+            model,
+            workspace_root,
+            created_unix_ms,
+            ..
+        } => Some(SessionHeaderSummary {
+            session_id,
+            model,
+            workspace_root,
+            created_unix_ms,
+        }),
+        _ => None,
+    }
+}
+
 /// Live session backed by a persistent buffered JSONL writer.
 ///
-/// Only exposes append, trailing-only rewind (`apply_rewind`), and safe compaction
-/// (`apply_compaction`) — making mid-history mutation impossible by type construction.
+/// Only exposes append, cold-cache pruning, and safe compaction (`apply_compaction`) —
+/// making mid-history mutation impossible by type construction.
 #[derive(Debug)]
 pub struct SessionStore {
     pub session_id: String,
+    /// Stable cache-routing identifier (equals `session_id` on root sessions; inherited from
+    /// parent on forked sessions so provider cache keys remain warm).
+    pub cache_key_id: String,
     pub path: Option<PathBuf>,
     writer: Option<File>,
     pub model: String,
+    pub workspace_root: Option<PathBuf>,
     pub static_system_prompt: String,
     pub tools: Vec<ToolSpec>,
     pub prefix_hash: String,
@@ -149,7 +196,7 @@ pub struct SessionStore {
     checkpoint_index: Option<usize>,
     last_message_id: Option<String>,
     /// Last valid provider-reported input token count anchored at `(active_messages.len(), tokens)`.
-    /// Invalidated automatically by any compaction or rewind (inspired by Pi's `estimateProjectedContextTokens`).
+    /// Invalidated automatically by any compaction or cold prune.
     last_usage_anchor: Option<(usize, u64)>,
     /// Unix timestamp (ms) of the most recent recorded session activity (used to detect cold provider caches).
     last_activity_unix_ms: Option<u64>,
@@ -162,7 +209,36 @@ impl SessionStore {
         static_system_prompt: String,
         tools: Vec<ToolSpec>,
     ) -> Result<Self> {
+        Self::create_with_workspace(session_dir, None, model, static_system_prompt, tools)
+    }
+
+    pub fn create_with_workspace(
+        session_dir: Option<&Path>,
+        workspace_root: Option<PathBuf>,
+        model: String,
+        static_system_prompt: String,
+        tools: Vec<ToolSpec>,
+    ) -> Result<Self> {
+        Self::create_with_workspace_and_cache_key(
+            session_dir,
+            workspace_root,
+            model,
+            static_system_prompt,
+            tools,
+            None,
+        )
+    }
+
+    fn create_with_workspace_and_cache_key(
+        session_dir: Option<&Path>,
+        workspace_root: Option<PathBuf>,
+        model: String,
+        static_system_prompt: String,
+        tools: Vec<ToolSpec>,
+        inherited_cache_key_id: Option<String>,
+    ) -> Result<Self> {
         let session_id = uuid::Uuid::now_v7().to_string();
+        let cache_key_id = inherited_cache_key_id.unwrap_or_else(|| session_id.clone());
         let prefix_hash = compute_static_prefix_hash(&static_system_prompt, &tools)?;
 
         let (path, writer) = if let Some(dir) = session_dir {
@@ -176,9 +252,11 @@ impl SessionStore {
 
         let mut store = Self {
             session_id: session_id.clone(),
+            cache_key_id: cache_key_id.clone(),
             path,
             writer,
             model: model.clone(),
+            workspace_root: workspace_root.clone(),
             static_system_prompt: static_system_prompt.clone(),
             tools: tools.clone(),
             prefix_hash: prefix_hash.clone(),
@@ -190,12 +268,15 @@ impl SessionStore {
             last_activity_unix_ms: None,
         };
 
+        let header_cache_key = (cache_key_id != session_id).then_some(cache_key_id);
         store.append_entry(
             SessionEntry::Header {
                 version: 2,
                 session_id,
+                cache_key_id: header_cache_key,
                 created_unix_ms: now_unix_ms(),
                 model,
+                workspace_root,
                 static_system_prompt,
                 tools,
                 prefix_hash,
@@ -206,8 +287,18 @@ impl SessionStore {
     }
 
     /// Replays a JSONL session from disk, truncating any crash-truncated final line before
-    /// reopening for append (fixes Opus S-4 & N1!).
+    /// reopening for append.
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_internal(path, false)
+    }
+
+    /// Replays a JSONL session from disk in read-only mode (used by `--fork`): ignores any
+    /// crash-truncated trailing line in memory without modifying or opening the file for writing.
+    pub fn load_readonly(path: &Path) -> Result<Self> {
+        Self::load_internal(path, true)
+    }
+
+    fn load_internal(path: &Path, readonly: bool) -> Result<Self> {
         let raw = fs::read(path)?;
         let mut entries = Vec::new();
         let mut offset: usize = 0;
@@ -253,7 +344,7 @@ impl SessionStore {
             offset = line_end;
         }
 
-        if truncated_tail {
+        if truncated_tail && !readonly {
             let f = OpenOptions::new().write(true).open(path)?;
             f.set_len(valid_end as u64)?;
             f.sync_data()?;
@@ -261,7 +352,9 @@ impl SessionStore {
 
         let Some(SessionEntry::Header {
             session_id,
+            cache_key_id,
             model,
+            workspace_root,
             static_system_prompt,
             tools,
             prefix_hash,
@@ -274,12 +367,20 @@ impl SessionStore {
             )));
         };
 
-        let append_file = OpenOptions::new().create(true).append(true).open(path)?;
+        let (stored_path, writer) = if readonly {
+            (None, None)
+        } else {
+            let append_file = OpenOptions::new().create(true).append(true).open(path)?;
+            (Some(path.to_path_buf()), Some(append_file))
+        };
+        let resolved_cache_key = cache_key_id.unwrap_or_else(|| session_id.clone());
         let mut store = Self {
             session_id,
-            path: Some(path.to_path_buf()),
-            writer: Some(append_file),
+            cache_key_id: resolved_cache_key,
+            path: stored_path,
+            writer,
             model,
+            workspace_root,
             static_system_prompt,
             tools,
             prefix_hash,
@@ -294,6 +395,123 @@ impl SessionStore {
         for entry in entries {
             store.apply_in_memory(&entry);
             store.entries.push(entry);
+        }
+        Ok(store)
+    }
+
+    /// Strips any trailing incomplete assistant `ToolUse` message(s) so a forked session or
+    /// forked subagent never starts with an orphan `tool_use` block (which providers reject with
+    /// HTTP 400). Preserves zero-copy `Arc<Message>` sharing for every earlier turn.
+    pub fn sanitize_fork_messages(messages: &[Arc<Message>]) -> Vec<Arc<Message>> {
+        let mut end = messages.len();
+        while end > 0
+            && messages[end - 1].role == Role::Assistant
+            && messages[end - 1].has_tool_use()
+        {
+            end -= 1;
+        }
+        messages[..end].to_vec()
+    }
+
+    /// Forks this live session into a brand-new `SessionStore` (fresh UUID v7 `session_id`)
+    /// with identical static prefix (`static_system_prompt`, `tools`, `prefix_hash`) and a
+    /// sanitized zero-copy clone of `active_messages`.
+    ///
+    /// The original session file on disk is NEVER modified.
+    pub fn fork(&self, session_dir: Option<&Path>) -> Result<Self> {
+        Self::from_forked_snapshot_with_cache_key(
+            session_dir,
+            self.workspace_root.clone(),
+            self.model.clone(),
+            self.static_system_prompt.clone(),
+            self.tools.clone(),
+            &self.active_messages,
+            self.checkpoint_index,
+            Some(self.cache_key_id.clone()),
+        )
+    }
+
+    /// Builds a new `SessionStore` seeded from a parent conversation snapshot (used by
+    /// `SessionStore::fork` and prompt-cache-warm `Subagent` forks).
+    pub fn from_forked_snapshot(
+        session_dir: Option<&Path>,
+        workspace_root: Option<PathBuf>,
+        model: String,
+        static_system_prompt: String,
+        tools: Vec<ToolSpec>,
+        snapshot_messages: &[Arc<Message>],
+        checkpoint_index: Option<usize>,
+    ) -> Result<Self> {
+        Self::from_forked_snapshot_with_cache_key(
+            session_dir,
+            workspace_root,
+            model,
+            static_system_prompt,
+            tools,
+            snapshot_messages,
+            checkpoint_index,
+            None,
+        )
+    }
+
+    /// Builds a new `SessionStore` seeded from a parent conversation snapshot while optionally
+    /// inheriting the parent's `cache_key_id` so provider prompt-cache shards (e.g. OpenAI
+    /// `prompt_cache_key`) stay hot on the forked branch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_forked_snapshot_with_cache_key(
+        session_dir: Option<&Path>,
+        workspace_root: Option<PathBuf>,
+        model: String,
+        static_system_prompt: String,
+        tools: Vec<ToolSpec>,
+        snapshot_messages: &[Arc<Message>],
+        checkpoint_index: Option<usize>,
+        inherited_cache_key_id: Option<String>,
+    ) -> Result<Self> {
+        let mut store = Self::create_with_workspace_and_cache_key(
+            session_dir,
+            workspace_root,
+            model,
+            static_system_prompt,
+            tools,
+            inherited_cache_key_id,
+        )?;
+        let sanitized = Self::sanitize_fork_messages(snapshot_messages);
+        let persist = store.writer.is_some();
+        for msg in &sanitized {
+            if persist {
+                let id = uuid::Uuid::now_v7().to_string();
+                let entry = SessionEntry::Message {
+                    id: id.clone(),
+                    parent_id: store.last_message_id.clone(),
+                    timestamp_unix_ms: now_unix_ms(),
+                    message: (**msg).clone(),
+                };
+                // Buffer writes without per-message flush; flush once below for instant fork speed.
+                store.append_entry(entry, false)?;
+                store.last_message_id = Some(id);
+            } else {
+                // In-memory fork (e.g. disposable forked subagent): true zero-copy `Arc::clone`!
+                store.active_messages.push(Arc::clone(msg));
+            }
+        }
+        if let Some(cp) = checkpoint_index
+            && cp < store.active_messages.len()
+            && !store.active_messages[cp].has_tool_use()
+        {
+            store.checkpoint_index = Some(cp);
+            if persist {
+                let entry = SessionEntry::Checkpoint {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    message_index: cp,
+                    reason: "forked-parent-checkpoint".into(),
+                    timestamp_unix_ms: now_unix_ms(),
+                };
+                store.append_entry(entry, false)?;
+            }
+        }
+        if let Some(ref mut w) = store.writer {
+            w.flush()?;
         }
         Ok(store)
     }
@@ -530,6 +748,7 @@ impl SessionStore {
             static_system_prompt: self.static_system_prompt.clone(),
             tools: self.tools.clone(),
             prefix_hash: self.prefix_hash.clone(),
+            cache_key_id: self.cache_key_id.clone(),
             messages: self.active_messages.clone(),
             checkpoint_index: self.checkpoint_index,
         }

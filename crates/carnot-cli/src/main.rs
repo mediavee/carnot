@@ -1,16 +1,17 @@
 //! `carnot` CLI binary: headless print/json, ACP stdio, Host RPC stdio, HTTP/SSE API server,
 //! MCP 2026-07-28 / 2025-11-25 / Legacy SSE 2024-11-05 management (`carnot mcp list|inspect`),
 //! prefix-invariance CI audit, production diagnostics (`carnot doctor`), session resume,
-//! budget/timeout guardrails, graceful signal handling, and micro-benchmarks.
+//! budget/timeout guardrails, and graceful signal handling.
 
-mod bench;
 mod repl;
+#[cfg(feature = "tui")]
+mod tui;
 
 use carnot::{
     AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, McpManager,
     McpServerConfig, Profile, ProviderRegistry, ReasoningEffort, ResolvedAcpModel,
-    assert_prefix_invariance, load_mcp_configs, parse_acp_mcp_servers, serve_acp_stdio_with_host,
-    serve_http, serve_rpc_stdio,
+    assert_prefix_invariance, discover_dropin_specs, load_mcp_configs, parse_acp_mcp_servers,
+    serve_acp_stdio_with_host, serve_http, serve_rpc_stdio,
 };
 use carnot_ext::microskills::discover_agent_skills;
 use carnot_ext::prefix_guard::static_system_prompt;
@@ -88,6 +89,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Mode::Text)]
     mode: Mode,
 
+    /// Use minimalist line-oriented plain REPL instead of the full-screen TUI
+    #[arg(long)]
+    plain: bool,
+
     /// Module profile preset
     #[arg(long, value_enum, default_value_t = CliProfile::Carnot)]
     profile: CliProfile,
@@ -120,6 +125,10 @@ struct Cli {
     #[arg(long)]
     resume: Option<String>,
 
+    /// With `--resume`: fork into a brand-new session file without modifying the original
+    #[arg(long)]
+    fork: bool,
+
     /// Explicit `.mcp.json` config path(s) (repeatable)
     #[arg(long = "mcp-config")]
     mcp_configs: Vec<PathBuf>,
@@ -132,17 +141,78 @@ struct Cli {
     #[arg(long)]
     trust_workspace_mcp: bool,
 
-    /// Enable opt-in SSRF-safe `WebFetch` module
+    /// Drop-in file extension path(s) (executable script/binary speaking `carnot-ext/1` JSON-RPC; repeatable)
+    #[arg(long = "ext")]
+    extensions: Vec<PathBuf>,
+
+    /// Explicitly trust workspace-local `.carnot/extensions/` (disabled by default to prevent RCE)
+    #[arg(long = "trust-workspace-ext")]
+    trust_workspace_extensions: bool,
+
+    /// Enable compiled-in Rust `carnot-ext-web` extension (hybrid native + local search & fetch)
+    #[cfg(feature = "ext-web")]
     #[arg(long)]
     web: bool,
 
-    /// Enable opt-in Tier-1 LSP diagnostics module (`rust-analyzer`/`tsserver`/`pyright`/`gopls`)
+    /// Web extension mode: `auto` (prefer native provider search/fetch, fallback local), `native`, or `local`
+    #[cfg(feature = "ext-web")]
+    #[arg(long = "web-mode", default_value = "auto")]
+    web_mode: carnot::WebMode,
+
+    /// Restrict web search/fetch to specific hostname(s) (repeatable, e.g. `docs.rs`)
+    #[cfg(feature = "ext-web")]
+    #[arg(long = "web-allow-domain")]
+    web_allow_domains: Vec<String>,
+
+    /// Block web search/fetch from specific hostname(s) (repeatable)
+    #[cfg(feature = "ext-web")]
+    #[arg(long = "web-block-domain")]
+    web_block_domains: Vec<String>,
+
+    /// Enable compiled-in Rust `carnot-ext-lsp` extension (`LspQuery` + warm diagnostics, requires `--features ext-lsp`)
+    #[cfg(feature = "ext-lsp")]
     #[arg(long)]
     lsp: bool,
 
-    /// Enable disposable-context `Subagent` delegation module
+    /// Enable disposable-context `Subagent` delegation extension (requires `--features ext-subagent`)
+    #[cfg(feature = "ext-subagent")]
     #[arg(long)]
     subagent: bool,
+
+    /// Declarative Claude Code / Carnot hooks JSON file(s) (repeatable, requires `--features ext-hooks`)
+    #[cfg(feature = "ext-hooks")]
+    #[arg(long = "hooks-file")]
+    hooks_files: Vec<PathBuf>,
+
+    /// Also load user-global Claude Code hooks from `~/.claude/settings.json`
+    #[cfg(feature = "ext-hooks")]
+    #[arg(long = "claude-hooks")]
+    claude_hooks: bool,
+
+    /// Explicitly trust workspace-local `.carnot/hooks.json` and `.claude/settings*.json` (disabled by default to prevent RCE)
+    #[cfg(feature = "ext-hooks")]
+    #[arg(long = "trust-workspace-hooks")]
+    trust_workspace_hooks: bool,
+
+    /// Claude Code plugin directory path(s) (equivalent to `--plugin-dir`, repeatable, requires `--features ext-claude-plugins`)
+    #[cfg(feature = "ext-claude-plugins")]
+    #[arg(long = "claude-plugin")]
+    claude_plugins: Vec<PathBuf>,
+
+    /// Auto-discover installed enabled Claude Code plugins from `~/.claude/plugins/installed_plugins.json`
+    #[cfg(feature = "ext-claude-plugins")]
+    #[arg(long = "load-installed-claude-plugins")]
+    load_installed_claude_plugins: bool,
+
+    /// Enable cross-session persistent memory extension (`MemorySearch`/`MemorySave`, requires `--features ext-memory`)
+    #[cfg(feature = "ext-memory")]
+    #[arg(long)]
+    memory: bool,
+
+    /// Custom root directory for persistent memory store (defaults to `~/.carnot/memory`)
+    #[cfg(feature = "ext-memory")]
+    #[arg(long = "memory-dir")]
+    memory_dir: Option<PathBuf>,
 
     /// Enable enterprise `PolicyGuard` (command/path guardrails + secret redaction)
     #[arg(long)]
@@ -204,14 +274,10 @@ enum Commands {
         #[command(subcommand)]
         action: McpCommands,
     },
-    /// Run reproducible multi-suite benchmarks (micro, mcp 2026-07-28 vs 2025-11-25, replay ablation)
-    Bench {
-        /// Repository path to benchmark against (defaults to current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        /// Suite to run: all, micro, mcp, or replay
-        #[arg(long, default_value = "all")]
-        suite: String,
+    /// Authenticate with OAuth 2.0 providers (PKCE, Device Code, OpenRouter PKCE) & manage `~/.carnot/auth.json`
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommands,
     },
 }
 
@@ -221,6 +287,45 @@ enum McpCommands {
     List,
     /// Inspect all discovered MCP tool specs (minified & canonicalized)
     Inspect,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AuthCommands {
+    /// Log in to a provider via OAuth 2.0 (PKCE, Device Code, or OpenRouter PKCE) or store a token securely (`0600`)
+    Login {
+        /// Provider name or alias from providers.json (e.g. `openrouter`, `gemini`, `anthropic`, `openai`)
+        provider: String,
+        /// Use RFC 8628 Device Authorization Grant instead of browser loopback PKCE
+        #[arg(long)]
+        device: bool,
+        /// Headless/SSH mode: paste redirected callback URL or authorization code manually instead of binding localhost
+        #[arg(long)]
+        manual: bool,
+        /// Do not auto-open the system browser (print URL only)
+        #[arg(long = "no-browser")]
+        no_browser: bool,
+        /// Explicit localhost callback port for loopback PKCE redirect
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override OAuth `client_id` for this login
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// Store a Bearer access token read from stdin into `~/.carnot/auth.json` (`0600`)
+        #[arg(long = "token-stdin")]
+        token_stdin: bool,
+    },
+    /// Show secret-safe authentication & OAuth token status across all configured providers
+    Status,
+    /// Force-refresh a stored OAuth token immediately using its refresh_token
+    Refresh {
+        /// Provider name or alias from providers.json
+        provider: String,
+    },
+    /// Remove stored OAuth credentials for a provider from `~/.carnot/auth.json`
+    Logout {
+        /// Provider name or alias from providers.json
+        provider: String,
+    },
 }
 
 fn init_tracing_if_requested() {
@@ -270,7 +375,8 @@ fn main() {
                     "profile": format!("{:?}", cli.profile).to_lowercase(),
                     "modules": sw,
                     "canonical_tools": canonical_tool_specs().iter().map(|t| &t.name).collect::<Vec<_>>(),
-                    "optional_modules": ["web_fetch", "lsp_diagnostics", "subagent", "policy_guard", "mcp_2026_07_28"],
+                    "compiled_extensions": compiled_extensions(),
+                    "optional_modules": ["subagent", "policy_guard", "mcp_2026_07_28", "dropin_extensions"],
                 });
                 println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
                 return;
@@ -327,15 +433,8 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 }
                 return 0;
             }
-            Commands::Bench { repo, suite } => {
-                let s = match suite.to_ascii_lowercase().as_str() {
-                    "micro" => bench::BenchSuite::Micro,
-                    "mcp" => bench::BenchSuite::Mcp,
-                    "replay" => bench::BenchSuite::Replay,
-                    _ => bench::BenchSuite::All,
-                };
-                bench::run_bench_suite(repo, s).await;
-                return 0;
+            Commands::Auth { action } => {
+                return run_auth_cmd(&cli, action).await;
             }
             Commands::Serve { addr } => {
                 let (agent, mcp) = match build_agent(&cli, cwd).await {
@@ -410,12 +509,34 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
             } else if let Some(p) = cli.prompt {
                 p
             } else if matches!(cli.mode, Mode::Text) && std::io::stdin().is_terminal() {
-                let rc = repl::run_repl(agent).await;
+                let want_plain = cli.plain
+                    || !std::io::stdout().is_terminal()
+                    || std::env::var_os("CARNOT_PLAIN").is_some()
+                    || matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"));
+                #[cfg(feature = "tui")]
+                let rc = if !want_plain {
+                    tui::run_tui(
+                        agent,
+                        tui::TuiLaunchInfo {
+                            default_provider: cli.provider.clone(),
+                            provider_configs: cli.provider_configs.clone(),
+                            active_extensions: active_extension_badges(&cli),
+                        },
+                    )
+                    .await
+                } else {
+                    repl::run_repl(agent, cli.provider.clone(), cli.provider_configs.clone()).await
+                };
+                #[cfg(not(feature = "tui"))]
+                let rc = {
+                    let _ = want_plain;
+                    repl::run_repl(agent, cli.provider.clone(), cli.provider_configs.clone()).await
+                };
                 mcp.shutdown_all().await;
                 return rc;
             } else {
                 eprintln!(
-                    "usage: carnot [-p \"<prompt>\" | --prompt-file <path>] | carnot doctor | carnot --mode acp|rpc | carnot serve | carnot mcp list | carnot bench"
+                    "usage: carnot [-p \"<prompt>\" | --prompt-file <path>] | carnot doctor | carnot audit-prefix | carnot providers | carnot modules | carnot --mode acp|rpc | carnot serve | carnot mcp list"
                 );
                 mcp.shutdown_all().await;
                 return 2;
@@ -534,6 +655,60 @@ async fn wait_termination_signal() -> i32 {
     }
 }
 
+fn compiled_extensions() -> Vec<&'static str> {
+    let items: &[&str] = &[
+        #[cfg(feature = "ext-web")]
+        "carnot-ext-web",
+        #[cfg(feature = "ext-lsp")]
+        "carnot-ext-lsp",
+        #[cfg(feature = "ext-subagent")]
+        "carnot-ext-subagent",
+        #[cfg(feature = "ext-hooks")]
+        "carnot-ext-hooks",
+        #[cfg(feature = "ext-claude-plugins")]
+        "carnot-ext-claude-plugins",
+        #[cfg(feature = "ext-memory")]
+        "carnot-ext-memory",
+    ];
+    items.to_vec()
+}
+
+#[cfg(feature = "tui")]
+fn active_extension_badges(cli: &Cli) -> Vec<String> {
+    let mut out = Vec::new();
+    #[cfg(feature = "ext-web")]
+    if cli.web {
+        out.push("web".to_string());
+    }
+    #[cfg(feature = "ext-memory")]
+    if cli.memory || cli.memory_dir.is_some() {
+        out.push("memory".to_string());
+    }
+    #[cfg(feature = "ext-subagent")]
+    if cli.subagent {
+        out.push("subagent".to_string());
+    }
+    #[cfg(feature = "ext-lsp")]
+    if cli.lsp {
+        out.push("lsp".to_string());
+    }
+    #[cfg(feature = "ext-hooks")]
+    if !cli.hooks_files.is_empty() || cli.claude_hooks || cli.trust_workspace_hooks {
+        out.push("hooks".to_string());
+    }
+    #[cfg(feature = "ext-claude-plugins")]
+    if !cli.claude_plugins.is_empty() || cli.load_installed_claude_plugins {
+        out.push("plugins".to_string());
+    }
+    if !cli.extensions.is_empty() || cli.trust_workspace_extensions {
+        out.push("ext".to_string());
+    }
+    if cli.policy_guard {
+        out.push("policy".to_string());
+    }
+    out
+}
+
 async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
     let prefix = assert_prefix_invariance(|_date, _cwd, _sid| {
         (static_system_prompt().to_string(), canonical_tool_specs())
@@ -598,6 +773,7 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
 
     let skills = discover_agent_skills(cwd, &cli.skills_dirs);
     let skills_names: Vec<&str> = skills.iter().map(|(n, _, _)| n.as_str()).collect();
+    let dropin_exts = discover_dropin_specs(cwd, &cli.extensions, cli.trust_workspace_extensions);
 
     let out = json!({
         "status": if prefix.is_ok() { "ok" } else { "degraded" },
@@ -611,6 +787,10 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
         "context_window": context_window,
         "sandbox": sandbox_backend,
         "mcp": mcp_info,
+        "extensions": {
+            "compiled": compiled_extensions(),
+            "dropin": dropin_exts.iter().map(|e| json!({"name": e.name, "source": e.source})).collect::<Vec<_>>(),
+        },
         "skills": { "count": skills_names.len(), "names": skills_names },
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
@@ -671,40 +851,26 @@ impl AcpHost for CliAcpHost {
             return Vec::new();
         };
         let cat = reg.catalog();
-        let has_labeled = cat
-            .models
-            .values()
-            .any(|e| e.provider.is_some() && e.label.is_some());
-        // Advertise models that explicitly declare a provider (skipping unlabeled catch-all prefix
-        // entries when labeled models are present), ordered by optional `order` then ID.
-        let mut items: Vec<(u32, AcpModelInfo)> = cat
-            .models
-            .iter()
-            .filter_map(|(id, entry)| {
-                let prov_id = entry.provider.as_deref()?;
-                if has_labeled && entry.label.is_none() {
-                    return None;
+        reg.available_models(false)
+            .into_iter()
+            .map(|m| {
+                let desc = cat
+                    .find_provider(&m.provider)
+                    .map(|(_, e)| {
+                        if !e.description.is_empty() {
+                            e.description.clone()
+                        } else {
+                            m.provider.clone()
+                        }
+                    })
+                    .or(Some(m.provider));
+                AcpModelInfo {
+                    id: m.id,
+                    name: m.label,
+                    description: desc,
                 }
-                // Only advertise models whose declared provider exists in the catalog
-                let (_, prov_entry) = cat.find_provider(prov_id)?;
-                let name = entry.label.clone().unwrap_or_else(|| id.clone());
-                let desc = if !prov_entry.description.is_empty() {
-                    Some(prov_entry.description.clone())
-                } else {
-                    Some(prov_id.to_string())
-                };
-                Some((
-                    entry.order.unwrap_or(500),
-                    AcpModelInfo {
-                        id: id.clone(),
-                        name,
-                        description: desc,
-                    },
-                ))
             })
-            .collect();
-        items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
-        items.into_iter().map(|(_, info)| info).collect()
+            .collect()
     }
 
     fn resolve_model(&self, model_id: &str) -> carnot::Result<ResolvedAcpModel> {
@@ -778,6 +944,9 @@ async fn build_agent_with_mcp(
     } else {
         cli.provider.clone()
     };
+    let interactive_surface = matches!(cli.mode, Mode::Acp | Mode::Rpc)
+        || matches!(cli.command, Some(Commands::Serve { .. }))
+        || (cli.prompt.is_none() && cli.prompt_file.is_none() && cli.command.is_none());
     let mut b = CarnotBuilder::new(cwd.clone())
         .profile(cli.profile.into())
         .model_opt(cli.model.clone())
@@ -786,11 +955,71 @@ async fn build_agent_with_mcp(
         .cache_ttl(ttl)
         .persist_session(!cli.no_session)
         .autonomous_gates(cli.gates.clone())
-        .web_fetch(cli.web)
-        .lsp_diagnostics(cli.lsp)
-        .subagent(cli.subagent)
         .policy_guard(cli.policy_guard)
-        .trust_workspace_mcp(cli.trust_workspace_mcp);
+        .ask_user(interactive_surface)
+        .trust_workspace_mcp(cli.trust_workspace_mcp)
+        .trust_workspace_extensions(cli.trust_workspace_extensions);
+
+    #[cfg(feature = "ext-subagent")]
+    {
+        b = b.subagent(cli.subagent);
+    }
+    #[cfg(feature = "ext-web")]
+    if cli.web {
+        b = b.web_config(carnot::WebConfig {
+            mode: cli.web_mode,
+            allowed_domains: cli.web_allow_domains.clone(),
+            blocked_domains: cli.web_block_domains.clone(),
+            ..carnot::WebConfig::default()
+        });
+    }
+    #[cfg(feature = "ext-lsp")]
+    {
+        b = b.lsp_diagnostics(cli.lsp);
+    }
+    #[cfg(feature = "ext-hooks")]
+    {
+        let user_hooks_exists = std::env::var_os("HOME")
+            .map(|h| {
+                PathBuf::from(h)
+                    .join(".carnot")
+                    .join("hooks.json")
+                    .is_file()
+            })
+            .unwrap_or(false);
+        if !cli.hooks_files.is_empty()
+            || cli.claude_hooks
+            || cli.trust_workspace_hooks
+            || user_hooks_exists
+        {
+            b = b.hooks_config(carnot::HooksConfig {
+                files: cli.hooks_files.clone(),
+                load_carnot_user_hooks: true,
+                load_claude_user_settings: cli.claude_hooks,
+                trust_workspace_hooks: cli.trust_workspace_hooks,
+                fail_closed: false,
+            });
+        }
+    }
+    #[cfg(feature = "ext-claude-plugins")]
+    if !cli.claude_plugins.is_empty() || cli.load_installed_claude_plugins {
+        b = b.claude_plugins_config(carnot::ClaudePluginsConfig {
+            plugin_dirs: cli.claude_plugins.clone(),
+            load_installed_plugins: cli.load_installed_claude_plugins,
+            fail_closed_hooks: false,
+        });
+    }
+    #[cfg(feature = "ext-memory")]
+    if cli.memory || cli.memory_dir.is_some() {
+        let mut mc = carnot::MemoryConfig::default();
+        if let Some(ref dir) = cli.memory_dir {
+            mc.root_dir = dir.clone();
+        }
+        b = b.memory_config(mc);
+    }
+    for ext in &cli.extensions {
+        b = b.extension(ext.clone());
+    }
 
     if let Some(mt) = cli.max_turns {
         b = b.max_turns(mt);
@@ -828,7 +1057,7 @@ async fn build_agent_with_mcp(
                 sdir.join(format!("{res}.jsonl"))
             }
         };
-        b = b.resume_session(resolved);
+        b = b.resume_session(resolved).fork_session(cli.fork);
     }
     if cli.no_sandbox {
         b = b
@@ -839,4 +1068,231 @@ async fn build_agent_with_mcp(
         b = b.sandbox_network(true);
     }
     b.build_async().await
+}
+
+async fn run_auth_cmd(cli: &Cli, action: &AuthCommands) -> i32 {
+    let catalog = match carnot::ProviderCatalog::load_layered(&cli.provider_configs) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("auth catalog error: {e}");
+            return 1;
+        }
+    };
+    let Some(store) = carnot::AuthStore::open_default() else {
+        eprintln!("auth error: could not determine HOME directory for ~/.carnot/auth.json");
+        return 1;
+    };
+
+    match action {
+        AuthCommands::Status => {
+            let stored = store.list().unwrap_or_default();
+            let summaries = catalog.summaries();
+            let mut rows: Vec<serde_json::Value> = Vec::with_capacity(summaries.len());
+            for s in summaries {
+                let entry_opt = catalog.find_provider(&s.id).map(|(_, e)| e);
+                let entry_oauth = entry_opt.and_then(|e| e.oauth.as_ref());
+                let profile = entry_opt
+                    .map(|e| e.oauth_profile(&s.id))
+                    .unwrap_or(s.id.as_str());
+                let tok = stored.get(profile);
+                rows.push(json!({
+                    "provider": s.id,
+                    "oauth_profile": profile,
+                    "api": s.api,
+                    "configured": s.configured,
+                    "auth_source": s.auth_source,
+                    "oauth_flow": entry_oauth.map(|o| format!("{:?}", o.flow).to_lowercase()),
+                    "oauth_stored": tok.is_some(),
+                    "oauth_expired": tok.map(|t| t.is_expired()),
+                    "oauth_expires_in_secs": tok.and_then(|t| t.seconds_until_expiry()),
+                    "oauth_refreshable": tok.map(|t| t.can_refresh(entry_oauth)),
+                }));
+            }
+            let out = json!({
+                "store_path": store.path(),
+                "providers": rows,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            0
+        }
+        AuthCommands::Login {
+            provider,
+            device,
+            manual,
+            no_browser,
+            port,
+            client_id,
+            token_stdin,
+        } => {
+            let (canonical_id, entry) = match catalog.find_provider(provider) {
+                Some((id, e)) => (id.to_string(), e.clone()),
+                None => {
+                    eprintln!("auth error: unknown provider `{provider}` (run `carnot providers`)");
+                    return 1;
+                }
+            };
+            let profile = entry.oauth_profile(&canonical_id).to_string();
+
+            if *token_stdin {
+                let mut buf = String::new();
+                if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                    eprintln!("auth error reading token from stdin: {e}");
+                    return 1;
+                }
+                match carnot::save_manual_token(&profile, &buf, &store) {
+                    Ok(_) => {
+                        println!(
+                            "Stored Bearer token for `{canonical_id}` (profile `{profile}`) in {} (mode 0600).",
+                            store.path().display()
+                        );
+                        return 0;
+                    }
+                    Err(e) => {
+                        eprintln!("auth error: {e}");
+                        return 1;
+                    }
+                }
+            }
+
+            let Some(oauth_cfg) = entry.oauth.as_ref() else {
+                eprintln!(
+                    "Provider `{canonical_id}` has no OAuth 2.0 flow configured in providers.json.\n\
+                     Either add an `oauth` block in ~/.carnot/providers.json (standard PKCE / Device Code),\n\
+                     or store a Bearer token securely with: printf '%s' \"$TOKEN\" | carnot auth login {canonical_id} --token-stdin"
+                );
+                return 1;
+            };
+
+            let opts = carnot::OAuthLoginOptions {
+                force_device_flow: *device,
+                manual_callback: *manual,
+                open_browser: !*no_browser,
+                port_override: *port,
+                client_id_override: client_id.clone(),
+                timeout: Duration::from_secs(300),
+            };
+
+            let res = carnot::login_with_oauth(
+                &profile,
+                oauth_cfg,
+                &store,
+                &opts,
+                |prompt| match prompt {
+                    carnot::OAuthPrompt::OpenUrl {
+                        url,
+                        callback_url,
+                        manual_paste,
+                    } => {
+                        eprintln!("Authenticate `{canonical_id}` by opening:\n  {url}");
+                        if manual_paste {
+                            if callback_url.is_empty() {
+                                eprintln!(
+                                    "After approving, paste the displayed authorization code below and press Enter:"
+                                );
+                            } else {
+                                eprintln!(
+                                    "After approving, paste the full callback URL (starting with {callback_url}) or code below and press Enter:"
+                                );
+                            }
+                        } else {
+                            eprintln!("Waiting for OAuth callback on {callback_url} ...");
+                        }
+                    }
+                    carnot::OAuthPrompt::DeviceCode {
+                        verification_uri,
+                        verification_uri_complete,
+                        user_code,
+                    } => {
+                        eprintln!("Authenticate `{canonical_id}` via Device Code:");
+                        eprintln!("  URL:  {verification_uri}");
+                        eprintln!("  Code: {user_code}");
+                        if let Some(full) = verification_uri_complete {
+                            eprintln!("  Direct link: {full}");
+                        }
+                        eprintln!("Waiting for approval ...");
+                    }
+                },
+                || {
+                    let mut line = String::new();
+                    std::io::stdin()
+                        .read_line(&mut line)
+                        .map_err(carnot::CarnotError::Io)?;
+                    Ok(line)
+                },
+            )
+            .await;
+
+            match res {
+                Ok(tok) => {
+                    let expiry = tok
+                        .seconds_until_expiry()
+                        .map(|s| format!(" (expires in {s}s)"))
+                        .unwrap_or_default();
+                    let refreshable = if tok.refresh_token.is_some() {
+                        ", auto-refresh enabled"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "Authenticated `{canonical_id}` (profile `{profile}`) and saved to {}{expiry}{refreshable}.",
+                        store.path().display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("auth login failed: {e}");
+                    1
+                }
+            }
+        }
+        AuthCommands::Refresh { provider } => {
+            let (canonical_id, entry) = match catalog.find_provider(provider) {
+                Some((id, e)) => (id.to_string(), e.clone()),
+                None => {
+                    eprintln!("auth error: unknown provider `{provider}`");
+                    return 1;
+                }
+            };
+            let profile = entry.oauth_profile(&canonical_id).to_string();
+            match carnot::refresh_stored_token(&profile, entry.oauth.as_ref(), &store).await {
+                Ok(tok) => {
+                    let expiry = tok
+                        .seconds_until_expiry()
+                        .map(|s| format!(" (valid for {s}s)"))
+                        .unwrap_or_default();
+                    println!(
+                        "Refreshed OAuth token for `{canonical_id}` (profile `{profile}`){expiry}."
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("auth refresh failed: {e}");
+                    1
+                }
+            }
+        }
+        AuthCommands::Logout { provider } => {
+            let profile = catalog
+                .find_provider(provider)
+                .map(|(id, e)| e.oauth_profile(id).to_string())
+                .unwrap_or_else(|| provider.to_string());
+            match store.remove(&profile) {
+                Ok(true) => {
+                    println!(
+                        "Removed stored credentials for `{profile}` from {}.",
+                        store.path().display()
+                    );
+                    0
+                }
+                Ok(false) => {
+                    println!("No stored credentials found for `{profile}`.");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("auth logout failed: {e}");
+                    1
+                }
+            }
+        }
+    }
 }

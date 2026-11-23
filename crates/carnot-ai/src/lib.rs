@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod compat;
 pub mod faux;
 pub mod google;
+pub mod oauth;
 pub mod openai;
 pub mod openai_responses;
 pub mod registry;
@@ -21,7 +22,10 @@ pub mod subprocess;
 #[cfg(test)]
 mod conformance_tests;
 
-use carnot_core::{CacheTtl, Message, ReasoningEffort, Result, StopReason, ToolSpec, Usage};
+use carnot_core::{
+    CacheTtl, Message, NativeWebConfig, ProviderWebCapabilities, ReasoningEffort, Result,
+    StopReason, ToolSpec, Usage,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -82,6 +86,8 @@ pub struct ProviderRequest {
     /// up to the previous turn's boundary without paying a `1.25x`/`2.0x` cache-write surcharge
     /// on the discarded tail + compaction prompt.
     pub skip_tail_cache_write: bool,
+    /// Optional provider-native server-side web search & fetch configuration.
+    pub native_web: NativeWebConfig,
 }
 
 /// Incremental streaming event from any model provider.
@@ -120,6 +126,11 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Declares whether this provider + model natively supports server-side web search and/or fetch.
+    fn web_capabilities(&self, _model: &str) -> ProviderWebCapabilities {
+        ProviderWebCapabilities::default()
+    }
+
     /// True when changing `ProviderRequest::effort` preserves the provider's prompt cache for
     /// `model` (e.g. Anthropic `output_config.effort` on adaptive/native models vs legacy
     /// `thinking.budget_tokens` models where changing budget invalidates message caches).
@@ -132,4 +143,62 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<mpsc::Receiver<StreamEvent>>>;
+}
+
+/// Sends a JSON POST request applying static `query_params`, provider headers, live auth
+/// (including proactive OAuth refresh), and a single reactive retry on HTTP `401 Unauthorized`
+/// when credentials are refreshable.
+pub(crate) async fn send_authorized_json_post(
+    client: &reqwest::Client,
+    spec: &crate::catalog::ResolvedProviderSpec,
+    raw_url: &str,
+    extra_headers: &[(String, String)],
+    body: &serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response> {
+    let url = spec.build_url(raw_url);
+    let mut rejected_token: Option<String> = None;
+    for attempt in 0..2 {
+        let mut rb = client.post(&url).header("content-type", "application/json");
+        let used_token;
+        (rb, used_token) = spec
+            .auth
+            .apply_to_request_async(rb, rejected_token.as_deref())
+            .await?;
+        for (k, v) in &spec.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        for (k, v) in extra_headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+
+        let resp = tokio::time::timeout(timeout, rb.json(body).send())
+            .await
+            .map_err(|_| carnot_core::CarnotError::Provider {
+                provider: spec.provider_id.clone(),
+                message: format!("HTTP response headers timeout ({}s)", timeout.as_secs()),
+                retryable: true,
+                retry_after_ms: None,
+            })?
+            .map_err(|e| carnot_core::CarnotError::Provider {
+                provider: spec.provider_id.clone(),
+                message: e.without_url().to_string(),
+                retryable: true,
+                retry_after_ms: None,
+            })?;
+
+        if attempt == 0
+            && resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && spec.auth.supports_refresh()
+        {
+            tracing::debug!(
+                provider = %spec.provider_id,
+                "received HTTP 401; forcing single-flight OAuth token refresh and retrying once"
+            );
+            rejected_token = used_token;
+            continue;
+        }
+        return Ok(resp);
+    }
+    unreachable!("loop always returns on attempt 1")
 }

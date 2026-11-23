@@ -26,7 +26,7 @@ pub use config::{
 };
 pub use transport::{ListToolsResponse, McpClient, ProgressCallback, encode_mcp_header_value};
 
-use carnot_cas::{CasStore, shape_text_output};
+use carnot_cas::{CasStore, shape_command_output_with_redaction};
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolResultBlock, ToolSpec};
 use carnot_tools::{BoxFuture, Tool};
 use serde_json::{Value, json};
@@ -611,11 +611,13 @@ impl Tool for McpToolProxy {
             let mut handle_rel: Option<String> = None;
             if !text_parts.is_empty() {
                 let joined = text_parts.join("\n");
-                let shaped = shape_text_output(
+                let shaped = shape_command_output_with_redaction(
+                    None,
                     &joined,
                     self.cas_enabled.then_some(self.cas.as_ref()),
                     self.spill_threshold,
                     self.preview_max,
+                    true,
                 )?;
                 handle_rel = shaped.spilled.map(|h| h.rel_path);
                 blocks.push(ToolResultBlock::text(shaped.text));

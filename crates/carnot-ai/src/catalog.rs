@@ -9,11 +9,13 @@
 //! layered/overridden at runtime by `~/.carnot/providers.json` and explicit `--provider-config`.
 
 use crate::compat::json_merge_patch;
+use crate::oauth::{AuthStore, OAuthConfig, OAuthTokenManager};
 use carnot_core::{CarnotError, ModelPricing, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Embedded default provider + model catalog (pure data, zero hardcoded Rust provider branches).
 pub const EMBEDDED_PROVIDERS_JSON: &str = include_str!("../catalog/providers.json");
@@ -55,12 +57,15 @@ pub struct ProviderEntry {
     pub auth_chain: Vec<AuthEntry>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Optional static URL query parameters appended to every request (e.g. `api-version`).
+    #[serde(default)]
+    pub query_params: BTreeMap<String, String>,
     #[serde(default)]
     pub betas: Vec<String>,
     #[serde(default)]
     pub cache_diagnosis_beta: Option<String>,
     #[serde(default)]
-    pub native_tool_search: bool,
+    pub native_tool_search: Option<bool>,
     #[serde(default)]
     pub compat: CompatFlags,
     #[serde(default)]
@@ -69,6 +74,22 @@ pub struct ProviderEntry {
     pub body_patch: Option<Value>,
     #[serde(default)]
     pub subprocess: Option<SubprocessProviderConfig>,
+    /// Optional standards-compliant OAuth 2.0 configuration (`carnot auth login <provider>`).
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
+}
+
+impl ProviderEntry {
+    /// Returns the OAuth token store profile name for this provider (`auth_chain[].profile` if
+    /// configured on an `oauth` entry, otherwise `canonical_id`).
+    pub fn oauth_profile<'a>(&'a self, canonical_id: &'a str) -> &'a str {
+        self.auth_chain
+            .iter()
+            .find(|a| matches!(a.scheme, AuthScheme::Oauth))
+            .and_then(|a| a.profile.as_deref())
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(canonical_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +99,7 @@ pub enum AuthScheme {
     XApiKey,
     Header,
     Query,
+    Oauth,
     None,
 }
 
@@ -90,6 +112,9 @@ pub struct AuthEntry {
     pub header_name: Option<String>,
     #[serde(default)]
     pub query_param: Option<String>,
+    /// Optional OAuth token profile name in `~/.carnot/auth.json` (defaults to canonical provider ID).
+    #[serde(default)]
+    pub profile: Option<String>,
     /// Optional secret command executed lazily (e.g. `agentsafe get ...`). NEVER stores raw secrets in JSON!
     #[serde(default)]
     pub cmd: Option<Vec<String>>,
@@ -110,6 +135,10 @@ pub enum ResolvedAuth {
     Query {
         param: String,
         value: String,
+        source: String,
+    },
+    OAuth {
+        manager: Arc<OAuthTokenManager>,
         source: String,
     },
 }
@@ -133,6 +162,11 @@ impl std::fmt::Debug for ResolvedAuth {
                 .debug_struct("ResolvedAuth::Query")
                 .field("param", param)
                 .field("value", &"<redacted>")
+                .field("source", source)
+                .finish(),
+            Self::OAuth { source, .. } => f
+                .debug_struct("ResolvedAuth::OAuth")
+                .field("token", &"<redacted>")
                 .field("source", source)
                 .finish(),
         }
@@ -167,9 +201,34 @@ impl ResolvedAuth {
 
     pub fn apply_to_request(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
-            Self::None | Self::Query { .. } => req,
+            Self::None | Self::Query { .. } | Self::OAuth { .. } => req,
             Self::Bearer { token, .. } => req.bearer_auth(token),
             Self::Header { name, value, .. } => req.header(name.as_str(), value.as_str()),
+        }
+    }
+
+    /// Async auth application that supports proactive & compare-and-swap OAuth token refresh.
+    /// Returns the modified `RequestBuilder` and (for OAuth) the exact access token attached so
+    /// an HTTP `401` retry can pass it as `rejected_token` to deduplicate concurrent refreshes.
+    pub async fn apply_to_request_async(
+        &self,
+        req: reqwest::RequestBuilder,
+        rejected_token: Option<&str>,
+    ) -> Result<(reqwest::RequestBuilder, Option<String>)> {
+        match self {
+            Self::OAuth { manager, .. } => {
+                let token = manager.access_token(rejected_token).await?;
+                Ok((req.bearer_auth(&token), Some(token)))
+            }
+            other => Ok((other.apply_to_request(req), None)),
+        }
+    }
+
+    /// True if this credential can be refreshed (e.g., OAuth with a stored `refresh_token`).
+    pub fn supports_refresh(&self) -> bool {
+        match self {
+            Self::OAuth { manager, .. } => manager.supports_refresh(),
+            _ => false,
         }
     }
 
@@ -178,7 +237,8 @@ impl ResolvedAuth {
             Self::None => "none",
             Self::Bearer { source, .. }
             | Self::Header { source, .. }
-            | Self::Query { source, .. } => source,
+            | Self::Query { source, .. }
+            | Self::OAuth { source, .. } => source,
         }
     }
 }
@@ -245,6 +305,35 @@ pub struct CompatFlags {
     pub envelope_user_agent: Option<String>,
     #[serde(default)]
     pub system_preamble: Option<String>,
+    /// Provider + model natively supports server-side web search (Anthropic `web_search`,
+    /// OpenAI Responses `web_search`, Gemini `googleSearch`).
+    #[serde(default)]
+    pub supports_native_web_search: Option<bool>,
+    /// Provider + model natively supports server-side URL fetch (Anthropic `web_fetch`,
+    /// OpenAI Responses `web_search`, Gemini `urlContext`).
+    #[serde(default)]
+    pub supports_native_web_fetch: Option<bool>,
+    /// Optional server-side web search tool type override (Anthropic default: `web_search_20250305`).
+    #[serde(default)]
+    pub native_web_search_type: Option<String>,
+    /// Optional server-side web fetch tool type override (Anthropic default: `web_fetch_20250910`).
+    #[serde(default)]
+    pub native_web_fetch_type: Option<String>,
+    /// Optional beta header sent ONLY when native web fetch is active (Anthropic: `web-fetch-2025-09-10`).
+    #[serde(default)]
+    pub native_web_fetch_beta: Option<String>,
+    /// OpenAI-compatible gateway supports Anthropic/Gemini `cache_control` breakpoints inside
+    /// content-part arrays (e.g., OpenRouter routing to `anthropic/*` or `google/gemini*`).
+    #[serde(default)]
+    pub supports_cache_control: Option<bool>,
+    /// Optional model-ID prefixes restricting when `supports_cache_control` is emitted (when empty/unset,
+    /// applies to all models on that provider).
+    #[serde(default)]
+    pub cache_control_model_prefixes: Option<Vec<String>>,
+    /// Emit `"ttl": "1h"` on static/Turn-1 `cache_control` breakpoints for `anthropic/*` models
+    /// when `CacheTtl::Long1h | CacheTtl::Hybrid` is active.
+    #[serde(default)]
+    pub supports_cache_control_1h_ttl: Option<bool>,
 }
 
 impl CompatFlags {
@@ -304,6 +393,32 @@ impl CompatFlags {
                 .system_preamble
                 .clone()
                 .or_else(|| self.system_preamble.clone()),
+            supports_native_web_search: ov
+                .supports_native_web_search
+                .or(self.supports_native_web_search),
+            supports_native_web_fetch: ov
+                .supports_native_web_fetch
+                .or(self.supports_native_web_fetch),
+            native_web_search_type: ov
+                .native_web_search_type
+                .clone()
+                .or_else(|| self.native_web_search_type.clone()),
+            native_web_fetch_type: ov
+                .native_web_fetch_type
+                .clone()
+                .or_else(|| self.native_web_fetch_type.clone()),
+            native_web_fetch_beta: ov
+                .native_web_fetch_beta
+                .clone()
+                .or_else(|| self.native_web_fetch_beta.clone()),
+            supports_cache_control: ov.supports_cache_control.or(self.supports_cache_control),
+            cache_control_model_prefixes: ov
+                .cache_control_model_prefixes
+                .clone()
+                .or_else(|| self.cache_control_model_prefixes.clone()),
+            supports_cache_control_1h_ttl: ov
+                .supports_cache_control_1h_ttl
+                .or(self.supports_cache_control_1h_ttl),
         }
     }
 }
@@ -316,6 +431,8 @@ pub struct UsageMap {
     pub output_ptr: String,
     #[serde(default = "default_cache_read_ptr")]
     pub cache_read_ptr: Option<String>,
+    #[serde(default)]
+    pub cache_write_ptr: Option<String>,
     #[serde(default = "default_reasoning_ptr")]
     pub reasoning_ptr: Option<String>,
     #[serde(default = "default_true")]
@@ -346,6 +463,7 @@ impl Default for UsageMap {
             input_ptr: default_input_ptr(),
             output_ptr: default_output_ptr(),
             cache_read_ptr: default_cache_read_ptr(),
+            cache_write_ptr: None,
             reasoning_ptr: default_reasoning_ptr(),
             cached_included_in_input: true,
             reasoning_included_in_output: true,
@@ -404,6 +522,7 @@ pub struct ResolvedProviderSpec {
     pub project_id: Option<String>,
     pub auth: ResolvedAuth,
     pub headers: BTreeMap<String, String>,
+    pub query_params: BTreeMap<String, String>,
     pub betas: Vec<String>,
     pub cache_diagnosis_beta: Option<String>,
     pub native_tool_search: bool,
@@ -463,6 +582,19 @@ impl ResolvedProviderSpec {
             json_merge_patch(body, patch);
         }
     }
+
+    /// Appends configured static `query_params` (e.g., `api-version`) and any query-based auth.
+    pub fn build_url(&self, raw_url: &str) -> String {
+        let mut out = raw_url.to_string();
+        for (k, v) in &self.query_params {
+            let sep = if out.contains('?') { '&' } else { '?' };
+            out.push(sep);
+            out.push_str(&percent_encode_component(k));
+            out.push('=');
+            out.push_str(&percent_encode_component(v));
+        }
+        self.auth.apply_to_url(&out)
+    }
 }
 
 /// Public summary emitted by `carnot providers` (NEVER includes secret values!).
@@ -477,6 +609,7 @@ pub struct ProviderSummary {
     pub auth_env_vars: Vec<String>,
     pub configured: bool,
     pub auth_source: String,
+    pub oauth_supported: bool,
 }
 
 impl ProviderCatalog {
@@ -534,10 +667,93 @@ impl ProviderCatalog {
     }
 
     pub fn merge(&mut self, other: ProviderCatalog) {
-        for (k, v) in other.providers {
+        for (k, mut v) in other.providers {
+            if let Some(base) = self.providers.get(&k)
+                && base.api == v.api
+            {
+                if v.aliases.is_empty() {
+                    v.aliases = base.aliases.clone();
+                }
+                if v.description.is_empty() {
+                    v.description = base.description.clone();
+                }
+                if v.base_url.is_empty() {
+                    v.base_url = base.base_url.clone();
+                }
+                if v.fallback_base_urls.is_empty() {
+                    v.fallback_base_urls = base.fallback_base_urls.clone();
+                }
+                if v.base_url_envs.is_empty() {
+                    v.base_url_envs = base.base_url_envs.clone();
+                }
+                if v.project_env.is_none() {
+                    v.project_env = base.project_env.clone();
+                }
+                if v.default_model.is_none() {
+                    v.default_model = base.default_model.clone();
+                }
+                if v.auth_chain.is_empty() {
+                    v.auth_chain = base.auth_chain.clone();
+                }
+                if !base.headers.is_empty() {
+                    let mut merged_headers = base.headers.clone();
+                    merged_headers.extend(v.headers);
+                    v.headers = merged_headers;
+                }
+                if !base.query_params.is_empty() {
+                    let mut merged_qp = base.query_params.clone();
+                    merged_qp.extend(v.query_params);
+                    v.query_params = merged_qp;
+                }
+                if v.betas.is_empty() {
+                    v.betas = base.betas.clone();
+                }
+                if v.cache_diagnosis_beta.is_none() {
+                    v.cache_diagnosis_beta = base.cache_diagnosis_beta.clone();
+                }
+                v.native_tool_search = v.native_tool_search.or(base.native_tool_search);
+                v.compat = base.compat.merge_override(&v.compat);
+                if v.body_patch.is_none() {
+                    v.body_patch = base.body_patch.clone();
+                }
+                if v.subprocess.is_none() {
+                    v.subprocess = base.subprocess.clone();
+                }
+                if v.oauth.is_none() {
+                    v.oauth = base.oauth.clone();
+                }
+            }
             self.providers.insert(k, v);
         }
-        for (k, v) in other.models {
+        for (k, mut v) in other.models {
+            if let Some(base) = self.models.get(&k) {
+                v.provider = v.provider.or_else(|| base.provider.clone());
+                v.label = v.label.or_else(|| base.label.clone());
+                v.order = v.order.or(base.order);
+                v.api = v.api.or_else(|| base.api.clone());
+                v.pricing = v.pricing.or(base.pricing);
+                v.context_window = v.context_window.or(base.context_window);
+                v.max_output_tokens = v.max_output_tokens.or(base.max_output_tokens);
+                v.supports_mid_system_role =
+                    v.supports_mid_system_role.or(base.supports_mid_system_role);
+                v.supports_effort = v.supports_effort.or(base.supports_effort);
+                v.supports_xhigh = v.supports_xhigh.or(base.supports_xhigh);
+                v.needs_adaptive_thinking =
+                    v.needs_adaptive_thinking.or(base.needs_adaptive_thinking);
+                v.thinking_mode = v.thinking_mode.or_else(|| base.thinking_mode.clone());
+                v.native_tool_search = v.native_tool_search.or(base.native_tool_search);
+                v.compat_override = match (&base.compat_override, &v.compat_override) {
+                    (Some(b), Some(o)) => Some(b.merge_override(o)),
+                    (Some(b), None) => Some(b.clone()),
+                    (None, o) => o.clone(),
+                };
+                if v.effort_map.is_empty() {
+                    v.effort_map = base.effort_map.clone();
+                }
+                if v.body_patch.is_none() {
+                    v.body_patch = base.body_patch.clone();
+                }
+            }
             self.models.insert(k, v);
         }
     }
@@ -629,7 +845,7 @@ impl ProviderCatalog {
                 .filter(|s| !s.is_empty())
         });
 
-        let auth = resolve_auth_chain(canonical_id, &entry.auth_chain)?;
+        let auth = resolve_auth_chain(canonical_id, &entry.auth_chain, entry.oauth.as_ref())?;
 
         // Model-level API override (prefix-aware, consistent with `model_entry`!)
         let model_entry = model_hint.and_then(|m| self.find_model(m));
@@ -639,7 +855,8 @@ impl ProviderCatalog {
 
         let native_tool_search = model_entry
             .and_then(|me| me.native_tool_search)
-            .unwrap_or(entry.native_tool_search);
+            .or(entry.native_tool_search)
+            .unwrap_or(false);
 
         Ok(ResolvedProviderSpec {
             provider_id: canonical_id.to_string(),
@@ -653,6 +870,7 @@ impl ProviderCatalog {
             project_id,
             auth,
             headers: entry.headers.clone(),
+            query_params: entry.query_params.clone(),
             betas: entry.betas.clone(),
             cache_diagnosis_beta: entry.cache_diagnosis_beta.clone(),
             native_tool_search,
@@ -666,6 +884,9 @@ impl ProviderCatalog {
 
     /// Produces a secret-safe summary of all registered providers for `carnot providers`.
     pub fn summaries(&self) -> Vec<ProviderSummary> {
+        let stored_tokens = AuthStore::open_default()
+            .and_then(|s| s.list().ok())
+            .unwrap_or_default();
         self.providers
             .iter()
             .map(|(id, entry)| {
@@ -683,10 +904,20 @@ impl ProviderCatalog {
                     .iter()
                     .filter_map(|a| a.env.clone())
                     .collect();
-                let (configured, auth_source) = match probe_auth_chain_env_only(&entry.auth_chain) {
+                let (configured, auth_source) = match probe_auth_chain(
+                    id,
+                    &entry.auth_chain,
+                    entry.oauth.as_ref(),
+                    &stored_tokens,
+                ) {
                     Some(src) => (true, src),
                     None => (false, "missing".into()),
                 };
+                let oauth_supported = entry.oauth.is_some()
+                    || entry
+                        .auth_chain
+                        .iter()
+                        .any(|a| matches!(a.scheme, AuthScheme::Oauth));
                 ProviderSummary {
                     id: id.clone(),
                     api: entry.api.clone(),
@@ -697,19 +928,34 @@ impl ProviderCatalog {
                     auth_env_vars,
                     configured,
                     auth_source,
+                    oauth_supported,
                 }
             })
             .collect()
     }
 }
 
-fn probe_auth_chain_env_only(chain: &[AuthEntry]) -> Option<String> {
+fn probe_auth_chain(
+    provider_id: &str,
+    chain: &[AuthEntry],
+    oauth_cfg: Option<&OAuthConfig>,
+    stored_tokens: &BTreeMap<String, crate::oauth::OAuthStoredToken>,
+) -> Option<String> {
     if chain.is_empty() {
         return Some("none".into());
     }
     for entry in chain {
         if matches!(entry.scheme, AuthScheme::None) {
             return Some("none".into());
+        }
+        if matches!(entry.scheme, AuthScheme::Oauth) {
+            let profile = entry.profile.as_deref().unwrap_or(provider_id);
+            if let Some(tok) = stored_tokens.get(profile)
+                && (!tok.is_expired() || tok.can_refresh(oauth_cfg))
+            {
+                return Some(format!("oauth:{profile}"));
+            }
+            continue;
         }
         if let Some(ref env_name) = entry.env
             && std::env::var(env_name)
@@ -725,17 +971,39 @@ fn probe_auth_chain_env_only(chain: &[AuthEntry]) -> Option<String> {
     None
 }
 
-fn resolve_auth_chain(provider_id: &str, chain: &[AuthEntry]) -> Result<ResolvedAuth> {
+fn resolve_auth_chain(
+    provider_id: &str,
+    chain: &[AuthEntry],
+    oauth_cfg: Option<&OAuthConfig>,
+) -> Result<ResolvedAuth> {
     if chain.is_empty() {
         return Ok(ResolvedAuth::None);
     }
-    let mut tried_envs: Vec<String> = Vec::new();
+    let mut tried_hints: Vec<String> = Vec::new();
     for entry in chain {
         if matches!(entry.scheme, AuthScheme::None) {
             return Ok(ResolvedAuth::None);
         }
+        if matches!(entry.scheme, AuthScheme::Oauth) {
+            let profile = entry.profile.as_deref().unwrap_or(provider_id);
+            tried_hints.push(format!("`carnot auth login {profile}`"));
+            if let Some(store) = AuthStore::open_default()
+                && let Ok(Some(tok)) = store.get(profile)
+                && (!tok.is_expired() || tok.can_refresh(oauth_cfg))
+            {
+                let source = format!("oauth:{profile}");
+                tracing::debug!(
+                    provider = %provider_id,
+                    auth_source = %source,
+                    "resolved OAuth provider credentials"
+                );
+                let manager = OAuthTokenManager::shared(profile, tok, oauth_cfg.cloned(), store);
+                return Ok(ResolvedAuth::OAuth { manager, source });
+            }
+            continue;
+        }
         let secret = if let Some(ref env_name) = entry.env {
-            tried_envs.push(env_name.clone());
+            tried_hints.push(env_name.clone());
             std::env::var(env_name)
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -788,7 +1056,7 @@ fn resolve_auth_chain(provider_id: &str, chain: &[AuthEntry]) -> Result<Resolved
                     value,
                     source,
                 },
-                AuthScheme::None => ResolvedAuth::None,
+                AuthScheme::Oauth | AuthScheme::None => ResolvedAuth::None,
             });
         }
     }
@@ -797,9 +1065,66 @@ fn resolve_auth_chain(provider_id: &str, chain: &[AuthEntry]) -> Result<Resolved
         provider: provider_id.to_string(),
         message: format!(
             "missing credentials for provider `{provider_id}`; set one of: {}",
-            tried_envs.join(", ")
+            tried_hints.join(", ")
         ),
         retryable: false,
         retry_after_ms: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_preserves_builtin_compat_and_native_flags_on_partial_override() {
+        let mut cat = ProviderCatalog::embedded().expect("embedded catalog");
+        let overlay: ProviderCatalog = serde_json::from_str(
+            r#"{
+              "providers": {
+                "anthropic": {
+                  "api": "anthropic-messages",
+                  "base_url": "https://gateway.example.internal",
+                  "auth_chain": [{ "scheme": "bearer", "env": "CUSTOM_GW_TOKEN" }]
+                }
+              }
+            }"#,
+        )
+        .expect("parse overlay");
+        cat.merge(overlay);
+
+        let (_, ant) = cat.find_provider("anthropic").expect("anthropic");
+        assert_eq!(ant.base_url, "https://gateway.example.internal");
+        assert_eq!(ant.compat.supports_native_web_search, Some(true));
+        assert_eq!(ant.compat.supports_native_web_fetch, Some(true));
+        assert_eq!(
+            ant.compat.native_web_fetch_beta.as_deref(),
+            Some("web-fetch-2025-09-10")
+        );
+        assert_eq!(ant.native_tool_search, Some(true));
+        assert_eq!(
+            ant.headers.get("anthropic-version").map(String::as_str),
+            Some("2023-06-01")
+        );
+
+        // Explicit false in overlay still overrides inherited true
+        let disable_overlay: ProviderCatalog = serde_json::from_str(
+            r#"{
+              "providers": {
+                "anthropic": {
+                  "api": "anthropic-messages",
+                  "native_tool_search": false,
+                  "compat": { "supports_native_web_search": false }
+                }
+              }
+            }"#,
+        )
+        .expect("parse disable overlay");
+        cat.merge(disable_overlay);
+
+        let (_, ant2) = cat.find_provider("anthropic").expect("anthropic");
+        assert_eq!(ant2.compat.supports_native_web_search, Some(false));
+        assert_eq!(ant2.compat.supports_native_web_fetch, Some(true));
+        assert_eq!(ant2.native_tool_search, Some(false));
+    }
 }

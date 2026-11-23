@@ -106,6 +106,7 @@ impl ToolRegistry {
                 config.bash_max_timeout_ms,
                 config.extra_env.clone(),
             )
+            .with_redact_cas_secrets(config.redact_cas_secrets)
             .with_seen_cas_hashes(seen_cas_hashes),
         ));
 
@@ -207,11 +208,27 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// Returns all registered tool specifications in deterministic canonical order
+    /// (`(defer_loading, name)`) with recursively sorted JSON schema keys so provider wire
+    /// prefixes stay byte-identical regardless of module or async MCP registration order.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.order
+        let mut out: Vec<ToolSpec> = self
+            .order
             .iter()
-            .filter_map(|n| self.tools.get(n).map(|t| t.spec()))
-            .collect()
+            .filter_map(|n| {
+                self.tools.get(n).map(|t| {
+                    let mut spec = t.spec();
+                    spec.input_schema = carnot_core::canonicalize_json(&spec.input_schema);
+                    spec
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.defer_loading
+                .cmp(&b.defer_loading)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        out
     }
 
     /// Returns all tools marked `defer_loading: true` in deterministic sorted order.
@@ -340,6 +357,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
                     "pattern": { "type": "string" },
                     "path": { "type": "string" },
                     "ext": { "type": "string" },
+                    "glob": { "type": "string" },
                     "case_insensitive": { "type": "boolean" },
                     "limit": { "type": "integer" }
                 }

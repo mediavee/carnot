@@ -9,7 +9,7 @@
 
 use crate::files::resolve_confined_path;
 use crate::{BoxFuture, Tool};
-use carnot_cas::{CasStore, shape_command_output};
+use carnot_cas::{CasStore, shape_command_output_with_redaction};
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
 use carnot_sandbox::{SandboxPolicy, annotate_sandbox_denial, build_sandboxed_shell_in_dir};
 use serde_json::{Value, json};
@@ -83,10 +83,10 @@ impl JobRegistry {
     }
 
     fn insert(&self, job: Arc<BackgroundJob>) -> String {
-        let mut c = self.counter.lock().expect("lock");
+        let mut c = self.counter.lock().unwrap_or_else(|e| e.into_inner());
         *c += 1;
         let id = format!("job-{}", *c);
-        let mut map = self.jobs.lock().expect("lock");
+        let mut map = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         // Evict oldest finished jobs if cap exceeded (B6)
         if map.len() >= MAX_RETAINED_JOBS {
             let finished: Vec<String> = map
@@ -103,11 +103,18 @@ impl JobRegistry {
     }
 
     fn get(&self, id: &str) -> Option<Arc<BackgroundJob>> {
-        self.jobs.lock().expect("lock").get(id).cloned()
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
     }
 
     fn remove(&self, id: &str) {
-        self.jobs.lock().expect("lock").remove(id);
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 
     pub fn kill_all(&self) {
@@ -185,6 +192,7 @@ pub struct BashTool {
     jobs: Arc<JobRegistry>,
     seen_cas_hashes: Arc<Mutex<HashSet<String>>>,
     cas_enabled: bool,
+    redact_cas_secrets: bool,
     spill_threshold: usize,
     preview_max: usize,
     yield_ms: u64,
@@ -213,12 +221,18 @@ impl BashTool {
             jobs,
             seen_cas_hashes: Arc::new(Mutex::new(HashSet::new())),
             cas_enabled,
+            redact_cas_secrets: true,
             spill_threshold,
             preview_max,
             yield_ms,
             max_timeout_ms,
             extra_env,
         }
+    }
+
+    pub fn with_redact_cas_secrets(mut self, redact: bool) -> Self {
+        self.redact_cas_secrets = redact;
+        self
     }
 
     /// Attaches a shared CAS hash set (cleared on compaction/rewind by `ToolRegistry::reset_read_tracker`)
@@ -234,12 +248,13 @@ impl BashTool {
         raw: &str,
         allow_dedup: bool,
     ) -> Result<FormattedBashOutput> {
-        let shaped = shape_command_output(
+        let shaped = shape_command_output_with_redaction(
             Some(command),
             raw,
             self.cas_enabled.then_some(self.cas.as_ref()),
             self.spill_threshold,
             self.preview_max,
+            self.redact_cas_secrets,
         )?;
         if allow_dedup
             && let Some(ref handle) = shaped.spilled
@@ -289,8 +304,13 @@ impl Tool for BashTool {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<ToolOutput>> {
         Box::pin(async move {
-            // Mode A: Collect or kill an existing yielded background job
-            if let Some(job_id) = input.get("job").and_then(Value::as_str) {
+            // Mode A: Collect or kill an existing yielded background job (ignore empty "" from strict schemas)
+            if let Some(job_id) = input
+                .get("job")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 let Some(job) = self.jobs.get(job_id) else {
                     return Ok(ToolOutput::err_text(format!("Unknown job id: {job_id}")));
                 };
@@ -322,7 +342,11 @@ impl Tool for BashTool {
                     }
                 }
                 let exit = *rx.borrow();
-                let delta = job.output.lock().expect("lock").take_delta();
+                let delta = job
+                    .output
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take_delta();
                 let FormattedBashOutput {
                     text: mut shaped,
                     handle,
@@ -375,6 +399,7 @@ impl Tool for BashTool {
             let explicit_timeout_ms = input
                 .get("timeout")
                 .and_then(Value::as_u64)
+                .filter(|&s| s > 0)
                 .map(|s| s.saturating_mul(1000).min(self.max_timeout_ms));
             let hard_timeout_ms = explicit_timeout_ms.unwrap_or(self.max_timeout_ms);
             // When the caller sets an explicit timeout, wait past `hard_timeout_ms` + kill/drain grace
@@ -444,7 +469,11 @@ impl Tool for BashTool {
                             match s.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => {
-                                    job_out.output.lock().expect("lock").push_bytes(&buf[..n]);
+                                    job_out
+                                        .output
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push_bytes(&buf[..n]);
                                 }
                             }
                         }
@@ -459,7 +488,11 @@ impl Tool for BashTool {
                             match s.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => {
-                                    job_err.output.lock().expect("lock").push_bytes(&buf[..n]);
+                                    job_err
+                                        .output
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push_bytes(&buf[..n]);
                                 }
                             }
                         }
@@ -512,7 +545,11 @@ impl Tool for BashTool {
 
             if completed {
                 let exit = wait_rx.borrow().unwrap_or(-1);
-                let raw = job.output.lock().expect("lock").take_all();
+                let raw = job
+                    .output
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take_all();
                 let FormattedBashOutput {
                     text: mut shaped,
                     handle,
@@ -547,7 +584,11 @@ impl Tool for BashTool {
                 })
             } else {
                 // Adaptive Yield: register background job + return any partial output already produced!
-                let partial = job.output.lock().expect("lock").take_delta();
+                let partial = job
+                    .output
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take_delta();
                 let job_id = self.jobs.insert(job.clone());
                 let header = if partial.is_empty() {
                     String::new()
@@ -615,6 +656,41 @@ mod tests {
             .await
             .expect("third run after reset");
         assert_eq!(third.details["deduplicated"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn spilled_bash_output_redacts_secrets_before_writing_to_cas_disk() {
+        let dir = std::env::temp_dir().join(format!("carnot-bash-redact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut cfg = carnot_core::CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        cfg.cas_spill_threshold_bytes = 256;
+        cfg.cas_preview_max_bytes = 128;
+        cfg.redact_cas_secrets = true;
+
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let reg = crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let bash = reg.get("Bash").expect("Bash");
+
+        let secret = "sk-ant-api03-secretvalue1234567890abcdef";
+        let cmd = format!(
+            "python3 -c \"print('TOKEN={secret}'); print('\\n'.join(f'line-{{i:04d}}-padding-abcdef' for i in range(40)))\""
+        );
+        let out = bash
+            .execute(json!({"command": cmd}), CancellationToken::new())
+            .await
+            .expect("run");
+        assert!(!out.is_error);
+        assert!(!out.text_only().contains(secret));
+        let rel = out.details["handle"].as_str().expect("spilled CAS handle");
+        let on_disk = std::fs::read_to_string(dir.join(rel)).expect("read CAS blob");
+        assert!(
+            !on_disk.contains(secret),
+            "raw secret must NEVER be written to .carnot/h/ on disk"
+        );
+        assert!(on_disk.contains("[REDACTED:ANTHROPIC_KEY]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
