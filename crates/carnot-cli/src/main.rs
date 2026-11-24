@@ -1064,10 +1064,14 @@ impl Cli {
                 "anthropic",
                 "openai",
                 "openai-responses",
-                "google",
+                "gemini",
+                "grok",
+                "muse",
+                "mistral",
+                "opencode",
+                "opencode-go",
                 "openrouter",
                 "deepseek",
-                "xai",
             ];
             for pref in PREFERRED {
                 if summaries.iter().any(|s| s.id == *pref && s.configured) {

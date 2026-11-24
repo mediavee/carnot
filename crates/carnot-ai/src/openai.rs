@@ -15,8 +15,8 @@
 
 use crate::catalog::{ProviderCatalog, ResolvedAuth, ResolvedProviderSpec};
 use crate::compat::{
-    apply_usage_map, can_replay_origin, is_context_overflow, is_retryable_status,
-    parse_retry_after_ms, repair_json, session_cache_key,
+    apply_usage_map, can_replay_origin, format_tool_call_id, is_context_overflow,
+    is_retryable_status, parse_retry_after_ms, repair_json, session_cache_key,
 };
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
@@ -163,9 +163,13 @@ impl OpenAiProvider {
                                     }
                                 }
                             }
+                            let wire_tool_call_id = format_tool_call_id(
+                                tool_use_id,
+                                compat.tool_call_id_format.as_deref(),
+                            );
                             messages.push(json!({
                                 "role": "tool",
-                                "tool_call_id": tool_use_id,
+                                "tool_call_id": wire_tool_call_id,
                                 "content": text_parts.join("\n"),
                             }));
                             pushed_tool = true;
@@ -253,7 +257,7 @@ impl OpenAiProvider {
                             ContentBlock::ToolUse {
                                 id, name, input, ..
                             } => Some(json!({
-                                "id": id,
+                                "id": format_tool_call_id(id, compat.tool_call_id_format.as_deref()),
                                 "type": "function",
                                 "function": {
                                     "name": name,
@@ -264,9 +268,17 @@ impl OpenAiProvider {
                         })
                         .collect();
 
+                    let empty_content = if compat
+                        .empty_assistant_content_as_empty_string
+                        .unwrap_or(false)
+                    {
+                        Value::String(String::new())
+                    } else {
+                        Value::Null
+                    };
                     let mut obj = json!({
                         "role": "assistant",
-                        "content": if txt.is_empty() { Value::Null } else { json!(txt) }
+                        "content": if txt.is_empty() { empty_content } else { json!(txt) }
                     });
                     if let Some(m) = obj.as_object_mut() {
                         if !reasoning_txt.is_empty() {
@@ -517,11 +529,73 @@ impl Provider for OpenAiProvider {
                                                 .send(StreamEvent::ThinkingDelta(r.to_string()))
                                                 .await;
                                         }
-                                        if let Some(t) = delta.get("content").and_then(Value::as_str)
-                                            && !t.is_empty()
-                                        {
-                                            text_acc.push_str(t);
-                                            let _ = tx.send(StreamEvent::TextDelta(t.to_string())).await;
+                                        if let Some(content) = delta.get("content") {
+                                            if let Some(t) = content.as_str() {
+                                                if !t.is_empty() {
+                                                    text_acc.push_str(t);
+                                                    let _ = tx
+                                                        .send(StreamEvent::TextDelta(t.to_string()))
+                                                        .await;
+                                                }
+                                            } else if let Some(parts) = content.as_array() {
+                                                // Structured content blocks (e.g. `type: "thinking"` + `type: "text"`).
+                                                for part in parts {
+                                                    match part.get("type").and_then(Value::as_str) {
+                                                        Some("thinking") => {
+                                                            if let Some(inner) = part
+                                                                .get("thinking")
+                                                                .and_then(Value::as_array)
+                                                            {
+                                                                for item in inner {
+                                                                    if let Some(rt) = item
+                                                                        .get("text")
+                                                                        .and_then(Value::as_str)
+                                                                        && !rt.is_empty()
+                                                                    {
+                                                                        reasoning_acc.push_str(rt);
+                                                                        let _ = tx
+                                                                            .send(
+                                                                                StreamEvent::ThinkingDelta(
+                                                                                    rt.to_string(),
+                                                                                ),
+                                                                            )
+                                                                            .await;
+                                                                    }
+                                                                }
+                                                            } else if let Some(rt) = part
+                                                                .get("thinking")
+                                                                .or_else(|| part.get("text"))
+                                                                .and_then(Value::as_str)
+                                                                && !rt.is_empty()
+                                                            {
+                                                                reasoning_acc.push_str(rt);
+                                                                let _ = tx
+                                                                    .send(
+                                                                        StreamEvent::ThinkingDelta(
+                                                                            rt.to_string(),
+                                                                        ),
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                        }
+                                                        Some("text") => {
+                                                            if let Some(t) = part
+                                                                .get("text")
+                                                                .and_then(Value::as_str)
+                                                                && !t.is_empty()
+                                                            {
+                                                                text_acc.push_str(t);
+                                                                let _ = tx
+                                                                    .send(StreamEvent::TextDelta(
+                                                                        t.to_string(),
+                                                                    ))
+                                                                    .await;
+                                                            }
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
                                         }
                                         if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
                                             for tc in tcs {

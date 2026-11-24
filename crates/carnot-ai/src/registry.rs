@@ -141,13 +141,17 @@ impl ProviderRegistry {
             if !seen.insert((canon_prov.to_string(), id.clone())) {
                 continue;
             }
+            let effective_api = self
+                .catalog
+                .effective_api(canon_prov, id)
+                .unwrap_or_else(|| api.clone());
             items.push((
                 entry.order.unwrap_or(500),
                 AvailableModel {
                     id: id.clone(),
                     label: entry.label.clone().unwrap_or_else(|| id.clone()),
                     provider: canon_prov.to_string(),
-                    api: api.clone(),
+                    api: effective_api,
                     configured: *is_cfg,
                     context_window: entry.context_window,
                     max_output_tokens: entry.max_output_tokens,
@@ -173,6 +177,10 @@ impl ProviderRegistry {
             }
             seen.insert((s.id.clone(), def_model.clone()));
             let me = self.catalog.find_model(def_model);
+            let effective_api = self
+                .catalog
+                .effective_api(&s.id, def_model)
+                .unwrap_or_else(|| s.api.clone());
             items.push((
                 900,
                 AvailableModel {
@@ -181,7 +189,7 @@ impl ProviderRegistry {
                         .and_then(|m| m.label.clone())
                         .unwrap_or_else(|| def_model.clone()),
                     provider: s.id.clone(),
-                    api: s.api.clone(),
+                    api: effective_api,
                     configured: s.configured,
                     context_window: me.and_then(|m| m.context_window),
                     max_output_tokens: me.and_then(|m| m.max_output_tokens),

@@ -250,7 +250,10 @@ pub fn repair_json(raw: &str) -> Option<Value> {
     serde_json::from_str::<Value>(&no_trailing).ok()
 }
 
-fn fnv1a_hex(parts: &[&[u8]]) -> String {
+const BASE62_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+fn fnv1a_u128(parts: &[&[u8]]) -> u128 {
     let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
     let mut h2: u64 = 0xaf63_dc4c_8601_ec8c;
     for part in parts {
@@ -263,7 +266,11 @@ fn fnv1a_hex(parts: &[&[u8]]) -> String {
         h1 ^= 0xff;
         h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{h1:016x}{h2:016x}")
+    (u128::from(h1) << 64) | u128::from(h2)
+}
+
+fn fnv1a_hex(parts: &[&[u8]]) -> String {
+    format!("{:032x}", fnv1a_u128(parts))
 }
 
 /// Sanitizes foreign tool call IDs to `[a-zA-Z0-9_-]{1,64}` deterministically for cross-provider replay.
@@ -286,6 +293,31 @@ pub fn normalize_tool_call_id(raw: &str) -> String {
         format!("tc_{}", &digest[..24])
     } else {
         format!("{clean}_{}", &digest[..16])
+    }
+}
+
+/// Formats a tool call ID to satisfy a declarative wire-protocol format constraint.
+///
+/// - `None`: returns `raw` unchanged.
+/// - `Some("alnum9")`: preserves IDs already matching `^[A-Za-z0-9]{9}$`, otherwise deterministically
+///   maps any foreign ID into a collision-resistant 9-char base62 identifier (`62^9` space).
+/// - `Some("sanitized")`: applies [`normalize_tool_call_id`].
+pub fn format_tool_call_id(raw: &str, format: Option<&str>) -> String {
+    match format {
+        Some("alnum9") => {
+            if raw.len() == 9 && raw.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return raw.to_string();
+            }
+            let mut n = fnv1a_u128(&[b"alnum9:", raw.as_bytes()]);
+            let mut out = [0u8; 9];
+            for slot in &mut out {
+                *slot = BASE62_ALPHABET[(n % 62) as usize];
+                n /= 62;
+            }
+            out.into_iter().map(char::from).collect()
+        }
+        Some("sanitized") => normalize_tool_call_id(raw),
+        _ => raw.to_string(),
     }
 }
 
@@ -532,6 +564,22 @@ mod tests {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         );
+    }
+
+    #[test]
+    fn format_tool_call_id_alnum9_preserves_native_and_maps_foreign_deterministically() {
+        assert_eq!(
+            format_tool_call_id("aBc123XyZ", Some("alnum9")),
+            "aBc123XyZ"
+        );
+        let mapped1 = format_tool_call_id("toolu_01AbCdEfGhIjKlMnOp", Some("alnum9"));
+        let mapped2 = format_tool_call_id("toolu_01AbCdEfGhIjKlMnOp", Some("alnum9"));
+        let mapped3 = format_tool_call_id("call_other_id_99", Some("alnum9"));
+        assert_eq!(mapped1, mapped2);
+        assert_ne!(mapped1, mapped3);
+        assert_eq!(mapped1.len(), 9);
+        assert!(mapped1.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert_eq!(format_tool_call_id("toolu_01Ab", None), "toolu_01Ab");
     }
 
     #[test]

@@ -77,6 +77,35 @@ pub struct ProviderEntry {
     /// Optional standards-compliant OAuth 2.0 configuration (`carnot auth login <provider>`).
     #[serde(default)]
     pub oauth: Option<OAuthConfig>,
+    /// Declarative per-model-prefix routing rules for multi-protocol gateways and model-generation splits.
+    #[serde(default)]
+    pub model_routes: Vec<ModelRouteRule>,
+}
+
+/// Declarative per-model-prefix routing override inside a provider entry.
+/// Matched longest-prefix-first against the target model ID (case-insensitive, delimiter-aware).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelRouteRule {
+    #[serde(default)]
+    pub prefixes: Vec<String>,
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub auth_chain: Vec<AuthEntry>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub betas: Option<Vec<String>>,
+    #[serde(default)]
+    pub native_tool_search: Option<bool>,
+    #[serde(default)]
+    pub compat: Option<CompatFlags>,
+    #[serde(default)]
+    pub usage_map: Option<UsageMap>,
+    #[serde(default)]
+    pub body_patch: Option<Value>,
 }
 
 impl ProviderEntry {
@@ -89,6 +118,21 @@ impl ProviderEntry {
             .and_then(|a| a.profile.as_deref())
             .filter(|p| !p.trim().is_empty())
             .unwrap_or(canonical_id)
+    }
+
+    /// Returns the most specific `ModelRouteRule` matching `model` (longest matching prefix wins).
+    pub fn match_model_route(&self, model: &str) -> Option<&ModelRouteRule> {
+        let mut best: Option<(usize, &ModelRouteRule)> = None;
+        for rule in &self.model_routes {
+            for prefix in &rule.prefixes {
+                if is_route_prefix_match(model, prefix)
+                    && best.map(|(len, _)| prefix.len() > len).unwrap_or(true)
+                {
+                    best = Some((prefix.len(), rule));
+                }
+            }
+        }
+        best.map(|(_, rule)| rule)
     }
 }
 
@@ -334,6 +378,13 @@ pub struct CompatFlags {
     /// when `CacheTtl::Long | CacheTtl::Hybrid` is active.
     #[serde(default)]
     pub supports_cache_control_1h_ttl: Option<bool>,
+    /// Optional wire-format constraint for tool call IDs (`"alnum9"` for strict 9-char alphanumeric
+    /// IDs, `"sanitized"` for `[A-Za-z0-9_-]{1,64}`).
+    #[serde(default)]
+    pub tool_call_id_format: Option<String>,
+    /// Emit `""` instead of `null` for empty assistant `content` on tool-calling messages.
+    #[serde(default)]
+    pub empty_assistant_content_as_empty_string: Option<bool>,
 }
 
 impl CompatFlags {
@@ -419,6 +470,13 @@ impl CompatFlags {
             supports_cache_control_1h_ttl: ov
                 .supports_cache_control_1h_ttl
                 .or(self.supports_cache_control_1h_ttl),
+            tool_call_id_format: ov
+                .tool_call_id_format
+                .clone()
+                .or_else(|| self.tool_call_id_format.clone()),
+            empty_assistant_content_as_empty_string: ov
+                .empty_assistant_content_as_empty_string
+                .or(self.empty_assistant_content_as_empty_string),
         }
     }
 }
@@ -542,6 +600,26 @@ fn is_model_prefix_match(model: &str, prefix: &str) -> bool {
         // Require a real delimiter so e.g. `gpt-5.4` matches `gpt-5.4-20260901` and
         // `opencode-go` matches `opencode-go/deepseek-v4.1-flash`.
         Some(b'-' | b'.' | b':' | b'@' | b'/') => true,
+        Some(_) => false,
+    }
+}
+
+fn is_route_prefix_match(model: &str, prefix: &str) -> bool {
+    if prefix.is_empty() || model.len() < prefix.len() {
+        return false;
+    }
+    let Some(head) = model.get(..prefix.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(prefix) {
+        return false;
+    }
+    if matches!(prefix.as_bytes().last(), Some(b'-' | b'/' | b'.' | b':')) {
+        return true;
+    }
+    match model.as_bytes().get(prefix.len()) {
+        None => true,
+        Some(b'-' | b'.' | b':' | b'@' | b'/' | b'_') => true,
         Some(_) => false,
     }
 }
@@ -722,6 +800,9 @@ impl ProviderCatalog {
                 if v.oauth.is_none() {
                     v.oauth = base.oauth.clone();
                 }
+                if v.model_routes.is_empty() && v.base_url == base.base_url {
+                    v.model_routes = base.model_routes.clone();
+                }
             }
             self.providers.insert(k, v);
         }
@@ -770,6 +851,15 @@ impl ProviderCatalog {
                     set.insert(env_name.clone());
                 }
             }
+            for route in &prov.model_routes {
+                for auth in &route.auth_chain {
+                    if let Some(ref env_name) = auth.env
+                        && !env_name.is_empty()
+                    {
+                        set.insert(env_name.clone());
+                    }
+                }
+            }
         }
         set.into_iter().collect()
     }
@@ -806,7 +896,21 @@ impl ProviderCatalog {
         self.find_model(model)?.provider.as_deref()
     }
 
-    /// Resolves base_url, auth credentials, project_id, and model override for a provider.
+    /// Resolves the effective wire protocol adapter ID for `(provider, model)` considering
+    /// model-level `api` overrides and declarative `model_routes` (longest-prefix-first).
+    pub fn effective_api(&self, name_or_alias: &str, model: &str) -> Option<String> {
+        let (_, entry) = self.find_provider(name_or_alias)?;
+        let model_entry = self.find_model(model);
+        if let Some(api) = model_entry.and_then(|me| me.api.as_ref()) {
+            return Some(api.clone());
+        }
+        if let Some(api) = entry.match_model_route(model).and_then(|r| r.api.as_ref()) {
+            return Some(api.clone());
+        }
+        Some(entry.api.clone())
+    }
+
+    /// Resolves base_url, auth credentials, project_id, model routes, and model overrides for a provider.
     pub fn resolve_spec(
         &self,
         name_or_alias: &str,
@@ -828,7 +932,17 @@ impl ProviderCatalog {
                     retry_after_ms: None,
                 })?;
 
-        let mut base_url = entry.base_url.clone();
+        let effective_model = model_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(entry.default_model.as_deref());
+        let route = effective_model.and_then(|m| entry.match_model_route(m));
+
+        let mut base_url = route
+            .and_then(|r| r.base_url.as_ref())
+            .filter(|u| !u.is_empty())
+            .cloned()
+            .unwrap_or_else(|| entry.base_url.clone());
         for env_name in &entry.base_url_envs {
             if let Ok(val) = std::env::var(env_name)
                 && !val.trim().is_empty()
@@ -845,18 +959,53 @@ impl ProviderCatalog {
                 .filter(|s| !s.is_empty())
         });
 
-        let auth = resolve_auth_chain(canonical_id, &entry.auth_chain, entry.oauth.as_ref())?;
+        let auth_chain = route
+            .filter(|r| !r.auth_chain.is_empty())
+            .map(|r| r.auth_chain.as_slice())
+            .unwrap_or(entry.auth_chain.as_slice());
+        let auth = resolve_auth_chain(canonical_id, auth_chain, entry.oauth.as_ref())?;
 
-        // Model-level API override (prefix-aware, consistent with `model_entry`!)
-        let model_entry = model_hint.and_then(|m| self.find_model(m));
+        // Model-level API override > provider model_route API > provider default API
+        let model_entry = effective_model.and_then(|m| self.find_model(m));
         let api = model_entry
             .and_then(|me| me.api.clone())
+            .or_else(|| route.and_then(|r| r.api.clone()))
             .unwrap_or_else(|| entry.api.clone());
 
         let native_tool_search = model_entry
             .and_then(|me| me.native_tool_search)
+            .or_else(|| route.and_then(|r| r.native_tool_search))
             .or(entry.native_tool_search)
             .unwrap_or(false);
+
+        let mut headers = entry.headers.clone();
+        if let Some(r) = route {
+            headers.extend(r.headers.clone());
+        }
+
+        let betas = route
+            .and_then(|r| r.betas.clone())
+            .unwrap_or_else(|| entry.betas.clone());
+
+        let compat = match route.and_then(|r| r.compat.as_ref()) {
+            Some(rc) => entry.compat.merge_override(rc),
+            None => entry.compat.clone(),
+        };
+
+        let usage_map = route
+            .and_then(|r| r.usage_map.clone())
+            .unwrap_or_else(|| entry.usage_map.clone());
+
+        let body_patch = match (&entry.body_patch, route.and_then(|r| r.body_patch.as_ref())) {
+            (Some(base), Some(ov)) => {
+                let mut merged = base.clone();
+                json_merge_patch(&mut merged, ov);
+                Some(merged)
+            }
+            (None, Some(ov)) => Some(ov.clone()),
+            (Some(base), None) => Some(base.clone()),
+            (None, None) => None,
+        };
 
         Ok(ResolvedProviderSpec {
             provider_id: canonical_id.to_string(),
@@ -869,14 +1018,14 @@ impl ProviderCatalog {
                 .collect(),
             project_id,
             auth,
-            headers: entry.headers.clone(),
+            headers,
             query_params: entry.query_params.clone(),
-            betas: entry.betas.clone(),
+            betas,
             cache_diagnosis_beta: entry.cache_diagnosis_beta.clone(),
             native_tool_search,
-            compat: entry.compat.clone(),
-            usage_map: entry.usage_map.clone(),
-            body_patch: entry.body_patch.clone(),
+            compat,
+            usage_map,
+            body_patch,
             subprocess: entry.subprocess.clone(),
             catalog_models: self.models.clone(),
         })
@@ -1126,5 +1275,47 @@ mod tests {
         assert_eq!(ant2.compat.supports_native_web_search, Some(false));
         assert_eq!(ant2.compat.supports_native_web_fetch, Some(true));
         assert_eq!(ant2.native_tool_search, Some(false));
+    }
+
+    #[test]
+    fn merge_drops_upstream_model_routes_when_overlay_replaces_base_url() {
+        let mut cat = ProviderCatalog::embedded().expect("embedded catalog");
+        // Partial override without changing base_url keeps model_routes
+        let partial: ProviderCatalog = serde_json::from_str(
+            r#"{
+              "providers": {
+                "opencode": {
+                  "api": "openai-completions",
+                  "default_model": "kimi-k3.1-pro"
+                }
+              }
+            }"#,
+        )
+        .expect("partial overlay");
+        cat.merge(partial);
+        assert!(
+            !cat.find_provider("opencode")
+                .expect("opencode")
+                .1
+                .model_routes
+                .is_empty()
+        );
+
+        // Redirecting base_url to a custom proxy must NOT inherit upstream model_routes
+        let proxy: ProviderCatalog = serde_json::from_str(
+            r#"{
+              "providers": {
+                "opencode-go": {
+                  "api": "openai-completions",
+                  "base_url": "https://proxy.example.internal/v1"
+                }
+              }
+            }"#,
+        )
+        .expect("proxy overlay");
+        cat.merge(proxy);
+        let (_, go) = cat.find_provider("opencode-go").expect("opencode-go");
+        assert_eq!(go.base_url, "https://proxy.example.internal/v1");
+        assert!(go.model_routes.is_empty());
     }
 }

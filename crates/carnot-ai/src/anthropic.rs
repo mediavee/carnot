@@ -44,6 +44,15 @@ impl ApiAdapter for AnthropicMessagesAdapter {
     }
 }
 
+fn messages_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
 /// Anthropic Messages API provider with hybrid cache TTLs, cache diagnostics, and TLS pre-warm.
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -119,7 +128,7 @@ impl AnthropicProvider {
             return;
         }
         let client = self.client.clone();
-        let url = format!("{}/v1/messages", self.spec.base_url);
+        let url = messages_url(&self.spec.base_url);
         tokio::spawn(async move {
             let _ = tokio::time::timeout(Duration::from_secs(3), client.head(&url).send()).await;
         });
@@ -638,7 +647,7 @@ impl Provider for AnthropicProvider {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<mpsc::Receiver<StreamEvent>>> {
         Box::pin(async move {
-            let raw_url = format!("{}/v1/messages", self.spec.base_url);
+            let raw_url = messages_url(&self.spec.base_url);
             let body = self.build_body(&request);
             let mut extra_headers: Vec<(String, String)> = Vec::new();
             if !self.spec.headers.contains_key("anthropic-version") {

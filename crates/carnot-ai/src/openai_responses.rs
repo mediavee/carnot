@@ -58,6 +58,11 @@ impl OpenAiResponsesProvider {
 
     pub fn build_body(&self, req: &ProviderRequest) -> Value {
         let compat = self.spec.effective_compat(&req.model);
+        let sys_role = if compat.supports_developer_role.unwrap_or(true) {
+            "developer"
+        } else {
+            "system"
+        };
         let mut input_items: Vec<Value> = Vec::new();
 
         for msg in &req.messages {
@@ -66,7 +71,7 @@ impl OpenAiResponsesProvider {
                     let txt = msg.text_concat();
                     if !txt.is_empty() {
                         input_items.push(json!({
-                            "role": "developer",
+                            "role": sys_role,
                             "content": [{ "type": "input_text", "text": txt }]
                         }));
                     }
@@ -190,7 +195,7 @@ impl OpenAiResponsesProvider {
             if !note.trim().is_empty() {
                 input_items.push(json!({
                     "type": "message",
-                    "role": "developer",
+                    "role": sys_role,
                     "content": [{"type": "input_text", "text": note}],
                 }));
             }

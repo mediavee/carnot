@@ -763,6 +763,8 @@ fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
         "openrouter.ai",
         "api.deepseek.com",
         "api.llama.com",
+        "api.meta.ai",
+        "opencode.ai",
         "api.groq.com",
         "api.mistral.ai",
         "api.fireworks.ai",
@@ -781,6 +783,10 @@ fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
         "XAI_API_KEY",
         "GEMINI_API_KEY",
         "META_API_KEY",
+        "META_MODEL_API_KEY",
+        "MISTRAL_API_KEY",
+        "OPENCODE_API_KEY",
+        "OPENCODE_GO_API_KEY",
     ];
     let ai_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let facade_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1110,4 +1116,388 @@ async fn conformance_oauth_reactive_401_refresh_and_query_params() {
 
     server_task.await.expect("server done");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn resolve_spec_no_env(
+    catalog: &ProviderCatalog,
+    provider_id: &str,
+    model: &str,
+    base_url_override: Option<&str>,
+) -> ResolvedProviderSpec {
+    let mut cloned = catalog.clone();
+    if let Some((canon, _)) = catalog.find_provider(provider_id)
+        && let Some(entry) = cloned.providers.get_mut(canon)
+    {
+        entry.auth_chain = vec![crate::catalog::AuthEntry {
+            scheme: crate::catalog::AuthScheme::None,
+            env: None,
+            header_name: None,
+            query_param: None,
+            profile: None,
+            cmd: None,
+        }];
+        for route in &mut entry.model_routes {
+            if !route.auth_chain.is_empty() {
+                route.auth_chain = entry.auth_chain.clone();
+            }
+        }
+        entry.base_url_envs.clear();
+    }
+    let mut spec = cloned
+        .resolve_spec(provider_id, Some(model))
+        .expect("resolve spec");
+    if let Some(u) = base_url_override {
+        spec.base_url = u.trim_end_matches('/').to_string();
+    }
+    spec
+}
+
+#[tokio::test]
+async fn conformance_mistral_alnum9_tool_ids_empty_content_and_structured_thinking() {
+    let catalog = ProviderCatalog::embedded().expect("catalog");
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"step 1\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"Answer ready.\"}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":40,\"prompt_tokens_details\":{\"cached_tokens\":900},\"completion_tokens_details\":{\"reasoning_tokens\":15}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, captured) = spawn_mock_http(vec![(
+        200,
+        vec![("Content-Type", "text/event-stream")],
+        sse.to_string(),
+    )])
+    .await;
+
+    let spec = resolve_spec_no_env(&catalog, "mistral", "mistral-large-latest", Some(&base_url));
+    assert_eq!(spec.api, "openai-completions");
+    assert_eq!(spec.compat.tool_call_id_format.as_deref(), Some("alnum9"));
+    assert_eq!(
+        spec.compat.empty_assistant_content_as_empty_string,
+        Some(true)
+    );
+    assert_eq!(spec.compat.send_stream_options, Some(false));
+
+    let provider = OpenAiProvider::from_spec(spec);
+    let msgs = vec![
+        Message::user_text("inspect"),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "toolu_01ForeignAnthropicId999".into(),
+                    name: "Read".into(),
+                    input: json!({"file_path": "a.rs"}),
+                    invalid_json: None,
+                    provider_meta: None,
+                    origin: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "aBc123XyZ".into(),
+                    name: "Read".into(),
+                    input: json!({"file_path": "b.rs"}),
+                    invalid_json: None,
+                    provider_meta: None,
+                    origin: None,
+                },
+            ],
+        },
+        Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "toolu_01ForeignAnthropicId999".into(),
+                    content: vec![ToolResultBlock::text("contents a")],
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "aBc123XyZ".into(),
+                    content: vec![ToolResultBlock::text("contents b")],
+                    is_error: false,
+                },
+            ],
+        },
+    ];
+
+    let mut rx = provider
+        .stream(
+            sample_request("mistral-large-latest", msgs),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("stream");
+    let mut saw_thinking = String::new();
+    let mut saw_text = String::new();
+    let mut done_ev = None;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            StreamEvent::ThinkingDelta(d) => saw_thinking.push_str(&d),
+            StreamEvent::TextDelta(d) => saw_text.push_str(&d),
+            StreamEvent::Done { message, usage, .. } => done_ev = Some((message, usage)),
+            _ => {}
+        }
+    }
+    let (_msg, usage) = done_ev.expect("done");
+    assert_eq!(saw_thinking, "step 1");
+    assert_eq!(saw_text, "Answer ready.");
+    assert_eq!(usage.cache_read_tokens, 900);
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.reasoning_tokens, 15);
+
+    let reqs = captured.lock().expect("cap");
+    let body: Value = serde_json::from_str(&reqs[0].2).expect("json body");
+    assert!(
+        body.get("stream_options").is_none(),
+        "Mistral rejects stream_options"
+    );
+    assert!(body.get("max_tokens").is_some());
+    let asst = &body["messages"][2];
+    assert_eq!(
+        asst["content"],
+        json!(""),
+        "Mistral empty assistant content must be \"\""
+    );
+    let mapped_id = asst["tool_calls"][0]["id"].as_str().expect("mapped id");
+    let native_id = asst["tool_calls"][1]["id"].as_str().expect("native id");
+    assert_eq!(mapped_id.len(), 9);
+    assert!(mapped_id.bytes().all(|b| b.is_ascii_alphanumeric()));
+    assert_eq!(native_id, "aBc123XyZ");
+    assert_eq!(
+        body["messages"][3]["tool_call_id"].as_str(),
+        Some(mapped_id),
+        "tool result must carry the exact same alnum9 ID as its assistant tool_call"
+    );
+    assert_eq!(
+        body["messages"][4]["tool_call_id"].as_str(),
+        Some("aBc123XyZ")
+    );
+}
+
+#[tokio::test]
+async fn conformance_opencode_zen_and_go_multi_protocol_routing_and_v1_messages_url() {
+    let catalog = ProviderCatalog::embedded().expect("catalog");
+
+    // Verify aliases & credential scrubbing
+    assert_eq!(
+        catalog.find_provider("zen").map(|(id, _)| id),
+        Some("opencode")
+    );
+    assert_eq!(
+        catalog.find_provider("opencode-zen").map(|(id, _)| id),
+        Some("opencode")
+    );
+    assert_eq!(
+        catalog.find_provider("go").map(|(id, _)| id),
+        Some("opencode-go")
+    );
+    let secrets = catalog.secret_env_vars();
+    assert!(secrets.contains(&"OPENCODE_API_KEY".to_string()));
+    assert!(secrets.contains(&"OPENCODE_GO_API_KEY".to_string()));
+    assert!(secrets.contains(&"META_MODEL_API_KEY".to_string()));
+    assert!(secrets.contains(&"MISTRAL_API_KEY".to_string()));
+
+    // OpenCode Zen multi-protocol routing table
+    let zen_claude = resolve_spec_no_env(&catalog, "opencode", "claude-opus-5-5", None);
+    assert_eq!(zen_claude.api, "anthropic-messages");
+    assert_eq!(
+        zen_claude.base_url,
+        "https://opencode.ai/inference/anthropic/v1"
+    );
+    assert_eq!(
+        zen_claude
+            .headers
+            .get("anthropic-version")
+            .map(String::as_str),
+        Some("2023-06-01")
+    );
+
+    let zen_gemini = resolve_spec_no_env(&catalog, "opencode", "gemini-4-argon", None);
+    assert_eq!(zen_gemini.api, "google-generative");
+    assert_eq!(
+        zen_gemini.base_url,
+        "https://opencode.ai/inference/google/v1beta"
+    );
+
+    let zen_gpt = resolve_spec_no_env(&catalog, "opencode", "gpt-5.4", None);
+    assert_eq!(zen_gpt.api, "openai-responses");
+    assert_eq!(zen_gpt.base_url, "https://opencode.ai/inference/openai/v1");
+
+    let zen_muse = resolve_spec_no_env(&catalog, "opencode", "muse-spark-1.3", None);
+    assert_eq!(zen_muse.api, "openai-responses");
+
+    let zen_grok = resolve_spec_no_env(&catalog, "opencode", "grok-4.7", None);
+    assert_eq!(zen_grok.api, "openai-responses");
+    assert_eq!(
+        zen_grok.compat.session_id_header.as_deref(),
+        Some("x-grok-conv-id")
+    );
+
+    let zen_mistral = resolve_spec_no_env(&catalog, "opencode", "mistral-large-4", None);
+    assert_eq!(zen_mistral.api, "openai-completions");
+    assert_eq!(
+        zen_mistral.compat.tool_call_id_format.as_deref(),
+        Some("alnum9")
+    );
+
+    let zen_kimi = resolve_spec_no_env(&catalog, "opencode", "kimi-k3.1-pro", None);
+    assert_eq!(zen_kimi.api, "openai-completions");
+    assert_eq!(
+        zen_kimi
+            .compat
+            .requires_reasoning_content_on_assistant_messages,
+        Some(true)
+    );
+
+    // OpenCode Go multi-protocol routing + longest-prefix override (`minimax-m3` vs `minimax-m3.1-flash`)
+    let go_claude = resolve_spec_no_env(&catalog, "opencode-go", "claude-haiku-5-5", None);
+    assert_eq!(go_claude.api, "anthropic-messages");
+    assert_eq!(
+        go_claude.base_url,
+        "https://opencode.ai/inference/go/anthropic/v1"
+    );
+
+    let go_m3 = resolve_spec_no_env(&catalog, "opencode-go", "minimax-m3", None);
+    assert_eq!(go_m3.api, "anthropic-messages");
+    assert_eq!(go_m3.compat.requires_thinking_signature, Some(false));
+
+    let go_m31 = resolve_spec_no_env(&catalog, "opencode-go", "minimax-m3.1-flash", None);
+    assert_eq!(go_m31.api, "openai-completions");
+    assert_eq!(
+        go_m31.base_url,
+        "https://opencode.ai/inference/go/openai/v1"
+    );
+
+    let go_gemini = resolve_spec_no_env(&catalog, "opencode-go", "gemini-4-argon", None);
+    assert_eq!(go_gemini.api, "google-generative");
+    assert_eq!(
+        go_gemini.base_url,
+        "https://opencode.ai/inference/go/google/v1beta"
+    );
+
+    // Verify AnthropicMessagesProvider avoids `/v1/v1/messages` when base_url already ends with `/v1`!
+    let sse_anth = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_oc1\",\"usage\":{\"input_tokens\":10}}}\n\n\
+        event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"zen-ok\"}}\n\n\
+        event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+        event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let (mock_base, captured) = spawn_mock_http(vec![(200, vec![], sse_anth.into())]).await;
+    let v1_base = format!("{mock_base}/inference/anthropic/v1");
+    let spec_live = resolve_spec_no_env(&catalog, "opencode", "claude-sonnet-5-5", Some(&v1_base));
+    let anth = AnthropicProvider::from_spec(spec_live);
+    let mut rx = anth
+        .stream(
+            sample_request("claude-sonnet-5-5", vec![Message::user_text("ping")]),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("stream");
+    while rx.recv().await.is_some() {}
+    let req_line = captured.lock().expect("cap")[0].0.clone();
+    assert!(
+        req_line.starts_with("POST /inference/anthropic/v1/messages "),
+        "must not double /v1/v1/messages: got `{req_line}`"
+    );
+}
+
+#[tokio::test]
+async fn conformance_grok_4_7_responses_sticky_conv_header_and_muse_meta_responses() {
+    let catalog = ProviderCatalog::embedded().expect("catalog");
+
+    // 1. Grok 4.7 auto-routes to openai-responses with x-grok-conv-id + encrypted reasoning + no reasoning.effort
+    let sse_resp = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"grok-ok\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"input_tokens_details\":{\"cached_tokens\":850},\"output_tokens\":20}}}\n\n"
+    );
+    let (grok_url, grok_cap) = spawn_mock_http(vec![(
+        200,
+        vec![("Content-Type", "text/event-stream")],
+        sse_resp.to_string(),
+    )])
+    .await;
+
+    let grok47_spec = resolve_spec_no_env(&catalog, "grok", "grok-4.7", Some(&grok_url));
+    assert_eq!(grok47_spec.api, "openai-responses");
+    assert_eq!(
+        grok47_spec.compat.session_id_header.as_deref(),
+        Some("x-grok-conv-id")
+    );
+    let grok47 = OpenAiResponsesProvider::from_spec(grok47_spec);
+    let mut rx = grok47
+        .stream(
+            sample_request("grok-4.7", vec![Message::user_text("hi")]),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("grok-4.7 stream");
+    let mut grok_usage = None;
+    while let Some(ev) = rx.recv().await {
+        if let StreamEvent::Done { usage, .. } = ev {
+            grok_usage = Some(usage);
+        }
+    }
+    let u = grok_usage.expect("usage");
+    assert_eq!(u.cache_read_tokens, 850);
+    assert_eq!(u.input_tokens, 150);
+
+    let gcap = grok_cap.lock().expect("cap");
+    assert!(gcap[0].0.starts_with("POST /responses "));
+    assert!(
+        gcap[0]
+            .1
+            .to_ascii_lowercase()
+            .contains("x-grok-conv-id: carnot-"),
+        "Grok 4.7 Responses must send sticky x-grok-conv-id header: {}",
+        gcap[0].1
+    );
+    let gbody: Value = serde_json::from_str(&gcap[0].2).expect("body");
+    assert!(
+        gbody.get("reasoning").is_none(),
+        "Grok 4.7 must not send reasoning.effort"
+    );
+    assert_eq!(gbody.get("store").and_then(Value::as_bool), Some(false));
+
+    // Legacy grok-4 still resolves to openai-completions
+    let grok4_spec = resolve_spec_no_env(&catalog, "grok", "grok-4", None);
+    assert_eq!(grok4_spec.api, "openai-completions");
+
+    // 2. Muse / Meta defaults to https://api.meta.ai/v1 + openai-responses; Llama 4 falls back to completions
+    let muse_spec = resolve_spec_no_env(&catalog, "muse", "muse-spark-1.3", None);
+    assert_eq!(muse_spec.api, "openai-responses");
+    assert_eq!(muse_spec.base_url, "https://api.meta.ai/v1");
+    let muse_provider = OpenAiResponsesProvider::from_spec(muse_spec);
+    let muse_body = muse_provider.build_body(&sample_request(
+        "muse-spark-1.3",
+        vec![Message::user_text("build")],
+    ));
+    assert_eq!(
+        muse_body
+            .pointer("/reasoning/effort")
+            .and_then(Value::as_str),
+        Some("high")
+    );
+    assert!(muse_body.get("prompt_cache_key").is_some());
+
+    let llama_spec = resolve_spec_no_env(
+        &catalog,
+        "muse",
+        "Llama-4-Maverick-17B-128E-Instruct-FP8",
+        None,
+    );
+    assert_eq!(llama_spec.api, "openai-completions");
+
+    // Verify auto-routing via ProviderRegistry::available_models + provider_for_model
+    assert_eq!(catalog.provider_for_model("grok-4.7"), Some("grok"));
+    assert_eq!(catalog.provider_for_model("muse-wonder-1.0"), Some("muse"));
+    assert_eq!(
+        catalog.provider_for_model("mistral-large-latest"),
+        Some("mistral")
+    );
+    assert_eq!(
+        catalog.effective_api("grok", "grok-4.7").as_deref(),
+        Some("openai-responses")
+    );
+    assert_eq!(
+        catalog
+            .effective_api("opencode", "claude-opus-5-5")
+            .as_deref(),
+        Some("anthropic-messages")
+    );
 }
