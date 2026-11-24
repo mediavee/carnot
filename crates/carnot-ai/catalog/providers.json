@@ -518,6 +518,9 @@
   },
   "models": {
     "claude-opus-5-5": {
+      "provider": "anthropic",
+      "label": "Claude Opus 5.5",
+      "order": 10,
       "pricing": { "input_per_mtok": 4.0, "output_per_mtok": 20.0, "cache_read_mult": 0.05, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 1000000,
       "max_output_tokens": 64000,
@@ -527,6 +530,9 @@
       "needs_adaptive_thinking": false
     },
     "claude-sonnet-5-5": {
+      "provider": "anthropic",
+      "label": "Claude Sonnet 5.5",
+      "order": 11,
       "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 10.0, "cache_read_mult": 0.05, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 1000000,
       "max_output_tokens": 64000,
@@ -536,6 +542,9 @@
       "needs_adaptive_thinking": false
     },
     "claude-haiku-5-5": {
+      "provider": "anthropic",
+      "label": "Claude Haiku 5.5",
+      "order": 12,
       "pricing": { "input_per_mtok": 0.10, "output_per_mtok": 0.50, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 200000,
       "max_output_tokens": 32768,
@@ -545,6 +554,9 @@
       "needs_adaptive_thinking": false
     },
     "claude-opus-4-8": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.8",
+      "order": 14,
       "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 1000000,
       "max_output_tokens": 64000,
@@ -554,6 +566,9 @@
       "needs_adaptive_thinking": true
     },
     "claude-opus-4-7": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.7",
+      "order": 15,
       "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 1000000,
       "max_output_tokens": 64000,
@@ -563,6 +578,9 @@
       "needs_adaptive_thinking": true
     },
     "claude-opus-4-6": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.6",
+      "order": 16,
       "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 1000000,
       "max_output_tokens": 64000,
@@ -572,6 +590,9 @@
       "needs_adaptive_thinking": true
     },
     "claude-opus-4-5": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.5",
+      "order": 17,
       "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 200000,
       "max_output_tokens": 32768,
@@ -582,6 +603,9 @@
       "thinking_mode": "budget"
     },
     "claude-sonnet-4-6": {
+      "provider": "anthropic",
+      "label": "Claude Sonnet 4.6",
+      "order": 18,
       "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 1000000,
       "max_output_tokens": 64000,
@@ -591,6 +615,9 @@
       "needs_adaptive_thinking": true
     },
     "claude-sonnet-4-5": {
+      "provider": "anthropic",
+      "label": "Claude Sonnet 4.5",
+      "order": 19,
       "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 200000,
       "max_output_tokens": 32768,
@@ -601,6 +628,9 @@
       "thinking_mode": "budget"
     },
     "claude-haiku-4-5": {
+      "provider": "anthropic",
+      "label": "Claude Haiku 4.5",
+      "order": 20,
       "pricing": { "input_per_mtok": 1.0, "output_per_mtok": 5.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 200000,
       "max_output_tokens": 32768,
@@ -611,6 +641,9 @@
       "thinking_mode": "budget"
     },
     "claude-fable-5-2": {
+      "provider": "anthropic",
+      "label": "Claude Fable 5.2",
+      "order": 13,
       "pricing": { "input_per_mtok": 8.0, "output_per_mtok": 40.0, "cache_read_mult": 0.025, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
       "context_window": 1000000,
       "max_output_tokens": 64000,
