@@ -23,9 +23,9 @@ pub use event_log::{EventLog, EventStream};
 
 use carnot_ai::{Provider, ProviderRequest, StreamEvent};
 use carnot_core::{
-    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, Message, NativeWebConfig,
-    ReasoningEffort, Result, Role, StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput,
-    ToolResultBlock, ToolSpec, Usage,
+    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, ContextBreakdown, Message,
+    NativeWebConfig, ReasoningEffort, Result, Role, StopReason, ThermodynamicMetrics, ToolEffects,
+    ToolOutput, ToolResultBlock, ToolSpec, Usage,
 };
 use carnot_ext::{
     BoundaryAction, Module, PermissionBroker, ToolGateDecision, TurnBoundarySnapshot,
@@ -758,6 +758,35 @@ impl Agent {
 
     pub async fn current_context_tokens(&self) -> u64 {
         self.session.lock().await.effective_context_tokens()
+    }
+
+    /// Returns `(context_tokens, context_breakdown)` atomically from a single session snapshot.
+    /// `context_breakdown` is `None` before the first provider response or right after compaction /
+    /// rewind / cold prune until the next provider usage measurement arrives.
+    pub async fn current_context_with_breakdown(&self) -> (u64, Option<ContextBreakdown>) {
+        let supports_native_ts = self
+            .runtime
+            .lock()
+            .await
+            .provider
+            .supports_native_tool_search();
+        let wire_tools =
+            tool_search::effective_tools_for_provider(&self.tools.specs(), supports_native_ts);
+        let session = self.session.lock().await;
+        let total = session.effective_context_tokens();
+        if !session.has_provider_usage_anchor() {
+            return (total, None);
+        }
+        let proj = session.project_context();
+        let raw =
+            estimate_context_breakdown(&proj.static_system_prompt, &wire_tools, &proj.messages);
+        (total, Some(raw.scaled_to(total)))
+    }
+
+    /// Estimated per-category context breakdown scaled to the current provider-grounded total,
+    /// or `None` when no provider measurement anchors the active history (e.g. right after compaction).
+    pub async fn context_breakdown(&self) -> Option<ContextBreakdown> {
+        self.current_context_with_breakdown().await.1
     }
 
     pub async fn pending_queue_len(&self) -> usize {
@@ -2233,6 +2262,99 @@ pub fn text_result(s: impl Into<String>) -> Vec<ToolResultBlock> {
     vec![ToolResultBlock::text(s)]
 }
 
+/// Estimates unscaled token counts per context category (~4 chars/token; images = 1,500 tokens).
+/// Deferred tool schemas (`defer_loading == true`) cost 0 tokens until loaded.
+fn estimate_context_breakdown(
+    static_system_prompt: &str,
+    wire_tools: &[ToolSpec],
+    messages: &[Arc<Message>],
+) -> ContextBreakdown {
+    let mut out = ContextBreakdown {
+        estimated: true,
+        ..ContextBreakdown::default()
+    };
+
+    if !static_system_prompt.is_empty() {
+        out.system = (static_system_prompt.len() as u64).div_ceil(4);
+    }
+
+    for tool in wire_tools {
+        if tool.defer_loading {
+            continue;
+        }
+        let schema_len = tool.input_schema.to_string().len();
+        let chars = tool.name.len() + tool.description.len() + schema_len;
+        out.tools = out.tools.saturating_add((chars as u64).div_ceil(4).max(1));
+    }
+
+    for msg in messages {
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    if msg.role == Role::User {
+                        classify_user_text_into_breakdown(text, &mut out);
+                    } else {
+                        out.messages = out.messages.saturating_add((text.len() as u64) / 4 + 1);
+                    }
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    out.messages = out.messages.saturating_add((thinking.len() as u64) / 4 + 1);
+                }
+                ContentBlock::Image { .. } => {
+                    out.messages = out.messages.saturating_add(1_500);
+                }
+                ContentBlock::Opaque { raw, .. } => {
+                    out.messages = out
+                        .messages
+                        .saturating_add((raw.to_string().len() as u64) / 4 + 1);
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    let chars = name.len() + input.to_string().len();
+                    out.tool_results = out.tool_results.saturating_add((chars as u64) / 4 + 4);
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    for tb in content {
+                        match tb {
+                            ToolResultBlock::Text { text } => {
+                                out.tool_results =
+                                    out.tool_results.saturating_add((text.len() as u64) / 4 + 1);
+                            }
+                            ToolResultBlock::Image { .. } => {
+                                out.tool_results = out.tool_results.saturating_add(1_500);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn classify_user_text_into_breakdown(text: &str, out: &mut ContextBreakdown) {
+    if text.is_empty() {
+        return;
+    }
+    for segment in text.split("\n\n") {
+        let trimmed = segment.trim_start();
+        let est = (segment.len() as u64) / 4 + 1;
+        if trimmed.starts_with("[available-deferred-tools]") {
+            out.tools = out.tools.saturating_add(est);
+        } else if trimmed.starts_with("[workspace-facts]")
+            || trimmed.starts_with("[global-instructions:")
+            || trimmed.starts_with("[project-instructions:")
+            || trimmed.starts_with("[carnot-skill:")
+            || trimmed.starts_with("[agent-skills]")
+            || trimmed.starts_with("[carnot-memory")
+        {
+            out.memory = out.memory.saturating_add(est);
+        } else {
+            out.messages = out.messages.saturating_add(est);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2282,5 +2404,83 @@ mod tests {
             .map(|i| format!("Unique diagnostic line number {i} with distinct payload {i:#x}\n"))
             .collect::<String>();
         assert!(!is_repetition_dominated(&normal_text));
+    }
+
+    #[tokio::test]
+    async fn context_breakdown_tracks_categories_scales_to_total_and_clears_after_compaction() {
+        let dir = std::env::temp_dir().join(format!("carnot-breakdown-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("note.txt"), "hello from tool result\n").expect("write");
+        let mut cfg = CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let tools = ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let faux = Arc::new(FauxProvider::new(vec![
+            ScriptedTurn::tool_calls(vec![("c1", "Read", json!({"file_path": "note.txt"}))]),
+            ScriptedTurn::text("all done"),
+            ScriptedTurn::text("compacted summary"),
+            ScriptedTurn::text("after compaction"),
+        ]));
+        let agent = Agent::new(cfg, faux, tools, Vec::new(), false).expect("agent");
+
+        // Before the first provider turn, no provider anchor exists -> breakdown is None.
+        assert!(agent.context_breakdown().await.is_none());
+
+        agent.prompt("inspect note.txt").await.expect("prompt");
+        let (total, breakdown) = agent.current_context_with_breakdown().await;
+        let b = breakdown.expect("breakdown after provider turn");
+        assert!(total > 0);
+        assert_eq!(
+            b.total(),
+            total,
+            "breakdown must sum to exact context total"
+        );
+        assert!(b.estimated);
+        assert!(b.system > 0);
+        assert!(b.tools > 0);
+        assert!(b.messages > 0);
+        assert!(b.tool_results > 0);
+
+        // Immediately after compaction, provider anchor is invalidated -> breakdown is None.
+        agent.compact_now().await.expect("compact");
+        assert!(agent.context_breakdown().await.is_none());
+
+        // On the next provider turn, breakdown resumes and matches the new exact total.
+        agent.prompt("continue").await.expect("post-compact prompt");
+        let (total2, breakdown2) = agent.current_context_with_breakdown().await;
+        let b2 = breakdown2.expect("breakdown restored after next turn");
+        assert_eq!(b2.total(), total2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn estimate_context_breakdown_skips_deferred_tools_and_classifies_memory_markers() {
+        let active_tool = ToolSpec {
+            name: "Read".into(),
+            description: "Read a file from disk.".into(),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            defer_loading: false,
+        };
+        let deferred_tool = ToolSpec {
+            name: "mcp__huge__tool".into(),
+            description: "x".repeat(4000),
+            input_schema: json!({"type": "object", "description": "y".repeat(4000)}),
+            defer_loading: true,
+        };
+        let msg = Arc::new(Message::user_text(
+            "[project-instructions:AGENTS.md]\nFollow repo rules.\n\nHello user prompt",
+        ));
+        let raw = estimate_context_breakdown(
+            "Static system prompt text.",
+            &[active_tool, deferred_tool],
+            &[msg],
+        );
+        assert!(raw.system > 0);
+        // Deferred tool with 8 KiB description must contribute 0 tokens!
+        assert!(raw.tools < 100);
+        assert!(raw.memory > 0);
+        assert!(raw.messages > 0);
+        assert_eq!(raw.tool_results, 0);
     }
 }

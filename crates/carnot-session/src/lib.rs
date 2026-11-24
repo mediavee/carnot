@@ -788,6 +788,12 @@ impl SessionStore {
             .sum()
     }
 
+    /// True when the session holds a provider-reported input token measurement for the current
+    /// message sequence (reset to `false` on compaction, rewind, or cold prune until the next turn).
+    pub fn has_provider_usage_anchor(&self) -> bool {
+        self.last_usage_anchor.is_some()
+    }
+
     /// Provider-grounded context size estimate: uses the exact last provider-billed input token
     /// count plus `estimated_tokens()` for any trailing messages added since that call.
     /// Automatically falls back to full `project_context().estimated_tokens()` after compaction

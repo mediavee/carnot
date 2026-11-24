@@ -616,7 +616,7 @@ async fn serve_rpc_loop(
             }),
             "get_session_stats" => {
                 let met = agent.metrics().await;
-                let ctx_tokens = agent.current_context_tokens().await;
+                let (ctx_tokens, ctx_breakdown) = agent.current_context_with_breakdown().await;
                 let ctx_window = agent.current_context_window().await;
                 let active_msgs = agent.active_messages().await;
                 let msg_count = active_msgs.len();
@@ -635,6 +635,7 @@ async fn serve_rpc_loop(
                     "result": {
                         "context_tokens": ctx_tokens,
                         "context_window": ctx_window,
+                        "context_breakdown": ctx_breakdown,
                         "cost_usd": met.total_usage.cost_usd,
                         "tokens": {
                             "input": met.total_usage.input_tokens,

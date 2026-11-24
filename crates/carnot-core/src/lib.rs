@@ -756,6 +756,92 @@ impl ModelPricing {
     }
 }
 
+/// Estimated token breakdown of the active conversation context across high-level categories.
+/// Contains sizes only (never prompt text or tool names).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    /// Static system prompt tokens (excluding memory and context files when split).
+    pub system: u64,
+    /// Declared active tool schema tokens (deferred tools cost 0 until loaded).
+    pub tools: u64,
+    /// Memory blocks and injected context files / skills.
+    pub memory: u64,
+    /// User, assistant, thinking, compaction summaries, attachments, and images.
+    pub messages: u64,
+    /// Tool calls (`ToolUse`) and tool/shell outputs (`ToolResult`).
+    pub tool_results: u64,
+    /// True while category counts are estimated (~4 chars/token) rather than exact provider counts.
+    pub estimated: bool,
+}
+
+impl ContextBreakdown {
+    pub fn total(&self) -> u64 {
+        self.system
+            .saturating_add(self.tools)
+            .saturating_add(self.memory)
+            .saturating_add(self.messages)
+            .saturating_add(self.tool_results)
+    }
+
+    /// Scales the five category counts proportionally so their sum equals `target_total` exactly
+    /// using the largest-remainder method.
+    pub fn scaled_to(&self, target_total: u64) -> Self {
+        let raw = [
+            self.system,
+            self.tools,
+            self.memory,
+            self.messages,
+            self.tool_results,
+        ];
+        let raw_sum: u128 = raw.iter().map(|&v| u128::from(v)).sum();
+        if target_total == 0 {
+            return Self {
+                estimated: self.estimated,
+                ..Self::default()
+            };
+        }
+        if raw_sum == 0 {
+            return Self {
+                messages: target_total,
+                estimated: self.estimated,
+                ..Self::default()
+            };
+        }
+
+        let target = u128::from(target_total);
+        let mut floors = [0u64; 5];
+        let mut remainders = [(0u128, 0usize); 5];
+        let mut assigned = 0u64;
+        for i in 0..5 {
+            let num = u128::from(raw[i]) * target;
+            let q = (num / raw_sum) as u64;
+            let r = num % raw_sum;
+            floors[i] = q;
+            remainders[i] = (r, i);
+            assigned = assigned.saturating_add(q);
+        }
+
+        let mut leftover = target_total.saturating_sub(assigned);
+        remainders.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for &(_, idx) in &remainders {
+            if leftover == 0 {
+                break;
+            }
+            floors[idx] = floors[idx].saturating_add(1);
+            leftover -= 1;
+        }
+
+        Self {
+            system: floors[0],
+            tools: floors[1],
+            memory: floors[2],
+            messages: floors[3],
+            tool_results: floors[4],
+            estimated: self.estimated,
+        }
+    }
+}
+
 /// Normalized provider rate-limit window parsed from HTTP response headers
 /// (e.g. Anthropic `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1328,5 +1414,28 @@ mod tests {
         assert!(wa.conflicts_with(&ra));
         assert!(!ra.conflicts_with(&wb));
         assert!(wa.conflicts_with(&ToolEffects::serial()));
+    }
+
+    #[test]
+    fn context_breakdown_scales_to_exact_total() {
+        let raw = ContextBreakdown {
+            system: 100,
+            tools: 250,
+            memory: 75,
+            messages: 400,
+            tool_results: 175,
+            estimated: true,
+        };
+        for target in [0u64, 1, 7, 999, 10_000, 123_457] {
+            let scaled = raw.scaled_to(target);
+            assert_eq!(scaled.total(), target);
+            assert!(scaled.estimated);
+        }
+        let zero = ContextBreakdown {
+            estimated: true,
+            ..ContextBreakdown::default()
+        };
+        assert_eq!(zero.scaled_to(500).total(), 500);
+        assert_eq!(zero.scaled_to(500).messages, 500);
     }
 }

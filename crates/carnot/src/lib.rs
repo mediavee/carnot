@@ -42,10 +42,11 @@ pub use carnot_cas::{
     shape_text_output,
 };
 pub use carnot_core::{
-    AgentEvent, CacheTtl, CarnotConfig, CarnotError, EventEnvelope, Message, ModelPricing,
-    ModuleSwitches, NativeWebConfig, Profile, ProviderWebCapabilities, RateLimitWindow,
-    ReasoningEffort, Result, StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolSpec,
-    Usage, UserQuestion, UserQuestionAnswer, UserQuestionOption, canonicalize_json,
+    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContextBreakdown, EventEnvelope, Message,
+    ModelPricing, ModuleSwitches, NativeWebConfig, Profile, ProviderWebCapabilities,
+    RateLimitWindow, ReasoningEffort, Result, StopReason, ThermodynamicMetrics, ToolEffects,
+    ToolOutput, ToolSpec, Usage, UserQuestion, UserQuestionAnswer, UserQuestionOption,
+    canonicalize_json,
 };
 pub use carnot_ext::{
     BoundaryAction, CompactionHookAction, CompactionHookContext, Module, PermissionBroker,
