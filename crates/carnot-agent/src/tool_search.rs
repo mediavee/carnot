@@ -23,7 +23,7 @@ pub const CALL_DEFERRED_TOOL_NAME: &str = "CallDeferredTool";
 /// Max number of non-MCP deferred tools promoted directly to eager tools on providers without
 /// native `defer_loading` (OpenAI, Gemini, local models).
 ///
-/// Rationale (hybrid Pi + Claude Code):
+/// Rationale:
 ///   - Providers WITH native `defer_loading` (Anthropic) keep `defer_loading: true` on the wire
 ///     (0 static schema tokens + 1-step server tool search).
 ///   - Providers WITHOUT native `defer_loading` pay ~240 static tokens + 1 extra LLM round-trip
@@ -82,7 +82,7 @@ pub fn effective_tools_for_provider(
     }
 }
 
-/// Builds a compact Turn-1 user-context directory of deferred tools (hybrid Claude Code + Pi):
+/// Builds a compact Turn-1 user-context directory of deferred tools:
 ///   - Built-in deferred tools (`WebFetch`, `WebSearch`, `LspQuery`, ...) are listed by exact name.
 ///   - MCP servers are grouped as one compact line per server (`name`, tool count, and 1-line
 ///     description / handshake instructions or sample tool names).

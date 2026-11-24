@@ -182,9 +182,9 @@ pub fn compaction_effort_for_provider(
 }
 
 /// Deterministically reconstructs `(modified_files, read_only_files)` from the persisted session
-/// messages, any prior compaction footer, and the current turn's `SegmentTracker` (inspired by
-/// Pi's `extractFileOperations` + `computeFileLists`). Ensures file tracking survives `--resume`
-/// and multiple chained compactions without duplicating modified files in the read-only list.
+/// messages, any prior compaction footer, and the current turn's `SegmentTracker`.
+/// Ensures file tracking survives `--resume` and multiple chained compactions without duplicating
+/// modified files in the read-only list.
 pub(crate) fn extract_file_ops_from_session(
     messages: &[Arc<Message>],
     seg: &SegmentTracker,
@@ -439,7 +439,7 @@ async fn try_semantic_llm_handoff(
                         stop_reason,
                         ..
                     } => {
-                        // Pi guard: never persist a length-truncated or tool-calling summary
+                        // Never persist a length-truncated or tool-calling summary.
                         if stop_reason == StopReason::MaxTokens || message.has_tool_use() {
                             rejected_incomplete = true;
                         } else {
@@ -503,7 +503,7 @@ pub(crate) async fn execute_compaction(
     custom_focus: Option<&str>,
     cancel: CancellationToken,
 ) -> Result<(u64, u64, bool)> {
-    // Guard against re-compacting an already-compacted single-summary session (Pi pattern)
+    // Guard against re-compacting an already-compacted single-summary session.
     let (pre_tokens, pre_msg_count) = {
         let s = session.lock().await;
         let tok = s.effective_context_tokens();

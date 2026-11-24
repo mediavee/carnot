@@ -1,5 +1,4 @@
-//! Cohesive modern dark-terminal palette inspired by Claude Code & OpenCode,
-//! with automatic `NO_COLOR` fallback.
+//! Modern dark-terminal palette with automatic `NO_COLOR` fallback.
 
 use ratatui::style::{Color, Modifier, Style};
 

@@ -1114,10 +1114,10 @@ impl Agent {
         }
         initial_content.extend(extra_blocks);
 
-        // Cold-cache opportunistic tool-result pruning (inspired by Hermes):
-        // ONLY when the provider's rolling prompt cache is ALREADY expired (zero cache breaks,
+        // Cold-cache opportunistic tool-result pruning:
+        // Only when the provider's rolling prompt cache is already expired (zero cache breaks,
         // zero LLM calls), replace oversized stale tool results outside the last 4 messages
-        // with compact handle-preserving stubs before the cold cache rewrite!
+        // with compact handle-preserving stubs before the cold cache rewrite.
         if self.config.modules.compaction {
             let ttl_ms = match self.config.cache_ttl {
                 CacheTtl::Long1h => 3_610_000u64,
@@ -2046,7 +2046,7 @@ impl Agent {
                     continue;
                 }
 
-                // Silent empty-reply guard (Prime/Hermes pattern): if the provider returned EndTurn
+                // Silent empty-reply guard: if the provider returned EndTurn
                 // with zero tool calls and empty visible text, retry once before settling empty.
                 if stop_reason == StopReason::EndTurn
                     && final_text.trim().is_empty()
@@ -2205,7 +2205,7 @@ impl Agent {
     }
 }
 
-/// Conservative repetition-loop detector (inspired by Hermes `repetition_guard.py`):
+/// Conservative repetition-loop detector:
 /// returns `true` if a long fragment (>=400 chars) is dominated by >=5 verbatim repeats of a single
 /// normalized line or 60-char chunk covering >=50% of the output, preventing `MaxTokens` auto-continue
 /// from stitching degenerate loops.

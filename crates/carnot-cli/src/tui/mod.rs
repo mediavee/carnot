@@ -1,4 +1,4 @@
-//! Clean, ultra-fast interactive TUI for Carnot (mini Claude Code / OpenCode style).
+//! Interactive full-screen terminal UI (TUI) for Carnot.
 //!
 //! Architecture:
 //!   - Full-screen alternate screen with RAII + panic-hook terminal restoration

@@ -797,7 +797,7 @@ impl SessionStore {
     /// Provider-grounded context size estimate: uses the exact last provider-billed input token
     /// count plus `estimated_tokens()` for any trailing messages added since that call.
     /// Automatically falls back to full `project_context().estimated_tokens()` after compaction
-    /// or rewind (inspired by Pi's `estimateProjectedContextTokens`).
+    /// or rewind.
     pub fn effective_context_tokens(&self) -> u64 {
         if let Some((anchor_len, input_tokens)) = self.last_usage_anchor
             && anchor_len <= self.active_messages.len()
