@@ -49,7 +49,7 @@ pub use carnot_core::{
 };
 pub use carnot_ext::{
     BoundaryAction, CompactionHookAction, CompactionHookContext, Module, PermissionBroker,
-    ToolGateDecision, TurnBoundarySnapshot, UserQuestionBroker,
+    PromptInjection, ToolGateDecision, TurnBoundarySnapshot, UserQuestionBroker,
     ask_user::{AskUserModule, SharedQuestionBroker},
     dropin::{
         DropinExtension, DropinExtensionSpec, FailurePolicy, discover_dropin_specs,
@@ -84,9 +84,20 @@ pub use carnot_mcp::{
     parse_acp_mcp_servers,
 };
 pub use carnot_protocol::{
-    acp::AcpHost, acp::AcpModelInfo, acp::ResolvedAcpModel, acp::serve_acp_stdio,
-    acp::serve_acp_stdio_with_host, http::serve_http, http::serve_http_with_token,
-    interaction::ChannelInteractionBroker, rpc::serve_rpc_stdio,
+    acp::AcpHost,
+    acp::AcpModelInfo,
+    acp::ResolvedAcpModel,
+    acp::serve_acp_stdio,
+    acp::serve_acp_stdio_with_host,
+    host_ext::{HostRegistration, HostRpcBridge, HostRpcModule, HostToolDecl},
+    http::serve_http,
+    http::serve_http_with_token,
+    interaction::ChannelInteractionBroker,
+    rpc::{
+        PendingHostSession, ResolvedRpcModel, RpcCommandInfo, RpcHost, RpcModelInfo,
+        read_host_registration, serve_rpc_stdio, serve_rpc_stdio_with_extension,
+        serve_rpc_stdio_with_host,
+    },
 };
 pub use carnot_tools::{Tool, ToolRegistry};
 
@@ -105,6 +116,7 @@ pub struct CarnotBuilder {
     extra_modules: Vec<Arc<dyn Module>>,
     extra_tools: Vec<Arc<dyn Tool>>,
     extra_mcp_servers: std::collections::BTreeMap<String, McpServerConfig>,
+    disable_mcp: bool,
     persist_session: bool,
     resume_session: Option<PathBuf>,
     fork_session: bool,
@@ -131,6 +143,7 @@ impl CarnotBuilder {
             extra_modules: Vec::new(),
             extra_tools: Vec::new(),
             extra_mcp_servers: std::collections::BTreeMap::new(),
+            disable_mcp: false,
             persist_session: true,
             resume_session: None,
             fork_session: false,
@@ -369,6 +382,42 @@ impl CarnotBuilder {
         self
     }
 
+    /// Sets an explicit session JSONL directory (defaults to `~/.carnot/sessions`).
+    pub fn session_dir(mut self, dir: PathBuf) -> Self {
+        self.config.session_dir = dir;
+        self
+    }
+
+    /// Overrides the default static system prompt (frozen before Turn 1 for cache invariance).
+    pub fn system_prompt_override(mut self, prompt: Option<String>) -> Self {
+        self.config.static_system_prompt_override = prompt;
+        self
+    }
+
+    /// Appends a frozen static section to the system prompt before Turn 1.
+    pub fn system_prompt_append(mut self, section: Option<String>) -> Self {
+        self.config.static_system_prompt_append = section;
+        self
+    }
+
+    /// Excludes named built-in tools (case-insensitive) from `ToolRegistry` before Turn 1.
+    pub fn exclude_tools(mut self, excluded: Vec<String>) -> Self {
+        self.config.excluded_tools = excluded;
+        self
+    }
+
+    /// Controls whether Turn-1 micro-skills auto-load `AGENTS.md`/`CLAUDE.md` (default `true`).
+    pub fn load_context_files(mut self, enabled: bool) -> Self {
+        self.config.load_context_files = enabled;
+        self
+    }
+
+    /// Controls whether Turn-1 micro-skills auto-discover `SKILL.md` directories (default `true`).
+    pub fn load_skills(mut self, enabled: bool) -> Self {
+        self.config.load_skills = enabled;
+        self
+    }
+
     pub fn autonomous_gates(mut self, gates: Vec<String>) -> Self {
         self.config.autonomous_gates = gates;
         self
@@ -389,6 +438,12 @@ impl CarnotBuilder {
         self
     }
 
+    /// Disables loading all global/workspace `.mcp.json` servers for this session.
+    pub fn disable_mcp(mut self, disable: bool) -> Self {
+        self.disable_mcp = disable;
+        self
+    }
+
     /// Synchronous build (no MCP server connections; suitable for embedded Rust callers & tests).
     pub fn build(self) -> Result<Arc<Agent>> {
         let cas = Arc::new(CasStore::open(&self.config.workspace_root)?);
@@ -398,12 +453,18 @@ impl CarnotBuilder {
     /// Async build loading all validated `.mcp.json` servers and drop-in file extensions.
     pub async fn build_async(mut self) -> Result<(Arc<Agent>, Arc<McpManager>)> {
         let cas = Arc::new(CasStore::open(&self.config.workspace_root)?);
-        let mut cfgs = load_mcp_configs(
-            &self.config.workspace_root,
-            &self.config.mcp_config_paths,
-            self.config.trust_workspace_mcp,
-        )?;
-        cfgs.extend(self.extra_mcp_servers.clone());
+        let mut cfgs = if self.disable_mcp {
+            std::collections::BTreeMap::new()
+        } else {
+            load_mcp_configs(
+                &self.config.workspace_root,
+                &self.config.mcp_config_paths,
+                self.config.trust_workspace_mcp,
+            )?
+        };
+        if !self.disable_mcp {
+            cfgs.extend(self.extra_mcp_servers.clone());
+        }
         #[cfg(feature = "ext-claude-plugins")]
         if let Some(plugin_cfg) = self.claude_plugins_config.take() {
             let plugin_mod = ClaudePluginsModule::load(&self.config.workspace_root, &plugin_cfg)?;

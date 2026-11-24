@@ -298,6 +298,13 @@ impl OpenAiProvider {
             );
         }
 
+        // Append ephemeral per-turn notes AFTER cache breakpoints so transient notes stay uncached!
+        for note in &req.ephemeral_tail_notes {
+            if !note.trim().is_empty() {
+                messages.push(json!({"role": "user", "content": note}));
+            }
+        }
+
         let tools: Vec<Value> = req
             .tools
             .iter()
@@ -796,6 +803,7 @@ mod tests {
             max_output_tokens: 4096,
             skip_tail_cache_write: skip_tail,
             native_web: NativeWebConfig::default(),
+            ephemeral_tail_notes: Vec::new(),
         }
     }
 

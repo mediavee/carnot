@@ -88,6 +88,9 @@ pub struct ProviderRequest {
     pub skip_tail_cache_write: bool,
     /// Optional provider-native server-side web search & fetch configuration.
     pub native_web: NativeWebConfig,
+    /// Ephemeral per-turn tail notes attached AFTER all provider prompt-cache breakpoints so
+    /// transient reminders NEVER invalidate or re-bill cached conversation prefixes.
+    pub ephemeral_tail_notes: Vec<String>,
 }
 
 /// Incremental streaming event from any model provider.

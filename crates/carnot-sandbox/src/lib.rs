@@ -217,6 +217,71 @@ pub fn build_sandboxed_shell_in_dir(
     Ok(cmd)
 }
 
+const MACOS_DENY_SUBPATHS: &[(&str, &str)] = &[
+    ("SSH", ".ssh"),
+    ("AWS", ".aws"),
+    ("GNUPG", ".gnupg"),
+    ("GH", ".config/gh"),
+    ("SECRETS", ".secrets"),
+    ("CLAUDE", ".claude"),
+    ("CODEX", ".codex"),
+    ("AGENTSAFE", ".config/agentsafe"),
+    ("DOCKER", ".docker"),
+    ("KUBE", ".kube"),
+    ("OP", ".config/op"),
+    ("KEYCHAINS", "Library/Keychains"),
+    ("GCLOUD", ".config/gcloud"),
+];
+
+const MACOS_DENY_LITERALS: &[(&str, &str)] = &[
+    ("ZSHENV", ".zshenv"),
+    ("ZSHRC", ".zshrc"),
+    ("ZSH_HIST", ".zsh_history"),
+    ("BASH_HIST", ".bash_history"),
+    ("PY_HIST", ".python_history"),
+    ("PSQL_HIST", ".psql_history"),
+    ("HOME_ENV", ".env"),
+    ("PYPIRC", ".pypirc"),
+    ("NETRC", ".netrc"),
+    ("GIT_CREDS", ".git-credentials"),
+    ("CONFIG_GIT_CREDS", ".config/git/credentials"),
+    ("NPMRC", ".npmrc"),
+    ("CARGO_CREDS", ".cargo/credentials"),
+    ("CARGO_CREDS_TOML", ".cargo/credentials.toml"),
+    ("CARNOT_TOKEN", ".carnot/server.token"),
+];
+
+/// Resolves all candidate home directories to protect in macOS Seatbelt so overriding `$HOME`
+/// (e.g. for isolated app config) NEVER disables secret-read denies on the real user home.
+fn macos_protected_homes() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = Vec::new();
+    let mut push_home = |candidate: PathBuf| {
+        let canonical = candidate.canonicalize().unwrap_or(candidate);
+        if !homes.contains(&canonical) {
+            homes.push(canonical);
+        }
+    };
+    if let Some(h) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        push_home(PathBuf::from(h));
+    }
+    for var in ["USER", "LOGNAME"] {
+        if let Ok(user) = std::env::var(var)
+            && !user.is_empty()
+            && !user.contains('/')
+            && !user.contains("..")
+        {
+            let real_home = PathBuf::from("/Users").join(&user);
+            if real_home.is_dir() {
+                push_home(real_home);
+            }
+        }
+    }
+    if homes.is_empty() {
+        homes.push(PathBuf::from("/nonexistent"));
+    }
+    homes
+}
+
 fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Command {
     let mut profile = String::from(
         "(version 1)\n\
@@ -230,134 +295,41 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
            (global-name-prefix \"com.apple.coreservices.launchservicesd\")\n\
            (global-name \"com.apple.SecurityServer\")\n\
            (global-name \"com.apple.securityd\"))\n\
-         (allow file-read*)\n\
-         (deny file-read*\n\
-           (subpath (param \"DENY_SSH\"))\n\
-           (subpath (param \"DENY_AWS\"))\n\
-           (subpath (param \"DENY_GNUPG\"))\n\
-           (subpath (param \"DENY_GH\"))\n\
-           (subpath (param \"DENY_SECRETS\"))\n\
-           (literal (param \"DENY_ZSHENV\"))\n\
-           (literal (param \"DENY_ZSHRC\"))\n\
-           (literal (param \"DENY_ZSH_HIST\"))\n\
-           (literal (param \"DENY_BASH_HIST\"))\n\
-           (literal (param \"DENY_PY_HIST\"))\n\
-           (literal (param \"DENY_PSQL_HIST\"))\n\
-           (literal (param \"DENY_HOME_ENV\"))\n\
-           (literal (param \"DENY_PYPIRC\"))\n\
-           (subpath (param \"DENY_CLAUDE\"))\n\
-           (subpath (param \"DENY_CODEX\"))\n\
-           (subpath (param \"DENY_AGENTSAFE\"))\n\
-           (subpath (param \"DENY_DOCKER\"))\n\
-           (subpath (param \"DENY_KUBE\"))\n\
-           (subpath (param \"DENY_OP\"))\n\
-           (subpath (param \"DENY_KEYCHAINS\"))\n\
-           (literal (param \"DENY_NETRC\"))\n\
-           (literal (param \"DENY_GIT_CREDS\"))\n\
-           (literal (param \"DENY_CONFIG_GIT_CREDS\"))\n\
-           (literal (param \"DENY_NPMRC\"))\n\
-           (literal (param \"DENY_CARGO_CREDS\"))\n\
-           (literal (param \"DENY_CARGO_CREDS_TOML\"))\n\
-           (subpath (param \"DENY_GCLOUD\"))\n\
-           (literal (param \"DENY_CARNOT_TOKEN\")))\n\
-         (allow file-write* (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
+         (allow file-read*)\n",
+    );
+
+    let mut c = Command::new("/usr/bin/sandbox-exec");
+    let homes = macos_protected_homes();
+
+    profile.push_str("(deny file-read*\n");
+    for (h_idx, home) in homes.iter().enumerate() {
+        for (tag, rel) in MACOS_DENY_SUBPATHS {
+            let key = format!("DENY_{tag}_{h_idx}");
+            profile.push_str(&format!("  (subpath (param \"{key}\"))\n"));
+            c.arg("-D")
+                .arg(format!("{key}={}", home.join(rel).display()));
+        }
+        for (tag, rel) in MACOS_DENY_LITERALS {
+            let key = format!("DENY_{tag}_{h_idx}");
+            profile.push_str(&format!("  (literal (param \"{key}\"))\n"));
+            c.arg("-D")
+                .arg(format!("{key}={}", home.join(rel).display()));
+        }
+    }
+    profile.push_str(")\n");
+    profile.push_str(
+        "(allow file-write* (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
          (allow file-write* (require-all (subpath (param \"WORKSPACE\")) (require-not (subpath (param \"WS_DOT_GIT\")))))\n",
     );
     if policy.allow_network {
         profile.push_str("(allow network*)\n");
     }
 
-    let mut c = Command::new("/usr/bin/sandbox-exec");
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|p| p.canonicalize().ok().or(Some(p)))
-        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
-
     c.arg("-D")
         .arg(format!("WORKSPACE={}", policy.workspace_root.display()));
     c.arg("-D").arg(format!(
         "WS_DOT_GIT={}",
         policy.workspace_root.join(".git").display()
-    ));
-    c.arg("-D")
-        .arg(format!("DENY_SSH={}", home.join(".ssh").display()));
-    c.arg("-D")
-        .arg(format!("DENY_AWS={}", home.join(".aws").display()));
-    c.arg("-D")
-        .arg(format!("DENY_GNUPG={}", home.join(".gnupg").display()));
-    c.arg("-D")
-        .arg(format!("DENY_GH={}", home.join(".config/gh").display()));
-    c.arg("-D")
-        .arg(format!("DENY_SECRETS={}", home.join(".secrets").display()));
-    c.arg("-D")
-        .arg(format!("DENY_ZSHENV={}", home.join(".zshenv").display()));
-    c.arg("-D")
-        .arg(format!("DENY_ZSHRC={}", home.join(".zshrc").display()));
-    c.arg("-D").arg(format!(
-        "DENY_ZSH_HIST={}",
-        home.join(".zsh_history").display()
-    ));
-    c.arg("-D").arg(format!(
-        "DENY_BASH_HIST={}",
-        home.join(".bash_history").display()
-    ));
-    c.arg("-D").arg(format!(
-        "DENY_PY_HIST={}",
-        home.join(".python_history").display()
-    ));
-    c.arg("-D").arg(format!(
-        "DENY_PSQL_HIST={}",
-        home.join(".psql_history").display()
-    ));
-    c.arg("-D")
-        .arg(format!("DENY_HOME_ENV={}", home.join(".env").display()));
-    c.arg("-D")
-        .arg(format!("DENY_PYPIRC={}", home.join(".pypirc").display()));
-    c.arg("-D")
-        .arg(format!("DENY_CLAUDE={}", home.join(".claude").display()));
-    c.arg("-D")
-        .arg(format!("DENY_CODEX={}", home.join(".codex").display()));
-    c.arg("-D").arg(format!(
-        "DENY_AGENTSAFE={}",
-        home.join(".config/agentsafe").display()
-    ));
-    c.arg("-D")
-        .arg(format!("DENY_DOCKER={}", home.join(".docker").display()));
-    c.arg("-D")
-        .arg(format!("DENY_KUBE={}", home.join(".kube").display()));
-    c.arg("-D")
-        .arg(format!("DENY_OP={}", home.join(".config/op").display()));
-    c.arg("-D").arg(format!(
-        "DENY_KEYCHAINS={}",
-        home.join("Library/Keychains").display()
-    ));
-    c.arg("-D")
-        .arg(format!("DENY_NETRC={}", home.join(".netrc").display()));
-    c.arg("-D").arg(format!(
-        "DENY_GIT_CREDS={}",
-        home.join(".git-credentials").display()
-    ));
-    c.arg("-D").arg(format!(
-        "DENY_CONFIG_GIT_CREDS={}",
-        home.join(".config/git/credentials").display()
-    ));
-    c.arg("-D")
-        .arg(format!("DENY_NPMRC={}", home.join(".npmrc").display()));
-    c.arg("-D").arg(format!(
-        "DENY_CARGO_CREDS={}",
-        home.join(".cargo/credentials").display()
-    ));
-    c.arg("-D").arg(format!(
-        "DENY_CARGO_CREDS_TOML={}",
-        home.join(".cargo/credentials.toml").display()
-    ));
-    c.arg("-D").arg(format!(
-        "DENY_GCLOUD={}",
-        home.join(".config/gcloud").display()
-    ));
-    c.arg("-D").arg(format!(
-        "DENY_CARNOT_TOKEN={}",
-        home.join(".carnot/server.token").display()
     ));
 
     for (idx, gdir) in policy.frozen_git_write_dirs.iter().enumerate() {
@@ -726,6 +698,53 @@ mod tests {
         .expect("run");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "preserved_ok|");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_seatbelt_protects_real_user_home_even_when_home_env_is_isolated() {
+        let dir = std::env::temp_dir().join(format!("carnot-sb-home-{}", uuid::Uuid::new_v4()));
+        let fake_home = dir.join("isolated_home");
+        std::fs::create_dir_all(&fake_home).expect("mkdir");
+        let policy = SandboxPolicy::for_workspace(dir.clone(), true, false);
+
+        // Find a real sensitive file under /Users/$USER to verify Seatbelt still blocks it
+        let real_user_home = std::env::var("USER")
+            .ok()
+            .map(|u| PathBuf::from("/Users").join(u))
+            .filter(|p| p.is_dir());
+        let Some(real_home) = real_user_home else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let probe = [".ssh/known_hosts", ".zshenv", ".zshrc", ".zsh_history"]
+            .into_iter()
+            .map(|rel| real_home.join(rel))
+            .find(|p| p.is_file());
+        let Some(target) = probe else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        let mut extra = BTreeMap::new();
+        extra.insert("HOME".to_string(), fake_home.display().to_string());
+        let cmd_str = format!(
+            "cat {:?} >/dev/null 2>&1 && echo READABLE || echo BLOCKED",
+            target
+        );
+        let out = build_sandboxed_shell(&policy, &cmd_str, &extra)
+            .expect("cmd")
+            .output()
+            .await
+            .expect("run");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "BLOCKED",
+            "Seatbelt must still block {:?} even when HOME is overridden to {:?}",
+            target,
+            fake_home
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

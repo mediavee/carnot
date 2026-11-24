@@ -1094,6 +1094,7 @@ mod tests {
         // 5. Stop hook decision=block -> AppendAdvisory
         let snap = TurnBoundarySnapshot {
             turn_index: 1,
+            stop_reason: carnot_core::StopReason::EndTurn,
             total_context_tokens: 100,
             had_edit_in_segment: true,
             had_tool_call_in_turn: false,

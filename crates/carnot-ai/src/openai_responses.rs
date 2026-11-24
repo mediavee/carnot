@@ -186,6 +186,16 @@ impl OpenAiResponsesProvider {
             }
         }
 
+        for note in &req.ephemeral_tail_notes {
+            if !note.trim().is_empty() {
+                input_items.push(json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": note}],
+                }));
+            }
+        }
+
         let mut tools: Vec<Value> = req
             .tools
             .iter()

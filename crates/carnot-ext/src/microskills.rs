@@ -426,6 +426,8 @@ impl Module for ExecMicroSkillsModule {
     fn on_session_start(&self, config: &CarnotConfig) -> BoxFuture<'_, Result<Option<String>>> {
         let root = config.workspace_root.clone();
         let extra_skills_dirs = config.skills_dirs.clone();
+        let load_context_files = config.load_context_files;
+        let load_skills = config.load_skills;
         Box::pin(async move {
             let res = tokio::task::spawn_blocking(move || {
                 let mut facts: Vec<String> = Vec::new();
@@ -484,11 +486,11 @@ impl Module for ExecMicroSkillsModule {
                     out.push_str("\nfiles:\n");
                     out.push_str(&files_map);
                 }
-                if let Some(instr) = load_repo_instructions(&root) {
+                if load_context_files && let Some(instr) = load_repo_instructions(&root) {
                     out.push_str("\n\n");
                     out.push_str(&instr);
                 }
-                if let Some(skills) = load_agent_skills(&root, &extra_skills_dirs) {
+                if load_skills && let Some(skills) = load_agent_skills(&root, &extra_skills_dirs) {
                     out.push_str("\n\n");
                     out.push_str(&skills);
                 }

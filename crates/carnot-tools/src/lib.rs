@@ -32,6 +32,17 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
 
     fn execute(&self, input: Value, cancel: CancellationToken)
     -> BoxFuture<'_, Result<ToolOutput>>;
+
+    /// Executes the tool with the provider's correlated `call_id` (used by host-RPC / MCP bridges
+    /// that key approvals and UI visuals on the call id). Defaults to [`Tool::execute`].
+    fn execute_with_id<'a>(
+        &'a self,
+        _call_id: &'a str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ToolOutput>> {
+        self.execute(input, cancel)
+    }
 }
 
 /// Explicit pre-edit snapshot kind (Opus #9: NEVER conflates newly created files with snapshot failures!).
@@ -206,6 +217,26 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// Removes a registered tool by exact name, falling back to a deterministic case-insensitive
+    /// match (first in registration order) before Turn-1 freeze.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let key = if self.tools.contains_key(name) {
+            Some(name.to_string())
+        } else {
+            self.order
+                .iter()
+                .find(|k| k.eq_ignore_ascii_case(name))
+                .cloned()
+        };
+        if let Some(k) = key {
+            self.tools.remove(&k);
+            self.order.retain(|n| n != &k);
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns all registered tool specifications in deterministic canonical order

@@ -135,6 +135,7 @@ fn sample_request(model: &str, messages: Vec<Message>) -> ProviderRequest {
         max_output_tokens: 4096,
         skip_tail_cache_write: false,
         native_web: Default::default(),
+        ephemeral_tail_notes: Vec::new(),
     }
 }
 

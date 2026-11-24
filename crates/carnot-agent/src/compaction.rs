@@ -399,6 +399,7 @@ async fn try_semantic_llm_handoff(
             max_output_tokens: config.max_output_tokens.min(16_384),
             skip_tail_cache_write: true,
             native_web: config.native_web.clone(),
+            ephemeral_tail_notes: Vec::new(),
         }
     };
 

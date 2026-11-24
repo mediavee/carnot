@@ -13,9 +13,11 @@ carnot-ai.workspace = true
 carnot-core.workspace = true
 carnot-ext.workspace = true
 carnot-session.workspace = true
+carnot-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 

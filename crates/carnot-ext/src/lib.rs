@@ -11,7 +11,9 @@ pub mod policy;
 pub mod prefix_guard;
 pub mod warm_fork;
 
-use carnot_core::{CarnotConfig, Result, ToolOutput, UserQuestion, UserQuestionAnswer};
+use carnot_core::{
+    CarnotConfig, ReasoningEffort, Result, StopReason, ToolOutput, UserQuestion, UserQuestionAnswer,
+};
 use carnot_tools::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,6 +63,11 @@ pub enum BoundaryAction {
         signal: String,
         message: String,
     },
+    /// Append a `system` note and request another turn even when the model produced no tool calls.
+    ContinueRun {
+        signal: String,
+        message: String,
+    },
     /// Stop autonomous loop cleanly.
     Halt {
         reason: String,
@@ -71,6 +78,8 @@ pub enum BoundaryAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnBoundarySnapshot {
     pub turn_index: u64,
+    #[serde(default)]
+    pub stop_reason: StopReason,
     pub total_context_tokens: u64,
     pub had_edit_in_segment: bool,
     pub had_tool_call_in_turn: bool,
@@ -102,6 +111,16 @@ pub enum CompactionHookAction {
     },
 }
 
+/// Per-turn context note returned by `Module::before_prompt`.
+/// Always injected append-only into conversation messages (NEVER into the static system prompt).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptInjection {
+    pub text: String,
+    /// When `true`, attached as an ephemeral system note for this turn rather than a durable note.
+    #[serde(default)]
+    pub ephemeral: bool,
+}
+
 /// First-class in-process Rust module interface.
 ///
 /// Every built-in Carnot capability implements this exact trait, so external Rust embedders
@@ -119,6 +138,20 @@ pub trait Module: Send + Sync + std::fmt::Debug {
         Box::pin(async { Ok(None) })
     }
 
+    /// Optional per-prompt append-only context / reminders injected before the model runs.
+    fn before_prompt<'a>(
+        &'a self,
+        _prompt_text: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<PromptInjection>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Optional per-turn reasoning effort selector (applied ONLY when the active provider/model
+    /// preserves its prompt cache across effort changes).
+    fn select_effort(&self) -> BoxFuture<'_, Result<Option<ReasoningEffort>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Permission gate or input transformation before a tool runs.
     fn before_tool_call(
         &self,
@@ -126,6 +159,16 @@ pub trait Module: Send + Sync + std::fmt::Debug {
         _input: &Value,
     ) -> BoxFuture<'_, Result<ToolGateDecision>> {
         Box::pin(async { Ok(ToolGateDecision::Allow) })
+    }
+
+    /// Permission gate carrying the provider's `call_id` for correlation with live UI / host approvals.
+    fn before_tool_call_with_id<'a>(
+        &'a self,
+        _call_id: &'a str,
+        tool_name: &'a str,
+        input: &'a Value,
+    ) -> BoxFuture<'a, Result<ToolGateDecision>> {
+        self.before_tool_call(tool_name, input)
     }
 
     /// Observation hook immediately after a tool completes.

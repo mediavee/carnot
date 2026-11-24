@@ -278,6 +278,19 @@ impl GoogleProvider {
             }
         }
 
+        for note in &req.ephemeral_tail_notes {
+            if !note.trim().is_empty() {
+                if let Some(last) = contents.last_mut()
+                    && last.get("role").and_then(Value::as_str) == Some("user")
+                    && let Some(prev_parts) = last.get_mut("parts").and_then(Value::as_array_mut)
+                {
+                    prev_parts.push(json!({ "text": note }));
+                } else {
+                    contents.push(json!({ "role": "user", "parts": [{ "text": note }] }));
+                }
+            }
+        }
+
         let sanitize = compat
             .sanitize_tool_schemas
             .unwrap_or(self.cloudcode_envelope);

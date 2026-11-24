@@ -78,6 +78,13 @@ pub enum SessionEntry {
         min_bytes: usize,
         timestamp_unix_ms: u64,
     },
+    /// Host/embedder custom metadata entry persisted append-only in the session JSONL.
+    Custom {
+        id: String,
+        kind: String,
+        data: serde_json::Value,
+        timestamp_unix_ms: u64,
+    },
 }
 
 /// Active view projected for the next provider request (`Arc<Message>` — zero image cloning).
@@ -597,6 +604,61 @@ impl SessionStore {
         )
     }
 
+    /// Appends a durable custom metadata entry to the session JSONL (does not alter active messages).
+    pub fn append_custom(
+        &mut self,
+        kind: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Result<String> {
+        let id = uuid::Uuid::now_v7().to_string();
+        self.append_entry(
+            SessionEntry::Custom {
+                id: id.clone(),
+                kind: kind.into(),
+                data,
+                timestamp_unix_ms: now_unix_ms(),
+            },
+            true,
+        )?;
+        Ok(id)
+    }
+
+    /// Repairs a crash/SIGTERM-interrupted session whose trailing active message is an
+    /// `Assistant` turn containing unpaired `ToolUse` blocks by persisting paired error
+    /// `ToolResult` blocks so subsequent provider calls never fail with HTTP 400.
+    pub fn repair_dangling_tool_uses(&mut self) -> Result<usize> {
+        let Some(last) = self.active_messages.last() else {
+            return Ok(0);
+        };
+        if last.role != Role::Assistant {
+            return Ok(0);
+        }
+        let recovery: Vec<carnot_core::ContentBlock> = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                carnot_core::ContentBlock::ToolUse { id, name, .. } => {
+                    Some(carnot_core::ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: vec![carnot_core::ToolResultBlock::text(format!(
+                            "Tool `{name}` was interrupted before completion; verify any side effects before retrying."
+                        ))],
+                        is_error: true,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let count = recovery.len();
+        if count > 0 {
+            self.push_message(Message {
+                role: Role::User,
+                content: recovery,
+            })?;
+        }
+        Ok(count)
+    }
+
     /// Safe compaction: adjusts `tail_start` backward so no orphan `tool_result` is kept (S-1)
     /// and strips `Thinking` / `redacted_thinking` from the kept tail so Preserved Thinking stays valid (S-2).
     pub fn apply_compaction(&mut self, summary: String, requested_keep_tail: usize) -> Result<()> {
@@ -891,6 +953,11 @@ impl SessionStore {
                     }
                 }
                 self.last_usage_anchor = None;
+            }
+            SessionEntry::Custom {
+                timestamp_unix_ms, ..
+            } => {
+                self.last_activity_unix_ms = Some(*timestamp_unix_ms);
             }
         }
     }
@@ -1226,6 +1293,42 @@ mod tests {
         let recent_json =
             serde_json::to_string(reloaded.active_messages()[5].as_ref()).expect("ser");
         assert!(recent_json.len() > 5_000, "recent tail must remain intact");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_dangling_tool_uses_pairs_uncompleted_calls_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("carnot-repair-{}", uuid::Uuid::new_v4()));
+        let mut s = SessionStore::create(
+            Some(&dir),
+            "claude-sonnet-5-5".into(),
+            "STATIC".into(),
+            vec![],
+        )
+        .expect("create");
+        let path = s.path.clone().expect("path");
+
+        s.push_message(Message::user_text("run tool")).expect("u0");
+        s.push_message(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-crash-1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "echo hi"}),
+                invalid_json: None,
+                provider_meta: None,
+                origin: None,
+            }],
+        })
+        .expect("a0");
+
+        let mut reloaded = SessionStore::load(&path).expect("reload");
+        assert_eq!(reloaded.repair_dangling_tool_uses().expect("repair"), 1);
+        assert_eq!(reloaded.repair_dangling_tool_uses().expect("idempotent"), 0);
+        let last = reloaded.active_messages().last().expect("last");
+        assert_eq!(last.role, Role::User);
+        assert!(last.has_tool_result());
 
         let _ = fs::remove_dir_all(&dir);
     }

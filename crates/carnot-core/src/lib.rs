@@ -1187,6 +1187,21 @@ pub struct CarnotConfig {
     pub subagent_depth: u8,
     pub subagent_max_depth: u8,
     pub subagent_max_cost_usd: f64,
+    /// Optional replacement for the default static system prompt (frozen before Turn 1).
+    #[serde(default)]
+    pub static_system_prompt_override: Option<String>,
+    /// Optional static section appended to the system prompt (frozen before Turn 1).
+    #[serde(default)]
+    pub static_system_prompt_append: Option<String>,
+    /// Tool names (case-insensitive) excluded from `ToolRegistry` before Turn 1.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+    /// Load workspace/global `AGENTS.md`/`CLAUDE.md` in Turn-1 micro-skills (default `true`).
+    #[serde(default = "default_true")]
+    pub load_context_files: bool,
+    /// Load workspace/extra `SKILL.md` directories in Turn-1 micro-skills (default `true`).
+    #[serde(default = "default_true")]
+    pub load_skills: bool,
 }
 
 fn default_true() -> bool {
@@ -1252,6 +1267,11 @@ impl CarnotConfig {
             subagent_depth: 0,
             subagent_max_depth: 1,
             subagent_max_cost_usd: 2.0,
+            static_system_prompt_override: None,
+            static_system_prompt_append: None,
+            excluded_tools: Vec::new(),
+            load_context_files: true,
+            load_skills: true,
         }
     }
 }

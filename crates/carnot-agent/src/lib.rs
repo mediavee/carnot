@@ -145,6 +145,33 @@ pub struct Agent {
     last_prefix_state: Mutex<Option<PrefixFingerprint>>,
 }
 
+fn effective_static_system_prompt(config: &CarnotConfig) -> String {
+    let base: &str = config
+        .static_system_prompt_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| static_system_prompt());
+    match config
+        .static_system_prompt_append
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(extra) => format!("{base}\n\n{extra}"),
+        None => base.to_string(),
+    }
+}
+
+fn apply_excluded_tools(tools: &mut ToolRegistry, excluded: &[String]) {
+    for name in excluded {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            tools.remove(trimmed);
+        }
+    }
+}
+
 impl Agent {
     pub fn new(
         config: CarnotConfig,
@@ -162,6 +189,7 @@ impl Agent {
                 tools.register(t);
             }
         }
+        apply_excluded_tools(&mut tools, &config.excluded_tools);
         // Always register universal `ToolSearch` + `CallDeferredTool` when deferred tools exist so
         // live cross-provider model switching (Anthropic <-> OpenAI/Gemini/...) always works!
         // `effective_tools_for_provider()` hides them on Anthropic's native tool-search requests.
@@ -180,7 +208,7 @@ impl Agent {
             session_dir,
             Some(config.workspace_root.clone()),
             config.model.clone(),
-            static_system_prompt().to_string(),
+            effective_static_system_prompt(&config),
             tool_specs,
         )?;
         Self::from_session(
@@ -211,12 +239,14 @@ impl Agent {
                 tools.register(t);
             }
         }
+        apply_excluded_tools(&mut tools, &config.excluded_tools);
         let deferred = tools.deferred_tools();
         if !deferred.is_empty() {
             tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
             tools.register(Arc::new(tool_search::CallDeferredTool::new(&deferred)));
         }
-        let session = SessionStore::load(session_path)?;
+        let mut session = SessionStore::load(session_path)?;
+        let _ = session.repair_dangling_tool_uses()?;
         let already_started = !session.active_messages().is_empty();
         Self::from_session(
             config,
@@ -248,6 +278,7 @@ impl Agent {
                 tools.register(t);
             }
         }
+        apply_excluded_tools(&mut tools, &config.excluded_tools);
         let deferred = tools.deferred_tools();
         if !deferred.is_empty() {
             tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
@@ -255,7 +286,8 @@ impl Agent {
         }
         let original = SessionStore::load_readonly(session_path)?;
         let session_dir = persist_session.then_some(config.session_dir.as_path());
-        let forked = original.fork(session_dir)?;
+        let mut forked = original.fork(session_dir)?;
+        let _ = forked.repair_dangling_tool_uses()?;
         let already_started = !forked.active_messages().is_empty();
         Self::from_session(
             config,
@@ -313,6 +345,7 @@ impl Agent {
                 tools.register(t);
             }
         }
+        apply_excluded_tools(&mut tools, &config.excluded_tools);
         let deferred = tools.deferred_tools();
         if !deferred.is_empty() {
             tools.register(Arc::new(tool_search::ToolSearchTool::new(&deferred)));
@@ -691,6 +724,26 @@ impl Agent {
         self.runtime.lock().await.effort = effort;
     }
 
+    /// Updates reasoning effort ONLY when the active provider/model preserves its prompt cache
+    /// across effort changes. Returns `true` if applied, `false` otherwise.
+    pub async fn set_scoped_effort(&self, effort: ReasoningEffort) -> bool {
+        let mut rt = self.runtime.lock().await;
+        if !rt.provider.effort_preserves_cache(&rt.model) {
+            return false;
+        }
+        rt.effort = effort;
+        true
+    }
+
+    pub async fn effort_preserves_cache(&self) -> bool {
+        let rt = self.runtime.lock().await;
+        rt.provider.effort_preserves_cache(&rt.model)
+    }
+
+    pub async fn current_provider_id(&self) -> String {
+        self.runtime.lock().await.provider.name().to_string()
+    }
+
     pub async fn current_model(&self) -> String {
         self.runtime.lock().await.model.clone()
     }
@@ -705,6 +758,26 @@ impl Agent {
 
     pub async fn current_context_tokens(&self) -> u64 {
         self.session.lock().await.effective_context_tokens()
+    }
+
+    pub async fn pending_queue_len(&self) -> usize {
+        self.pending_steers.lock().await.len() + self.pending_follow_ups.lock().await.len()
+    }
+
+    pub async fn session_file(&self) -> Option<std::path::PathBuf> {
+        self.session.lock().await.path.clone()
+    }
+
+    pub async fn session_entries(&self) -> Vec<carnot_session::SessionEntry> {
+        self.session.lock().await.entries().to_vec()
+    }
+
+    pub async fn append_custom_entry(
+        &self,
+        kind: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Result<String> {
+        self.session.lock().await.append_custom(kind, data)
     }
 
     async fn effective_config_and_provider(&self) -> (CarnotConfig, Arc<dyn Provider>) {
@@ -782,7 +855,10 @@ impl Agent {
     ) -> Result<(serde_json::Value, Option<String>)> {
         let mut effective_input = raw_input.clone();
         for m in &self.modules {
-            match m.before_tool_call(tool_name, &effective_input).await? {
+            match m
+                .before_tool_call_with_id(call_id, tool_name, &effective_input)
+                .await?
+            {
                 ToolGateDecision::Allow => {}
                 ToolGateDecision::RewriteInput(new_in) => effective_input = new_in,
                 ToolGateDecision::Deny { reason } => {
@@ -849,6 +925,54 @@ impl Agent {
             .await
     }
 
+    /// Continues an interrupted session turn without appending a new user message.
+    /// Returns `Ok(None)` if the session is empty or already settled on an assistant reply.
+    async fn emit_terminal_error_events(&self, err: &CarnotError) {
+        let metrics = self.metrics.lock().await.clone();
+        if matches!(err, CarnotError::Cancelled) {
+            self.events.push(AgentEvent::TurnEnd {
+                turn: metrics.turns,
+                stop_reason: StopReason::Aborted,
+            });
+        } else {
+            self.events.push(AgentEvent::Error {
+                message: err.to_string(),
+            });
+        }
+        self.events.push(AgentEvent::RunSettled {
+            final_text: String::new(),
+            metrics,
+        });
+    }
+
+    /// Resumes an interrupted session without injecting a new user message when the last persisted
+    /// message is not a settled assistant reply. Returns `Ok(None)` if the session is already settled.
+    pub async fn continue_run(&self) -> Result<Option<RunOutcome>> {
+        let _run_guard = self.run_lock.lock().await;
+        let can_continue = {
+            let mut s = self.session.lock().await;
+            let _ = s.repair_dangling_tool_uses()?;
+            let msgs = s.active_messages();
+            match msgs.last() {
+                None => false,
+                Some(last) => last.role != Role::Assistant || last.has_tool_use(),
+            }
+        };
+        if !can_continue {
+            return Ok(None);
+        }
+        match self
+            .prompt_inner_opts(Vec::new(), CancellationToken::new(), true)
+            .await
+        {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(e) => {
+                self.emit_terminal_error_events(&e).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Runs a multimodal user prompt bound to an external `CancellationToken`.
     pub async fn prompt_blocks_with_cancel(
         &self,
@@ -856,21 +980,23 @@ impl Agent {
         external_cancel: CancellationToken,
     ) -> Result<RunOutcome> {
         let _run_guard = self.run_lock.lock().await;
-        match self.prompt_inner(user_blocks, external_cancel).await {
+        match self
+            .prompt_inner_opts(user_blocks, external_cancel, false)
+            .await
+        {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
-                self.events.push(AgentEvent::Error {
-                    message: e.to_string(),
-                });
+                self.emit_terminal_error_events(&e).await;
                 Err(e)
             }
         }
     }
 
-    async fn prompt_inner(
+    async fn prompt_inner_opts(
         &self,
         user_blocks: Vec<ContentBlock>,
         external_cancel: CancellationToken,
+        continue_existing: bool,
     ) -> Result<RunOutcome> {
         let cancel = external_cancel.child_token();
         *self.cancel_current.lock().await = cancel.clone();
@@ -892,6 +1018,7 @@ impl Agent {
             }
         }
         let mut initial_text = text_parts.join("\n");
+        let raw_prompt_for_hooks = initial_text.clone();
 
         // Capture full verbatim user objective BEFORE Turn-1 `[workspace-facts]`/`AGENTS.md` injection
         // (and track any subsequent follow-up prompts so compaction NEVER drops user requirements!)
@@ -990,13 +1117,48 @@ impl Agent {
             }
         }
 
+        // Collect per-prompt module injections (`before_prompt`: durable vs ephemeral)
+        let mut ephemeral_notes: Vec<String> = Vec::new();
+        let mut durable_notes: Vec<String> = Vec::new();
+        if !continue_existing {
+            for m in &self.modules {
+                if let Ok(injs) = m.before_prompt(&raw_prompt_for_hooks).await {
+                    for inj in injs {
+                        let t = inj.text.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        if inj.ephemeral {
+                            ephemeral_notes.push(t.to_string());
+                        } else {
+                            durable_notes.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         // Record user turn and mark Checkpoint C at the user boundary
-        {
+        if !continue_existing {
             let mut s = self.session.lock().await;
-            s.push_message(Message {
-                role: Role::User,
-                content: initial_content,
-            })?;
+            if s.active_messages().is_empty() && !durable_notes.is_empty() {
+                let prefix = durable_notes.join("\n\n");
+                let mut combined = Vec::with_capacity(1 + initial_content.len());
+                combined.push(ContentBlock::Text { text: prefix });
+                combined.extend(initial_content);
+                s.push_message(Message {
+                    role: Role::User,
+                    content: combined,
+                })?;
+            } else {
+                for note in durable_notes {
+                    s.push_message(Message::system_note(note))?;
+                }
+                s.push_message(Message {
+                    role: Role::User,
+                    content: initial_content,
+                })?;
+            }
             s.mark_checkpoint("user_turn")?;
         }
 
@@ -1038,6 +1200,16 @@ impl Agent {
                 }
             }
 
+            // Optional per-turn effort selector (applied ONLY when effort preserves prompt cache)
+            let mut turn_effort = eff_cfg.effort;
+            if active_provider.effort_preserves_cache(&eff_cfg.model) {
+                for m in &self.modules {
+                    if let Ok(Some(selected)) = m.select_effort().await {
+                        turn_effort = selected;
+                    }
+                }
+            }
+
             let (req, turn_num, ctx_est) = {
                 let s = self.session.lock().await;
                 let ctx_est = s.effective_context_tokens();
@@ -1059,16 +1231,18 @@ impl Agent {
                     messages: proj.messages,
                     checkpoint_index: proj.checkpoint_index,
                     cache_ttl: eff_cfg.cache_ttl,
-                    effort: eff_cfg.effort,
+                    effort: turn_effort,
                     max_output_tokens: eff_cfg.max_output_tokens,
                     skip_tail_cache_write: false,
                     native_web: eff_cfg.native_web.clone(),
+                    ephemeral_tail_notes: ephemeral_notes.clone(),
                 };
                 (req, turn_num, ctx_est)
             };
 
-            // Live runtime prefix-freeze verification (< 5 µs BLAKE3): catches any unexpected
-            // mutation in `system + tools + native_web` OR in previously sent message prefixes!
+            // Live runtime prefix-freeze verification (< 5 µs BLAKE3) over PERSISTED messages.
+            // Ephemeral notes travel separately in `req.ephemeral_tail_notes` AFTER all provider
+            // cache breakpoints so they never bust prefix cache on Turn 1 or subsequent turns!
             {
                 let prov_name = active_provider.name().to_string();
                 let static_hash = compute_wire_static_hash(
@@ -1076,6 +1250,7 @@ impl Agent {
                     &req.tools,
                     &req.native_web,
                 );
+                let persisted_slice = &req.messages;
                 let mut prev_guard = self.last_prefix_state.lock().await;
                 let mut detected_break: Option<(String, String, String)> = None;
                 if let Some(ref prev) = *prev_guard
@@ -1088,19 +1263,19 @@ impl Agent {
                             prev.static_hash.clone(),
                             static_hash.clone(),
                         ));
-                    } else if req.messages.len() < prev.msg_count {
+                    } else if persisted_slice.len() < prev.msg_count {
                         detected_break = Some((
                             format!(
                                 "conversation history shrank unexpectedly ({} -> {} messages) without compaction",
                                 prev.msg_count,
-                                req.messages.len()
+                                persisted_slice.len()
                             ),
                             prev.msg_prefix_hash.clone(),
-                            compute_messages_prefix_hash(&req.messages),
+                            compute_messages_prefix_hash(persisted_slice),
                         ));
                     } else {
                         let reused_hash =
-                            compute_messages_prefix_hash(&req.messages[..prev.msg_count]);
+                            compute_messages_prefix_hash(&persisted_slice[..prev.msg_count]);
                         if reused_hash != prev.msg_prefix_hash {
                             detected_break = Some((
                                 format!(
@@ -1140,8 +1315,8 @@ impl Agent {
                     provider: prov_name,
                     model: req.model.clone(),
                     static_hash,
-                    msg_count: req.messages.len(),
-                    msg_prefix_hash: compute_messages_prefix_hash(&req.messages),
+                    msg_count: persisted_slice.len(),
+                    msg_prefix_hash: compute_messages_prefix_hash(persisted_slice),
                 });
             }
 
@@ -1222,11 +1397,14 @@ impl Agent {
                                     });
                                     self.metrics.lock().await.eager_tools_started += 1;
                                     let c = cancel.clone();
+                                    let cid_exec = id.clone();
                                     let inp_exec = eff_input.clone();
                                     Some(tokio::spawn(async move {
                                         let t0 = Instant::now();
-                                        let out =
-                                            tool.execute(inp_exec, c).await.unwrap_or_else(|e| {
+                                        let out = tool
+                                            .execute_with_id(&cid_exec, inp_exec, c)
+                                            .await
+                                            .unwrap_or_else(|e| {
                                                 ToolOutput::err_text(e.to_string())
                                             });
                                         (out, t0.elapsed().as_millis() as u64)
@@ -1505,37 +1683,45 @@ impl Agent {
                         continue;
                     }
 
-                    let (mut effective_input, mut denied) =
+                    // Gate the real tool directly (for `CallDeferredTool`, gate ONLY the inner
+                    // target tool so policies keyed on tool names aren't double-gated or blocked).
+                    let (effective_input, denied) = if tool_name == "CallDeferredTool" {
+                        let mut wrapper_input = raw_input.clone();
+                        if let Some(inner_name) = wrapper_input
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        {
+                            let inner_args = wrapper_input
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            match self
+                                .run_before_gates(call_id, &inner_name, &inner_args)
+                                .await
+                            {
+                                Ok((rewritten, inner_denied)) => {
+                                    if inner_denied.is_none()
+                                        && let Some(obj) = wrapper_input.as_object_mut()
+                                    {
+                                        obj.insert("arguments".into(), rewritten);
+                                    }
+                                    (wrapper_input, inner_denied)
+                                }
+                                Err(e) => (wrapper_input, Some(format!("inner gate error: {e}"))),
+                            }
+                        } else {
+                            (
+                                wrapper_input,
+                                Some("CallDeferredTool missing target tool `name`".into()),
+                            )
+                        }
+                    } else {
                         match self.run_before_gates(call_id, tool_name, raw_input).await {
                             Ok(pair) => pair,
                             Err(e) => (raw_input.clone(), Some(format!("gate error: {e}"))),
-                        };
-                    // Never allow `CallDeferredTool` to bypass module/broker gates keyed on the real tool name!
-                    if denied.is_none()
-                        && tool_name == "CallDeferredTool"
-                        && let Some(inner_name) =
-                            effective_input.get("name").and_then(|v| v.as_str())
-                    {
-                        let inner_args = effective_input
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        match self
-                            .run_before_gates(call_id, inner_name, &inner_args)
-                            .await
-                        {
-                            Ok((rewritten, inner_denied)) => {
-                                if let Some(reason) = inner_denied {
-                                    denied = Some(reason);
-                                } else if let Some(obj) = effective_input.as_object_mut() {
-                                    obj.insert("arguments".into(), rewritten);
-                                }
-                            }
-                            Err(e) => {
-                                denied = Some(format!("inner gate error: {e}"));
-                            }
                         }
-                    }
+                    };
                     if let Some(reason) = denied {
                         outputs[idx] = Some((
                             effective_input,
@@ -1595,13 +1781,14 @@ impl Agent {
                         });
                         let tool_opt = self.tools.get(&call.tool_name);
                         let c = cancel.clone();
+                        let cid = call.call_id.clone();
                         let inp = call.effective_input.clone();
                         let tname = call.tool_name.clone();
                         let jh = tokio::spawn(async move {
                             let t0 = Instant::now();
                             let out = match tool_opt {
                                 Some(t) => t
-                                    .execute(inp, c)
+                                    .execute_with_id(&cid, inp, c)
                                     .await
                                     .unwrap_or_else(|e| ToolOutput::err_text(e.to_string())),
                                 None => ToolOutput::err_text(format!("Unknown tool: {tname}")),
@@ -1732,10 +1919,12 @@ impl Agent {
             }
 
             // Evaluate turn-boundary module hooks
+            let mut boundary_resume = false;
             if !should_halt && !self.modules.is_empty() {
                 let total_ctx_est = self.session.lock().await.effective_context_tokens();
                 let snap = TurnBoundarySnapshot {
                     turn_index: turn_num,
+                    stop_reason,
                     total_context_tokens: total_ctx_est,
                     had_edit_in_segment: seg.had_edit,
                     had_tool_call_in_turn: had_tools,
@@ -1756,6 +1945,22 @@ impl Agent {
                                 .push_message(Message::system_note(message.clone()))?;
                             self.events
                                 .push(AgentEvent::ModuleAdvisory { signal, message });
+                        }
+                        BoundaryAction::ContinueRun { signal, message } => {
+                            let note = if message.trim().is_empty() {
+                                "Continue working on the remaining tasks.".to_string()
+                            } else {
+                                message
+                            };
+                            self.session
+                                .lock()
+                                .await
+                                .push_message(Message::system_note(note.clone()))?;
+                            self.events.push(AgentEvent::ModuleAdvisory {
+                                signal,
+                                message: note,
+                            });
+                            boundary_resume = true;
                         }
                         BoundaryAction::Halt { reason } => {
                             halted_reason = Some(reason);
@@ -1802,8 +2007,9 @@ impl Agent {
                         .push_message(Message::system_note(notes.join("\n\n")))?;
                 }
             } else {
-                // Anthropic server-side `pause_turn`: continue the loop without requiring a new user turn (A5)
-                if stop_reason == StopReason::PauseTurn {
+                // Anthropic server-side `pause_turn` or module-requested continuation: continue loop!
+                if stop_reason == StopReason::PauseTurn || boundary_resume {
+                    idle_turn_streak = 0;
                     continue;
                 }
 

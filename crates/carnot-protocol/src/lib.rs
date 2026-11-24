@@ -5,6 +5,7 @@
 //!   - `interaction`: shared async broker for interactive approvals & `AskUser` questions
 
 pub mod acp;
+pub mod host_ext;
 pub mod http;
 pub mod interaction;
 pub mod rpc;

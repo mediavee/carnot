@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "hooks": {
+    "host/register": {
+      "request": {
+        "tools": [
+          {
+            "name": "echo_tool",
+            "description": "Echo input text.",
+            "input_schema": {
+              "type": "object",
+              "properties": { "text": { "type": "string" } },
+              "required": ["text"],
+              "additionalProperties": false
+            },
+            "defer_loading": false
+          }
+        ],
+        "hooks": [
+          "gate",
+          "tool_result",
+          "before_prompt",
+          "turn_end",
+          "before_compact",
+          "select_effort"
+        ]
+      },
+      "response": {
+        "tools": { "active": ["echo_tool"], "deferred": [] },
+        "session_file": "/path/to/session.jsonl"
+      }
+    },
+    "host/gate": {
+      "request": {
+        "call_id": "call-1",
+        "tool": "Read",
+        "input": { "file_path": "README.md" }
+      },
+      "allow_response": {
+        "decision": "allow"
+      },
+      "rewrite_response": {
+        "decision": "allow",
+        "updated_input": { "file_path": "README.md", "limit": 50 }
+      },
+      "deny_response": {
+        "decision": "deny",
+        "reason": "blocked by policy"
+      }
+    },
+    "host/tool_call": {
+      "request": {
+        "call_id": "call-1",
+        "name": "echo_tool",
+        "input": { "text": "hello" }
+      },
+      "ok_response": {
+        "content": [{ "type": "text", "text": "echo:hello" }],
+        "is_error": false
+      },
+      "err_response": {
+        "content": [{ "type": "text", "text": "tool failed" }],
+        "is_error": true
+      }
+    },
+    "host/tool_result": {
+      "request": {
+        "tool": "Write",
+        "input": { "file_path": "src/main.rs" },
+        "output": {
+          "content": [{ "type": "text", "text": "wrote 10 bytes" }],
+          "is_error": false,
+          "details": null
+        }
+      },
+      "response": {
+        "append_text": "lint ok"
+      }
+    },
+    "host/before_prompt": {
+      "request": {
+        "prompt": "Fix the bug"
+      },
+      "response": {
+        "injections": [
+          { "text": "[memory] Use cargo test", "ephemeral": false },
+          { "text": "[ephemeral] Unattended turn", "ephemeral": true }
+        ]
+      }
+    },
+    "host/turn_end": {
+      "request_fields": ["turn_index", "stop_reason", "had_tool_call_in_turn", "last_assistant_text"],
+      "continue_response": { "action": "continue" },
+      "advisory_response": {
+        "action": "append_advisory",
+        "signal": "host_note",
+        "message": "Note for next turn"
+      },
+      "continue_run_response": {
+        "action": "continue_run",
+        "signal": "host_continue",
+        "message": "Open items remain"
+      },
+      "halt_response": {
+        "action": "halt",
+        "reason": "stopped by host"
+      }
+    },
+    "host/before_compact": {
+      "request_fields": ["mode", "tokens_before", "message_count", "custom_focus"],
+      "continue_response": { "action": "continue" },
+      "focus_response": { "action": "add_focus", "focus": "Preserve open file paths" },
+      "cancel_response": { "action": "cancel", "reason": "host deferred compaction" }
+    },
+    "host/select_effort": {
+      "request": {},
+      "response": { "effort": "medium" }
+    },
+    "host/cancel": {
+      "notification_params": { "id": "hreq-1" }
+    }
+  }
+}

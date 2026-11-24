@@ -346,7 +346,7 @@ impl AnthropicProvider {
             Some(last_idx)
         };
         let msg_count = wire_messages.len();
-        let final_messages: Vec<Value> = wire_messages
+        let mut final_messages: Vec<Value> = wire_messages
             .into_iter()
             .enumerate()
             .map(|(idx, (role, mut blocks, is_cp))| {
@@ -383,6 +383,34 @@ impl AnthropicProvider {
                 json!({"role": role, "content": blocks})
             })
             .collect();
+
+        // Append ephemeral per-turn notes AFTER all `cache_control` breakpoints are placed so
+        // BP2/BP4 always sit strictly on persisted blocks and transient notes stay uncached!
+        if !req.ephemeral_tail_notes.is_empty() {
+            let note_blocks: Vec<Value> = req
+                .ephemeral_tail_notes
+                .iter()
+                .filter(|n| !n.trim().is_empty())
+                .map(|n| json!({"type": "text", "text": n}))
+                .collect();
+            if !note_blocks.is_empty() {
+                let append_to_last_user = final_messages
+                    .last()
+                    .and_then(|m| m.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("user");
+                if append_to_last_user
+                    && let Some(arr) = final_messages
+                        .last_mut()
+                        .and_then(|m| m.get_mut("content"))
+                        .and_then(Value::as_array_mut)
+                {
+                    arr.extend(note_blocks);
+                } else {
+                    final_messages.push(json!({"role": "user", "content": note_blocks}));
+                }
+            }
+        }
 
         let mut body = json!({
             "model": req.model,
@@ -1103,6 +1131,7 @@ mod tests {
             max_output_tokens: 32_768,
             skip_tail_cache_write: false,
             native_web: Default::default(),
+            ephemeral_tail_notes: Vec::new(),
         };
         let body = p.build_body(&req);
         // BP1 on system[0] covers tools + static system prompt; BP2 on messages[0] covers Turn-1;
@@ -1150,6 +1179,7 @@ mod tests {
             max_output_tokens: 32_768,
             skip_tail_cache_write: false,
             native_web: Default::default(),
+            ephemeral_tail_notes: Vec::new(),
         };
         let body = p.build_body(&req);
         // Exactly 4 breakpoints with strictly monotonic TTLs: 1h -> 1h -> 5m -> 5m
@@ -1200,6 +1230,7 @@ mod tests {
             max_output_tokens: 64_000,
             skip_tail_cache_write: true,
             native_web: Default::default(),
+            ephemeral_tail_notes: Vec::new(),
         };
         let body = p.build_body(&req);
         assert!(
@@ -1324,6 +1355,7 @@ mod tests {
                                 max_output_tokens: 32_768,
                                 skip_tail_cache_write: skip_tail,
                                 native_web: native_web.clone(),
+                                ephemeral_tail_notes: Vec::new(),
                             };
                             let body = p.build_body(&req);
 
@@ -1419,5 +1451,58 @@ mod tests {
     fn sse_frame_finder_handles_crlf_and_lf() {
         assert_eq!(find_sse_frame_end(b"data: {}\n\nrest"), Some((8, 2)));
         assert_eq!(find_sse_frame_end(b"data: {}\r\n\r\nrest"), Some((8, 4)));
+    }
+
+    #[test]
+    fn ephemeral_tail_notes_never_capture_cache_breakpoints_on_turn1_or_multiturn() {
+        let p = AnthropicProvider::new("test-key".into());
+        // Turn 1: BP2 (1h) must stay on persisted user prompt, ephemeral note uncached after it!
+        let req_t1 = ProviderRequest {
+            model: "claude-sonnet-5-5".into(),
+            static_system_prompt: "STATIC".into(),
+            tools: Vec::new(),
+            prefix_hash: "abc".into(),
+            session_id: "sess-1".into(),
+            messages: vec![Arc::new(Message::user_text("persisted turn 1 goal"))],
+            checkpoint_index: Some(0),
+            cache_ttl: CacheTtl::Hybrid,
+            effort: ReasoningEffort::High,
+            max_output_tokens: 4096,
+            skip_tail_cache_write: false,
+            native_web: Default::default(),
+            ephemeral_tail_notes: vec!["[ephemeral] unattended turn".into()],
+        };
+        let b1 = p.build_body(&req_t1);
+        assert!(b1.pointer("/messages/0/content/0/cache_control").is_some());
+        assert_eq!(
+            b1.pointer("/messages/0/content/1/text")
+                .and_then(Value::as_str),
+            Some("[ephemeral] unattended turn")
+        );
+        assert!(
+            b1.pointer("/messages/0/content/1/cache_control").is_none(),
+            "ephemeral tail note must NEVER receive cache_control on Turn 1"
+        );
+
+        // Multi-turn: BP4 (5m) must sit on persisted tool result / user turn, NOT ephemeral note!
+        let req_t2 = ProviderRequest {
+            messages: vec![
+                Arc::new(Message::user_text("persisted turn 1 goal")),
+                Arc::new(Message::assistant_text("step 1")),
+                Arc::new(Message::user_text("persisted turn 2")),
+            ],
+            ..req_t1
+        };
+        let b2 = p.build_body(&req_t2);
+        // Persisted Turn-1 block is byte-identical between Turn 1 and Turn 2!
+        assert_eq!(
+            b1.pointer("/messages/0/content/0"),
+            b2.pointer("/messages/0/content/0")
+        );
+        assert!(b2.pointer("/messages/2/content/0/cache_control").is_some());
+        assert!(
+            b2.pointer("/messages/2/content/1/cache_control").is_none(),
+            "ephemeral tail note must NEVER capture rolling BP4 on multi-turn runs"
+        );
     }
 }

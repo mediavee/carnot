@@ -404,3 +404,470 @@ fn cli_auth_login_status_and_logout_with_custom_profile() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_models_list_and_resolve_family_alias() {
+    let list_out = carnot_bin()
+        .args(["models", "--json", "--all"])
+        .output()
+        .expect("carnot models --json --all");
+    assert!(
+        list_out.status.success(),
+        "models list failed: {list_out:?}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&list_out.stdout).expect("valid JSON");
+    let models = v["models"].as_array().expect("models array");
+    assert!(
+        models
+            .iter()
+            .any(|m| m["provider"] == "anthropic" && m["id"] == "claude-sonnet-5-5"),
+        "expected claude-sonnet-5-5 in models catalog"
+    );
+
+    let res_out = carnot_bin()
+        .args(["models", "--resolve", "anthropic/sonnet"])
+        .output()
+        .expect("carnot models --resolve");
+    assert!(res_out.status.success(), "resolve failed: {res_out:?}");
+    let resolved = String::from_utf8_lossy(&res_out.stdout).trim().to_string();
+    assert_eq!(resolved, "anthropic/claude-sonnet-5-5");
+}
+
+#[test]
+fn cli_rpc_host_extension_bidirectional_handshake_tools_hooks_and_controls() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let dir = std::env::temp_dir().join(format!("carnot-cli-hostext-{}", std::process::id()));
+    let sessions_dir = dir.join("sessions");
+    let _ = std::fs::create_dir_all(&sessions_dir);
+
+    let mut child = carnot_bin()
+        .args([
+            "--cwd",
+            &dir.to_string_lossy(),
+            "--provider",
+            "faux",
+            "--mode",
+            "rpc",
+            "--host-extension",
+            "--no-sandbox",
+            "--no-context-files",
+            "--no-skills",
+            "--exclude-tools",
+            "Bash,Write",
+            "--system-prompt",
+            "Custom frozen host system prompt.",
+            "--session-dir",
+            &sessions_dir.to_string_lossy(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn carnot rpc --host-extension");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    let mut send = |v: serde_json::Value| {
+        writeln!(stdin, "{v}").expect("write jsonrpc");
+        stdin.flush().expect("flush");
+    };
+
+    // 1. Handshake: host/register with custom tool + hooks
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "reg-1",
+        "method": "host/register",
+        "params": {
+            "tools": [{
+                "name": "host_echo",
+                "description": "Echoes a message from the host",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }
+            }],
+            "system_prompt_append": "Frozen host appendix.",
+            "hooks": ["gate", "before_prompt", "turn_end", "before_compact"]
+        }
+    }));
+
+    let mut line = String::new();
+    let reg_resp: serde_json::Value = loop {
+        line.clear();
+        assert!(reader.read_line(&mut line).expect("read") > 0);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+        if v.get("id") == Some(&serde_json::json!("reg-1")) {
+            break v;
+        }
+    };
+    let active_tools = reg_resp["result"]["tools"]["active"]
+        .as_array()
+        .expect("active tools");
+    let tool_names: Vec<&str> = active_tools.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        tool_names.contains(&"host_echo"),
+        "missing host_echo: {tool_names:?}"
+    );
+    assert!(
+        !tool_names.contains(&"Bash"),
+        "Bash should be excluded: {tool_names:?}"
+    );
+    assert!(
+        !tool_names.contains(&"Write"),
+        "Write should be excluded: {tool_names:?}"
+    );
+    assert!(
+        reg_resp["result"]["session_file"]
+            .as_str()
+            .is_some_and(|p| p.contains("sessions")),
+        "expected session_file inside --session-dir: {reg_resp}"
+    );
+
+    // 2. append_entry + get_entries + get_session_stats + set_effort
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "app-1",
+        "method": "append_entry",
+        "params": { "kind": "host_snapshot", "data": { "v": 1 } }
+    }));
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "eff-1",
+        "method": "set_effort",
+        "params": { "effort": "medium", "scoped": false }
+    }));
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "prompt-1",
+        "method": "prompt",
+        "params": { "message": "hello bidirectional host" }
+    }));
+
+    let mut saw_before_prompt = false;
+    let mut saw_turn_end = false;
+    let mut saw_prompt_done = false;
+    let mut saw_append_ok = false;
+    let mut saw_effort_ok = false;
+
+    while !saw_prompt_done {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read");
+        assert!(n > 0, "EOF before prompt-1 completed");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+
+        // Handle engine -> host callbacks!
+        if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+            let cid = v.get("id").cloned();
+            match method {
+                "host/before_prompt" => {
+                    saw_before_prompt = true;
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": cid,
+                        "result": {
+                            "injections": [{ "text": "[host-context] injected cleanly", "ephemeral": false }]
+                        }
+                    }));
+                }
+                "host/turn_end" => {
+                    saw_turn_end = true;
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": cid,
+                        "result": { "action": "continue" }
+                    }));
+                }
+                "host/gate" => {
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": cid,
+                        "result": { "decision": "allow" }
+                    }));
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if v.get("id") == Some(&serde_json::json!("app-1")) {
+            assert!(v["result"]["id"].is_string());
+            saw_append_ok = true;
+        } else if v.get("id") == Some(&serde_json::json!("eff-1")) {
+            assert_eq!(v["result"]["effort"], "medium");
+            saw_effort_ok = true;
+        } else if v.get("id") == Some(&serde_json::json!("prompt-1")) {
+            assert!(v["result"]["final_text"].is_string(), "prompt error: {v}");
+            assert_eq!(v["result"]["metrics"]["cache_breaks"], 0);
+            saw_prompt_done = true;
+        }
+    }
+
+    assert!(saw_append_ok);
+    assert!(saw_effort_ok);
+    assert!(saw_before_prompt, "expected host/before_prompt callback");
+    assert!(saw_turn_end, "expected host/turn_end callback");
+
+    drop(stdin);
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "carnot exited with {status}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_rpc_host_extension_scripted_tool_calls_ephemeral_cache_invariance_and_continue_run() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let dir = std::env::temp_dir().join(format!("carnot-cli-scripted-{}", std::process::id()));
+    let sessions_dir = dir.join("sessions");
+    let _ = std::fs::create_dir_all(&sessions_dir);
+
+    // 3 scripted turns:
+    //   Turn 1: invokes host tool `host_echo` (allowed) + built-in `Bash` (denied by host gate)
+    //   Turn 2: returns text, host/turn_end requests `continue_run` once
+    //   Turn 3: final settled answer
+    let script = serde_json::json!([
+        {
+            "text": "Calling tools.",
+            "tool_calls": [
+                {"id": "tc-echo", "name": "host_echo", "input": {"msg": "ping"}},
+                {"id": "tc-bash", "name": "Bash", "input": {"command": "echo forbidden"}}
+            ]
+        },
+        {"text": "First draft."},
+        {"text": "Final answer after continue_run."}
+    ]);
+
+    let mut child = carnot_bin()
+        .env("CARNOT_FAUX_SCRIPT", script.to_string())
+        .args([
+            "--cwd",
+            &dir.to_string_lossy(),
+            "--provider",
+            "faux",
+            "--mode",
+            "rpc",
+            "--host-extension",
+            "--no-mcp",
+            "--no-sandbox",
+            "--no-context-files",
+            "--no-skills",
+            "--system-prompt",
+            "Frozen host prompt.",
+            "--session-dir",
+            &sessions_dir.to_string_lossy(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn scripted carnot");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    fn write_line(stdin: &mut std::process::ChildStdin, raw: &str) {
+        stdin.write_all(raw.as_bytes()).expect("write");
+        stdin.write_all(b"\n").expect("nl");
+        stdin.flush().expect("flush");
+    }
+    let mut send = |val: serde_json::Value| {
+        let s = serde_json::to_string(&val).expect("serialize");
+        write_line(&mut stdin, &s);
+    };
+
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "reg-1",
+        "method": "host/register",
+        "params": {
+            "tools": [{
+                "name": "host_echo",
+                "description": "Echo msg",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"msg": {"type": "string"}},
+                    "required": ["msg"],
+                    "additionalProperties": false
+                }
+            }],
+            "hooks": ["gate", "tool_result", "before_prompt", "turn_end"]
+        }
+    }));
+
+    let mut line = String::new();
+    let reg_v: serde_json::Value = loop {
+        line.clear();
+        assert!(reader.read_line(&mut line).expect("read") > 0);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("reg json");
+        if v.get("id") == Some(&serde_json::json!("reg-1")) {
+            break v;
+        }
+    };
+    let reg_tools = reg_v["result"]["tools"]["active"]
+        .as_array()
+        .expect("active tools");
+    assert!(reg_tools.iter().any(|t| t == "host_echo"));
+
+    // Send malformed JSON first to verify -32700 parse error
+    {
+        drop(send);
+        write_line(&mut stdin, "{bad json");
+    }
+    let mut send = |val: serde_json::Value| {
+        let s = serde_json::to_string(&val).expect("serialize");
+        write_line(&mut stdin, &s);
+    };
+
+    // Send prompt with `ack: true`
+    send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "p-ack",
+        "method": "prompt",
+        "params": { "message": "go", "ack": true }
+    }));
+
+    let mut saw_parse_error = false;
+    let mut saw_ack = false;
+    let mut saw_gate_call_ids = Vec::new();
+    let mut saw_host_tool_call = false;
+    let mut saw_tool_result_hook = false;
+    let mut saw_continue_run_sent = false;
+    let mut saw_cache_break = false;
+    let final_text: String;
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read");
+        assert!(n > 0, "unexpected EOF before run_settled");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+
+        if v.get("error").is_some() && v["error"]["code"] == -32700 {
+            saw_parse_error = true;
+            continue;
+        }
+        if v.get("id") == Some(&serde_json::json!("p-ack")) {
+            assert_eq!(v["result"]["accepted"], true);
+            saw_ack = true;
+            continue;
+        }
+        if v.get("method") == Some(&serde_json::json!("event")) {
+            let ev = &v["params"];
+            if ev["event"] == "cache_break_detected" {
+                saw_cache_break = true;
+            }
+            if ev["event"] == "run_settled" {
+                final_text = ev["final_text"].as_str().unwrap_or("").to_string();
+                break;
+            }
+            continue;
+        }
+
+        if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+            let cid = v["id"].clone();
+            let params = &v["params"];
+            match method {
+                "host/before_prompt" => {
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": cid,
+                        "result": {
+                            "injections": [
+                                {"text": "[durable] remember X", "ephemeral": false},
+                                {"text": "[ephemeral] stay concise", "ephemeral": true}
+                            ]
+                        }
+                    }));
+                }
+                "host/gate" => {
+                    let call_id = params["call_id"].as_str().unwrap_or("").to_string();
+                    saw_gate_call_ids.push(call_id);
+                    if params["tool"] == "Bash" {
+                        send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": cid,
+                            "result": {"decision": "deny", "reason": "bash blocked"}
+                        }));
+                    } else {
+                        send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": cid,
+                            "result": {"decision": "allow"}
+                        }));
+                    }
+                }
+                "host/tool_call" => {
+                    assert_eq!(params["call_id"], "tc-echo");
+                    assert_eq!(params["name"], "host_echo");
+                    assert_eq!(params["input"]["msg"], "ping");
+                    saw_host_tool_call = true;
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": cid,
+                        "result": {
+                            "content": [{"type": "text", "text": "pong:ping"}],
+                            "is_error": false
+                        }
+                    }));
+                }
+                "host/tool_result" => {
+                    saw_tool_result_hook = true;
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": cid,
+                        "result": {"append_text": "[checked]"}
+                    }));
+                }
+                "host/turn_end" => {
+                    assert!(
+                        params.get("stop_reason").is_some(),
+                        "missing stop_reason: {params}"
+                    );
+                    if params["stop_reason"] == "end_turn" && !saw_continue_run_sent {
+                        saw_continue_run_sent = true;
+                        send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": cid,
+                            "result": {
+                                "action": "continue_run",
+                                "signal": "open_items",
+                                "message": "Finish remaining item."
+                            }
+                        }));
+                    } else {
+                        send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": cid,
+                            "result": {"action": "continue"}
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(saw_parse_error, "expected -32700 parse error");
+    assert!(saw_ack, "expected immediate ack: true response");
+    assert!(saw_gate_call_ids.iter().any(|c| c == "tc-echo"));
+    assert!(saw_gate_call_ids.iter().any(|c| c == "tc-bash"));
+    assert!(saw_host_tool_call, "expected host/tool_call execution");
+    assert!(saw_tool_result_hook, "expected host/tool_result hook");
+    assert!(saw_continue_run_sent, "expected continue_run from turn_end");
+    assert!(
+        !saw_cache_break,
+        "ephemeral prompt injection must NEVER trigger CacheBreakDetected across multi-tool turns!"
+    );
+    assert_eq!(final_text, "Final answer after continue_run.");
+
+    drop(stdin);
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "carnot exited with {status}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

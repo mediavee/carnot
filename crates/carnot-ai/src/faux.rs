@@ -12,6 +12,93 @@ impl ApiAdapter for FauxApiAdapter {
     }
 
     fn build(&self, _spec: &ResolvedProviderSpec) -> Result<Arc<dyn Provider>> {
+        if let Ok(raw) = std::env::var("CARNOT_FAUX_SCRIPT")
+            && !raw.trim().is_empty()
+        {
+            let trimmed = raw.trim();
+            let json_text = if trimmed.starts_with('[') {
+                trimmed.to_string()
+            } else {
+                std::fs::read_to_string(trimmed)?
+            };
+            let parsed: Vec<serde_json::Value> = serde_json::from_str(&json_text).map_err(|e| {
+                carnot_core::CarnotError::Provider {
+                    provider: "faux".into(),
+                    message: format!("invalid CARNOT_FAUX_SCRIPT JSON: {e}"),
+                    retryable: false,
+                    retry_after_ms: None,
+                }
+            })?;
+            let mut turns = Vec::with_capacity(parsed.len());
+            for item in parsed {
+                let mut blocks = Vec::new();
+                if let Some(thinking) = item.get("thinking").and_then(|v| v.as_str())
+                    && !thinking.is_empty()
+                {
+                    blocks.push(ContentBlock::Thinking {
+                        thinking: thinking.to_string(),
+                        signature: None,
+                        origin: None,
+                    });
+                }
+                if let Some(text) = item.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    blocks.push(ContentBlock::Text {
+                        text: text.to_string(),
+                    });
+                }
+                let mut had_tools = false;
+                if let Some(calls) = item.get("tool_calls").and_then(|v| v.as_array()) {
+                    for (idx, tc) in calls.iter().enumerate() {
+                        let id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| format!("faux-call-{idx}"));
+                        let name = tc
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = tc
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        if !name.is_empty() {
+                            had_tools = true;
+                            blocks.push(ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                invalid_json: None,
+                                provider_meta: None,
+                                origin: None,
+                            });
+                        }
+                    }
+                }
+                let stop_reason = match item.get("stop_reason").and_then(|v| v.as_str()) {
+                    Some("tool_use") => StopReason::ToolUse,
+                    Some("max_tokens") => StopReason::MaxTokens,
+                    Some("refusal") => StopReason::Refusal,
+                    Some("end_turn") => StopReason::EndTurn,
+                    _ if had_tools => StopReason::ToolUse,
+                    _ => StopReason::EndTurn,
+                };
+                turns.push(ScriptedTurn {
+                    blocks,
+                    stop_reason,
+                    output_tokens: item
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(24),
+                });
+            }
+            if !turns.is_empty() {
+                return Ok(Arc::new(FauxProvider::new(turns)));
+            }
+        }
         Ok(Arc::new(FauxProvider::new(vec![ScriptedTurn::text(
             "Carnot faux provider ready.",
         )])))

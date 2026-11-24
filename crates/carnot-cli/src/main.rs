@@ -8,10 +8,12 @@ mod repl;
 mod tui;
 
 use carnot::{
-    AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, McpManager,
-    McpServerConfig, Profile, ProviderRegistry, ReasoningEffort, ResolvedAcpModel,
+    AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, HostRpcBridge,
+    HostRpcModule, McpManager, McpServerConfig, Profile, ProviderRegistry, ReasoningEffort,
+    ResolvedAcpModel, ResolvedRpcModel, RpcCommandInfo, RpcHost, RpcModelInfo,
     assert_prefix_invariance, discover_dropin_specs, load_mcp_configs, parse_acp_mcp_servers,
-    serve_acp_stdio_with_host, serve_http, serve_rpc_stdio,
+    read_host_registration, serve_acp_stdio_with_host, serve_http, serve_rpc_stdio_with_extension,
+    serve_rpc_stdio_with_host,
 };
 use carnot_ext::microskills::discover_agent_skills;
 use carnot_ext::prefix_guard::static_system_prompt;
@@ -129,6 +131,10 @@ struct Cli {
     #[arg(long)]
     fork: bool,
 
+    /// Disable loading global or workspace `.mcp.json` servers
+    #[arg(long)]
+    no_mcp: bool,
+
     /// Explicit `.mcp.json` config path(s) (repeatable)
     #[arg(long = "mcp-config")]
     mcp_configs: Vec<PathBuf>,
@@ -230,6 +236,34 @@ struct Cli {
     #[arg(long)]
     no_session: bool,
 
+    /// Explicit directory for session JSONL files (defaults to ~/.carnot/sessions)
+    #[arg(long = "session-dir")]
+    session_dir: Option<PathBuf>,
+
+    /// Enable bidirectional host-extension handshake (`host/register`) on `--mode rpc`
+    #[arg(long = "host-extension")]
+    host_extension: bool,
+
+    /// Override the static system prompt (frozen before Turn 1 for prompt-cache invariance)
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+
+    /// Read static system prompt override from a file path (avoids ARG_MAX limits)
+    #[arg(long = "system-prompt-file")]
+    system_prompt_file: Option<PathBuf>,
+
+    /// Exclude built-in tools by name before Turn 1 (comma-separated or repeatable, e.g. `Bash,Edit,Write`)
+    #[arg(long = "exclude-tools", value_delimiter = ',')]
+    exclude_tools: Vec<String>,
+
+    /// Disable automatic Turn-1 `AGENTS.md`/`CLAUDE.md` discovery
+    #[arg(long = "no-context-files")]
+    no_context_files: bool,
+
+    /// Disable automatic Turn-1 `SKILL.md` discovery
+    #[arg(long = "no-skills")]
+    no_skills: bool,
+
     /// Maximum agent turns before halting (default: 500)
     #[arg(long = "max-turns")]
     max_turns: Option<u64>,
@@ -269,6 +303,18 @@ enum Commands {
     Modules,
     /// List registered wire-protocol adapters & data-driven providers from providers.json
     Providers,
+    /// List available catalog models or resolve a model reference / family alias (e.g. `anthropic/sonnet`)
+    Models {
+        /// Output structured JSON instead of a human table
+        #[arg(long)]
+        json: bool,
+        /// Resolve a model reference (`provider/model`, bare id, or family alias) to canonical `provider/id`
+        #[arg(long)]
+        resolve: Option<String>,
+        /// Include unconfigured providers in listing
+        #[arg(long)]
+        all: bool,
+    },
     /// Manage & inspect configured MCP 2026-07-28 servers and deferred tools
     Mcp {
         #[command(subcommand)]
@@ -395,6 +441,47 @@ fn main() {
                     std::process::exit(1);
                 }
             },
+            Commands::Models { json, resolve, all } => {
+                match ProviderRegistry::load_default(&cli.provider_configs) {
+                    Ok(reg) => {
+                        if let Some(reference) = resolve {
+                            match resolve_model_spec_in_registry(&reg, reference, None) {
+                                Some((prov, model)) => {
+                                    println!("{prov}/{model}");
+                                    return;
+                                }
+                                None => {
+                                    eprintln!("models error: could not resolve `{reference}`");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        let models = list_rpc_models(&reg, *all);
+                        if *json {
+                            let out = json!({ "models": models });
+                            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                        } else if models.is_empty() {
+                            println!(
+                                "No models available (configure provider credentials first or pass --all)."
+                            );
+                        } else {
+                            println!("{:<20} {:<38} {:>10}", "provider", "model", "context");
+                            for m in models {
+                                let ctx = m
+                                    .context_window
+                                    .map(|c| format!("{}k", c / 1000))
+                                    .unwrap_or_else(|| "-".into());
+                                println!("{:<20} {:<38} {:>10}", m.provider, m.id, ctx);
+                            }
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("models error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -452,11 +539,62 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 }
                 return 0;
             }
-            Commands::AuditPrefix | Commands::Modules | Commands::Providers => return 0,
+            Commands::AuditPrefix
+            | Commands::Modules
+            | Commands::Providers
+            | Commands::Models { .. } => return 0,
         }
     }
 
-    let (agent, mcp) = match build_agent(&cli, cwd).await {
+    // In `--mode rpc --host-extension`, perform the `host/register` handshake BEFORE building
+    // the Agent so host-supplied tools & static system-prompt sections freeze before Turn 1.
+    if matches!(cli.mode, Mode::Rpc) && cli.host_extension {
+        let pending = match read_host_registration().await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("rpc host-extension handshake error: {e}");
+                return 1;
+            }
+        };
+        let timeout = Duration::from_millis(pending.registration.timeout_ms.max(1_000));
+        let bridge = Arc::new(HostRpcBridge::new(Arc::clone(&pending.stdout), timeout));
+        let sys_append = pending.registration.system_prompt_append.clone();
+        let host_mod: Arc<dyn carnot::Module> = Arc::new(HostRpcModule::from_registration(
+            pending.registration.clone(),
+            Arc::clone(&bridge),
+        ));
+        let (agent, mcp) = match build_agent_full(
+            &cli,
+            cwd.clone(),
+            BTreeMap::new(),
+            vec![host_mod],
+            sys_append,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        };
+        let rpc_host: Arc<dyn RpcHost> = Arc::new(CliRpcHost {
+            cli: cli.clone(),
+            cwd,
+        });
+        let code =
+            match serve_rpc_stdio_with_extension(agent, Some(rpc_host), bridge, pending).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("rpc error: {e}");
+                    1
+                }
+            };
+        mcp.shutdown_all().await;
+        return code;
+    }
+
+    let (agent, mcp) = match build_agent(&cli, cwd.clone()).await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("error: {e}");
@@ -480,13 +618,19 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
             host.shutdown_session_mcps().await;
             rc
         }
-        Mode::Rpc => match serve_rpc_stdio(agent).await {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("rpc error: {e}");
-                1
+        Mode::Rpc => {
+            let rpc_host: Arc<dyn RpcHost> = Arc::new(CliRpcHost {
+                cli: cli.clone(),
+                cwd,
+            });
+            match serve_rpc_stdio_with_host(agent, Some(rpc_host)).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("rpc error: {e}");
+                    1
+                }
             }
-        },
+        }
         Mode::Text | Mode::Json => {
             let prompt = if let Some(ref pf) = cli.prompt_file {
                 match std::fs::read_to_string(pf) {
@@ -918,11 +1062,163 @@ impl AcpHost for CliAcpHost {
     }
 }
 
+#[derive(Debug)]
+struct CliRpcHost {
+    cli: Cli,
+    cwd: PathBuf,
+}
+
+fn family_version_tuple(model_id: &str, family: &str) -> Option<Vec<u64>> {
+    let parts: Vec<&str> = model_id.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let maker = parts[0];
+    let name = parts[1];
+    if name != family || !maker.is_ascii() || !maker.bytes().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+    let mut ver = Vec::new();
+    for p in &parts[2..] {
+        if p.len() >= 8 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        ver.push(p.parse::<u64>().ok()?);
+    }
+    (!ver.is_empty()).then_some(ver)
+}
+
+fn list_rpc_models(reg: &ProviderRegistry, include_unconfigured: bool) -> Vec<RpcModelInfo> {
+    let cat = reg.catalog();
+    reg.available_models(include_unconfigured)
+        .into_iter()
+        .map(|m| {
+            let entry = cat.find_model(&m.id);
+            let supports_effort = entry.and_then(|e| e.supports_effort).unwrap_or(false);
+            let thinking_mode = entry.and_then(|e| e.thinking_mode.as_deref());
+            let effort_preserves_cache = supports_effort && thinking_mode != Some("budget");
+            RpcModelInfo {
+                provider: m.provider,
+                id: m.id.clone(),
+                label: Some(m.label),
+                context_window: reg.context_window_for_model(&m.id),
+                max_output_tokens: reg.max_output_tokens_for_model(&m.id),
+                effort_preserves_cache,
+            }
+        })
+        .collect()
+}
+
+fn resolve_model_spec_in_registry(
+    reg: &ProviderRegistry,
+    reference: &str,
+    provider_override: Option<&str>,
+) -> Option<(String, String)> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cat = reg.catalog();
+    let (wanted_prov, raw_model) = if let Some(ov) = provider_override {
+        let canon = cat
+            .find_provider(ov)
+            .map(|(id, _)| id.to_string())
+            .unwrap_or_else(|| ov.to_string());
+        (Some(canon), trimmed)
+    } else if let Some((lhs, rhs)) = trimmed.split_once('/')
+        && let Some((canon, _)) = cat.find_provider(lhs)
+    {
+        (Some(canon.to_string()), rhs)
+    } else {
+        (None, trimmed)
+    };
+
+    let all_models = reg.available_models(true);
+    // 1. Exact (provider, id) match
+    if let Some(ref wp) = wanted_prov
+        && let Some(found) = all_models
+            .iter()
+            .find(|m| m.provider == *wp && m.id == raw_model)
+    {
+        return Some((found.provider.clone(), found.id.clone()));
+    }
+    // 2. Bare exact id match
+    if wanted_prov.is_none()
+        && let Some(found) = all_models.iter().find(|m| m.id == raw_model)
+    {
+        return Some((found.provider.clone(), found.id.clone()));
+    }
+    // 3. Family alias resolution (e.g. `anthropic/sonnet` or `opus` -> newest version in catalog)
+    let mut best: Option<(Vec<u64>, String, String)> = None;
+    for m in &all_models {
+        if let Some(ref wp) = wanted_prov
+            && m.provider != *wp
+        {
+            continue;
+        }
+        if let Some(ver) = family_version_tuple(&m.id, raw_model) {
+            let better = best.as_ref().map(|(bv, _, _)| ver > *bv).unwrap_or(true);
+            if better {
+                best = Some((ver, m.provider.clone(), m.id.clone()));
+            }
+        }
+    }
+    if let Some((_, prov, id)) = best {
+        return Some((prov, id));
+    }
+    // 4. Fallback: explicit provider + literal model id (for arbitrary/new models not in catalog)
+    if let Some(wp) = wanted_prov {
+        return Some((wp, raw_model.to_string()));
+    }
+    cat.provider_for_model(raw_model)
+        .map(|p| (p.to_string(), raw_model.to_string()))
+}
+
+impl RpcHost for CliRpcHost {
+    fn list_models(&self) -> Vec<RpcModelInfo> {
+        let Ok(reg) = ProviderRegistry::load_default(&self.cli.provider_configs) else {
+            return Vec::new();
+        };
+        list_rpc_models(&reg, false)
+    }
+
+    fn resolve_model(
+        &self,
+        model_spec: &str,
+        provider_override: Option<&str>,
+    ) -> carnot::Result<ResolvedRpcModel> {
+        let reg = ProviderRegistry::load_default(&self.cli.provider_configs)?;
+        let (prov_id, model_id) =
+            resolve_model_spec_in_registry(&reg, model_spec, provider_override)
+                .unwrap_or_else(|| (self.cli.provider.clone(), model_spec.trim().to_string()));
+        let provider = reg.build_provider(&prov_id, Some(&model_id))?;
+        let context_window = reg.context_window_for_model(&model_id);
+        let max_output_tokens = reg.max_output_tokens_for_model(&model_id);
+        Ok(ResolvedRpcModel {
+            provider_id: prov_id,
+            model_id,
+            provider,
+            context_window,
+            max_output_tokens,
+        })
+    }
+
+    fn list_commands(&self) -> Vec<RpcCommandInfo> {
+        discover_agent_skills(&self.cwd, &self.cli.skills_dirs)
+            .into_iter()
+            .map(|(name, desc, _)| RpcCommandInfo {
+                name,
+                description: if desc.is_empty() { None } else { Some(desc) },
+            })
+            .collect()
+    }
+}
+
 async fn build_agent(
     cli: &Cli,
     cwd: PathBuf,
 ) -> carnot::Result<(Arc<carnot::Agent>, Arc<McpManager>)> {
-    build_agent_with_mcp(cli, cwd, BTreeMap::new()).await
+    build_agent_full(cli, cwd, BTreeMap::new(), Vec::new(), None).await
 }
 
 async fn build_agent_with_mcp(
@@ -930,35 +1226,76 @@ async fn build_agent_with_mcp(
     cwd: PathBuf,
     extra_mcp: BTreeMap<String, McpServerConfig>,
 ) -> carnot::Result<(Arc<carnot::Agent>, Arc<McpManager>)> {
+    build_agent_full(cli, cwd, extra_mcp, Vec::new(), None).await
+}
+
+async fn build_agent_full(
+    cli: &Cli,
+    cwd: PathBuf,
+    extra_mcp: BTreeMap<String, McpServerConfig>,
+    extra_modules: Vec<Arc<dyn carnot::Module>>,
+    system_prompt_append: Option<String>,
+) -> carnot::Result<(Arc<carnot::Agent>, Arc<McpManager>)> {
     let ttl = match cli.cache_ttl.to_ascii_lowercase().as_str() {
         "5m" | "short" => CacheTtl::Short5m,
         "1h" | "long" => CacheTtl::Long1h,
         _ => CacheTtl::Hybrid,
     };
-    let effective_provider = if let Some(ref m) = cli.model
-        && cli.provider == "anthropic"
-        && let Ok(reg) = ProviderRegistry::load_default(&cli.provider_configs)
-        && let Some(routed) = reg.catalog().provider_for_model(m)
-    {
-        routed.to_string()
+    let (effective_provider, effective_model) = if let Some(ref m) = cli.model {
+        if let Ok(reg) = ProviderRegistry::load_default(&cli.provider_configs) {
+            if cli.provider == "anthropic" {
+                if let Some((prov, mid)) = resolve_model_spec_in_registry(&reg, m, None) {
+                    (prov, Some(mid))
+                } else {
+                    (cli.provider.clone(), Some(m.clone()))
+                }
+            } else if let Some((prov, mid)) =
+                resolve_model_spec_in_registry(&reg, m, Some(&cli.provider))
+            {
+                (prov, Some(mid))
+            } else {
+                (cli.provider.clone(), Some(m.clone()))
+            }
+        } else {
+            (cli.provider.clone(), Some(m.clone()))
+        }
     } else {
-        cli.provider.clone()
+        (cli.provider.clone(), None)
     };
+
+    let sys_override = if let Some(ref spf) = cli.system_prompt_file {
+        Some(std::fs::read_to_string(spf)?)
+    } else {
+        cli.system_prompt.clone()
+    };
+
     let interactive_surface = matches!(cli.mode, Mode::Acp | Mode::Rpc)
         || matches!(cli.command, Some(Commands::Serve { .. }))
         || (cli.prompt.is_none() && cli.prompt_file.is_none() && cli.command.is_none());
     let mut b = CarnotBuilder::new(cwd.clone())
         .profile(cli.profile.into())
-        .model_opt(cli.model.clone())
+        .model_opt(effective_model)
         .effort(cli.effort.into())
         .provider_name(effective_provider)
         .cache_ttl(ttl)
         .persist_session(!cli.no_session)
+        .system_prompt_override(sys_override)
+        .system_prompt_append(system_prompt_append)
+        .exclude_tools(cli.exclude_tools.clone())
+        .load_context_files(!cli.no_context_files)
+        .load_skills(!cli.no_skills)
+        .disable_mcp(cli.no_mcp)
         .autonomous_gates(cli.gates.clone())
         .policy_guard(cli.policy_guard)
         .ask_user(interactive_surface)
         .trust_workspace_mcp(cli.trust_workspace_mcp)
         .trust_workspace_extensions(cli.trust_workspace_extensions);
+    if let Some(ref sd) = cli.session_dir {
+        b = b.session_dir(sd.clone());
+    }
+    for m in extra_modules {
+        b = b.with_module(m);
+    }
 
     #[cfg(feature = "ext-subagent")]
     {
