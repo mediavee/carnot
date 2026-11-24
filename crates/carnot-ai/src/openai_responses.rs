@@ -1,6 +1,6 @@
 //! Stateless OpenAI Responses API adapter (`api = "openai-responses"`).
 //!
-//! Implements Opus Phase 5 contract:
+//! Protocol contract:
 //! - Stateless by default (`store: false`, `include: ["reasoning.encrypted_content"]`) — never uses
 //!   `previous_response_id` so ZDR, failover, and session resume stay 100% deterministic.
 //! - Verbatim replay of origin-matched `Opaque` reasoning items (`type: "reasoning"`).

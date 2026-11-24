@@ -24,7 +24,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait Tool: Send + Sync + std::fmt::Debug {
     fn spec(&self) -> ToolSpec;
 
-    /// Declares read/write path effects for the I2 effect-based parallel scheduler.
+    /// Declares read/write path effects for the effect-based parallel scheduler.
     /// Defaults to a global serial barrier for safety.
     fn effects(&self, _input: &Value) -> ToolEffects {
         ToolEffects::serial()
@@ -45,7 +45,7 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Explicit pre-edit snapshot kind (Opus #9: NEVER conflates newly created files with snapshot failures!).
+/// Explicit pre-edit snapshot kind (never conflates newly created files with snapshot failures).
 #[derive(Debug, Clone)]
 pub enum UndoKind {
     Created {
@@ -169,7 +169,7 @@ impl ToolRegistry {
     }
 
     /// Atomically rolls back the most recent `Edit`/`Write` using its verified BLAKE3 CAS snapshot.
-    /// Refuses to clobber external modifications made after the edit (Opus #9 & #19!).
+    /// Refuses to clobber external modifications made after the edit.
     pub fn undo_last_edit(&self) -> Result<Option<std::path::PathBuf>> {
         let entry = self.undo_stack.lock().ok().and_then(|mut st| st.pop());
         let Some(entry) = entry else {
@@ -286,7 +286,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Invalidates a single tracked path (called when a speculative eager `Read` is discarded — N3).
+    /// Invalidates a single tracked path (called when a speculative eager `Read` is discarded).
     pub fn invalidate_read_path(&self, path: &std::path::Path) {
         if let Ok(mut guard) = self.read_tracker.lock() {
             guard.invalidate(path);

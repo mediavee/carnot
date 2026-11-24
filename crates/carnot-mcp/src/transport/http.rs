@@ -60,7 +60,7 @@ impl StreamableHttpTransport {
         }
     }
 
-    /// Builds an HTTP POST with protocol headers set **AFTER** user headers (Opus A1 rule:
+    /// Builds an HTTP POST with protocol headers set **after** user headers (
     /// protocol headers always win so `-32020 HeaderMismatch` can never be triggered by config!).
     fn build_post(
         &self,
@@ -215,7 +215,7 @@ impl StreamableHttpTransport {
         if content_type.contains("text/event-stream") {
             self.read_sse_response(resp, id, on_progress, cancel).await
         } else {
-            // Bounded JSON body read (16 MiB cap — Opus #13!) with cancellation support
+            // Bounded JSON body read (16 MiB cap) with cancellation support.
             let mut stream = resp.bytes_stream();
             let mut body_bytes = Vec::with_capacity(4096);
             loop {

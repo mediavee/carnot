@@ -1,7 +1,7 @@
 //! Structured `WebSearch` tool backed by real search APIs (SearXNG, Exa, Tavily, Brave).
 //!
 //! Zero brittle HTML scraping; declares `defer_loading: true` (0 static prefix tokens) and
-//! `ToolEffects::global_read()` (parallelizable in I2 waves).
+//! `ToolEffects::global_read()` (parallelizable in read-only waves).
 
 use carnot_cas::{CasStore, shape_command_output_with_redaction};
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};

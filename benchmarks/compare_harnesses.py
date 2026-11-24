@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Fair, Deterministic Cross-Harness Benchmark Suite (Opus 5.5 Phase 5 Protocol).
+Fair, Deterministic Cross-Harness Benchmark Suite.
 
 Compares:
   - Carnot (Rust)
   - Unharnessed (Rust)
-  - prime-agent (Rust)
-  - lythe / rho (Rust)
   - Pi (@mariozechner/pi-coding-agent, TypeScript/Node)
   - OpenCode (Bun/TypeScript compiled binary)
   - Claude Code (Anthropic CLI)
@@ -563,24 +561,23 @@ def resolve_real_file_mb(bin_path: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Harness Definitions (All 8 Harnesses!)
+# Harness Definitions
 # ---------------------------------------------------------------------------
 
 def build_harnesses(port: int) -> List[Dict[str, Any]]:
     base_url = f"http://127.0.0.1:{port}"
     repo_root = Path(__file__).resolve().parent.parent
     carnot_bin = os.environ.get("CARNOT_BIN") or str(repo_root / "target/release/carnot")
-    uh_bin = os.environ.get("UNHARNESSED_BIN") or "/tmp/carnot-bench-competitors/target-uh/release/unharnessed"
-    pa_bin = os.environ.get("PRIME_AGENT_BIN") or "/tmp/carnot-bench-competitors/target-pa/release/prime-agent"
-    lythe_bin = os.environ.get("LYTHE_BIN") or "/tmp/carnot-bench-competitors/target-rho/release/lythe"
-    pi_bin = os.environ.get("PI_BIN") or "/tmp/carnot-bench-competitors/pi/node_modules/.bin/pi"
-    opencode_bin = shutil.which("opencode") or "/opt/homebrew/bin/opencode"
+    uh_bin = os.environ.get("UNHARNESSED_BIN") or (shutil.which("unharnessed") or "")
+    pi_bin = os.environ.get("PI_BIN") or (shutil.which("pi") or "")
+    opencode_bin = shutil.which("opencode") or ""
     claude_bin = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
-    codex_bin = shutil.which("codex") or "/opt/homebrew/bin/codex"
-    node_bin = shutil.which("node") or "/opt/homebrew/bin/node"
+    codex_bin = shutil.which("codex") or ""
+    node_bin = shutil.which("node") or ""
 
     # Compute exact installed closures
-    pi_closure_mb = dir_size_mb(Path("/tmp/carnot-bench-competitors/pi/node_modules")) + resolve_real_file_mb(node_bin)
+    pi_node_modules = Path(pi_bin).resolve().parent.parent if pi_bin and Path(pi_bin).exists() else Path("/nonexistent")
+    pi_closure_mb = (dir_size_mb(pi_node_modules) if pi_node_modules.exists() else 0.0) + (resolve_real_file_mb(node_bin) if node_bin else 0.0)
     opencode_real = Path(opencode_bin).resolve()
     # OpenCode Homebrew binary is often a standalone compiled executable or inside a package dir
     opencode_bin_mb = resolve_real_file_mb(opencode_bin)
@@ -635,18 +632,6 @@ def build_harnesses(port: int) -> List[Dict[str, Any]]:
 
     def setup_uh_home(home_dir: str):
         agent_dir = Path(home_dir) / ".unharnessed"
-        agent_dir.mkdir(parents=True, exist_ok=True)
-        models_cfg = {
-            "providers": {
-                "anthropic": {
-                    "baseUrl": base_url,
-                }
-            }
-        }
-        (agent_dir / "models.json").write_text(json.dumps(models_cfg))
-
-    def setup_pa_home(home_dir: str):
-        agent_dir = Path(home_dir) / ".prime-agent"
         agent_dir.mkdir(parents=True, exist_ok=True)
         models_cfg = {
             "providers": {
@@ -720,38 +705,10 @@ def build_harnesses(port: int) -> List[Dict[str, Any]]:
             "warmup_timeout_s": 90.0,
         },
         {
-            "id": "lythe",
-            "label": "lythe / rho (Rust)",
-            "protocol": "anthropic-messages",
-            "binary_mb": round(resolve_real_file_mb(lythe_bin), 1),
-            "closure_mb": round(resolve_real_file_mb(lythe_bin), 1),
-            "cmd": lambda cwd: [
-                lythe_bin, "-p", "--provider", "anthropic", "--model", "claude-sonnet-4-5-20250929",
-                "--no-session", "--no-skills", "--no-context-files", "--no-mcp", "--no-extensions",
-                "--offline", "--cwd", cwd, "Reply OK",
-            ],
-            "env": base_env,
-            "setup_home": None,
-        },
-        {
-            "id": "prime-agent",
-            "label": "prime-agent (Rust)",
-            "protocol": "anthropic-messages",
-            "binary_mb": round(resolve_real_file_mb(pa_bin), 1),
-            "closure_mb": round(resolve_real_file_mb(pa_bin), 1),
-            "cmd": lambda cwd: [
-                pa_bin, "-p", "--provider", "anthropic", "--model", "claude-sonnet-4-5-20250929",
-                "--no-session", "--no-skills", "--no-context-files", "--offline", "--cwd", cwd, "Reply OK",
-            ],
-            "env": lambda h: {**base_env(h), "PRIME_AGENT_CODING_AGENT_DIR": os.path.join(h, ".prime-agent")},
-            "setup_home": setup_pa_home,
-            "warmup_timeout_s": 90.0,
-        },
-        {
             "id": "pi",
             "label": "Pi (TS/Node)",
             "protocol": "anthropic-messages",
-            "binary_mb": round(dir_size_mb(Path("/tmp/carnot-bench-competitors/pi/node_modules")), 1),
+            "binary_mb": round(dir_size_mb(pi_node_modules) if pi_node_modules.exists() else 0.0, 1),
             "closure_mb": round(pi_closure_mb, 1),
             "cmd": lambda cwd: [
                 pi_bin, "-p", "--provider", "anthropic", "--model", "claude-sonnet-4-5-20250929",

@@ -1,13 +1,13 @@
-//! Canonical `Read`, `Edit`, and `Write` tools — hardened against Opus S2 & F1–F7:
+//! Canonical `Read`, `Edit`, and `Write` tools:
 //!   - Strict path confinement to `workspace_root` + `extra_writable_roots` (normalizes `..`
-//!     and resolves canonical symlink targets BEFORE reading or writing — closes S2!)
-//!   - `Read` NEVER loops through CAS spill (F1); caps at 16 MiB & 2,000 lines with explicit offset hint
-//!   - `ReadTracker` stores ONLY unnumbered raw lines actually returned (F2, F4)
-//!   - `Edit` rejects empty `old_string` and preserves CRLF line endings (F5)
+//!     and resolves canonical symlink targets before reading or writing)
+//!   - `Read` never loops through CAS spill; caps at 16 MiB & 2,000 lines with explicit offset hint
+//!   - `ReadTracker` stores only unnumbered raw lines actually returned
+//!   - `Edit` rejects empty `old_string` and preserves CRLF line endings
 //!   - `atomic_write` follows symlink targets (re-checked for confinement), preserves permissions,
-//!     and removes temp files on error (F6)
-//!   - Saturating range math & `tokio::task::spawn_blocking` off the async executor (F7)
-//!   - Path-level `ToolEffects` for parallel disjoint `Edit`/`Write` execution (I2)
+//!     and removes temp files on error
+//!   - Saturating range math & `tokio::task::spawn_blocking` off the async executor
+//!   - Path-level `ToolEffects` for parallel disjoint `Edit`/`Write` execution
 
 mod edit;
 mod path;

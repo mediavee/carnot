@@ -1,17 +1,17 @@
 //! Hardened OS-native process sandboxing (macOS Seatbelt, Linux bwrap + Landlock fallback) and
 //! strict environment allowlisting.
 //!
-//! Security invariants (verified against Opus 5.5 High red-team exploits C1, S1, S3, N6, N7):
-//!   - `<workspace>/.git` is READ-ONLY inside Seatbelt & bwrap (closes C1: sandboxed process can
-//!     NEVER write `.git/config` or `.git/hooks/*` to hijack host-side `git`!).
+//! Security invariants:
+//!   - `<workspace>/.git` is READ-ONLY inside Seatbelt & bwrap (sandboxed processes can never
+//!     write `.git/config` or `.git/hooks/*` to hijack host-side `git`).
 //!   - Linked git worktrees are verified strictly (`gd` outside workspace, `cd == gd/../..`,
-//!     reciprocal `worktrees/<name>/gitdir` -> `<ws>/.git` — closes N6) and ONLY `worktrees/<name>`
-//!     + `cd/{objects,refs,logs}` are writable — NEVER `cd/config` or `cd/hooks`!
+//!     reciprocal `worktrees/<name>/gitdir` -> `<ws>/.git`) and ONLY `worktrees/<name>`
+//!     + `cd/{objects,refs,logs}` are writable — never `cd/config` or `cd/hooks`.
 //!   - Host-side git invocations use `host_safe_git_command()` (`-c core.fsmonitor=false -c core.hooksPath=/dev/null`).
 //!   - Strict environment allowlist (`env_clear()` + safe baseline vars + isolated `ZDOTDIR`,
 //!     no `BASH_ENV`/`ENV`) + Seatbelt/bwrap/Landlock block `~/.ssh`, `~/.aws`, `~/.gnupg`,
 //!     `~/.config/gh`, `~/.secrets`, `~/.zshenv`, `~/.zshrc`, `~/.claude`, `~/.codex`,
-//!     `~/.config/agentsafe`, `~/.docker`, `~/.kube` (closes S3 & N7).
+//!     `~/.config/agentsafe`, `~/.docker`, `~/.kube`.
 //!   - Workspace-isolated `TMPDIR` (`.carnot/tmp`), network OFF by default, fail-closed if no OS sandbox.
 
 mod landlock;
@@ -96,7 +96,7 @@ fn resolve_shell_binary() -> &'static str {
 }
 
 /// Builds a host-side `std::process::Command` for `git` that neutralizes repo-controlled
-/// `core.fsmonitor`, `core.hooksPath`, and `core.sshCommand` (defense-in-depth for C1).
+/// `core.fsmonitor`, `core.hooksPath`, and `core.sshCommand`.
 pub fn host_safe_git_command(repo_root: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.args([
@@ -126,7 +126,7 @@ pub fn apply_safe_env(cmd: &mut Command, extra_env: &BTreeMap<String, String>) {
         cmd.env(k, v);
     }
     cmd.env("AI_AGENT", "carnot");
-    // Neutralize shell startup scripts that could reload host secrets (N7)
+    // Neutralize shell startup scripts that could reload host secrets.
     cmd.env("BASH_ENV", "");
     cmd.env("ENV", "");
     for (k, v) in extra_env {
@@ -251,14 +251,14 @@ pub fn build_sandboxed_shell_in_dir(
 
     if policy.enabled {
         apply_safe_env(&mut cmd, extra_env);
-        // Isolate child TMPDIR & ZDOTDIR inside the workspace (closes host /tmp writes & ~/.zshenv leak N7)
+        // Isolate child TMPDIR & ZDOTDIR inside the workspace (prevents host /tmp writes and ~/.zshenv leaks).
         let ws_tmp = policy.workspace_root.join(".carnot").join("tmp");
         let zdot = ws_tmp.join("zdotdir");
         let _ = std::fs::create_dir_all(&zdot);
         cmd.env("TMPDIR", &ws_tmp);
         cmd.env("ZDOTDIR", &zdot);
         // Inside an offline OS sandbox, host compiler wrapper daemons configured in `~/.cargo/config.toml`
-        // (e.g. `sccache` / `cachette-sccache`) cannot reach their local sockets/network and fail `cargo test`.
+        // (e.g. `sccache`) cannot reach their local sockets/network and fail `cargo test`.
         // Override them cleanly to empty unless the caller explicitly passed them in `extra_env`.
         if !policy.allow_network {
             for k in [
@@ -413,13 +413,13 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
     c
 }
 
-/// Hardened Linux `bubblewrap` (`bwrap`) backend (fail-closed, zero `unsafe`! — fixes Opus #1).
-///   - `--unshare-all` (isolates PID, IPC, UTS, cgroup, user, net namespaces -> parent `/proc/<pid>/environ`
-///     and host Unix sockets are unreachable!) + `--share-net` ONLY when `policy.allow_network == true`.
+/// Hardened Linux `bubblewrap` (`bwrap`) backend (fail-closed, zero `unsafe`):
+///   - `--unshare-all` (isolates PID, IPC, UTS, cgroup, user, net namespaces so parent `/proc/<pid>/environ`
+///     and host Unix sockets are unreachable) + `--share-net` only when `policy.allow_network == true`.
 ///   - Explicit minimal read-only mounts (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/opt`)
-///     instead of `--ro-bind / /` (prevents connecting to host D-Bus / `docker.sock` / SSH agent sockets!).
+///     instead of `--ro-bind / /` (prevents connecting to host D-Bus / `docker.sock` / SSH agent sockets).
 ///   - Fresh `--tmpfs /run`, `--tmpfs /tmp`, and `--tmpfs $XDG_RUNTIME_DIR`.
-///   - Read-only `<ws>/.git` (C1), `--new-session` (blocks TIOCSTI), `--die-with-parent`, and
+///   - Read-only `<ws>/.git`, `--new-session` (blocks TIOCSTI), `--die-with-parent`, and
 ///     credential file/dir masking (`~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.cargo/credentials.toml`).
 fn resolve_bwrap_binary() -> Option<PathBuf> {
     for candidate in ["/usr/bin/bwrap", "/bin/bwrap"] {
@@ -579,11 +579,11 @@ fn build_linux_bwrap_command(
     c
 }
 
-/// Strictly validates a linked git worktree ONCE on the host (closes S1 & N6):
-///   - `gd` MUST lie OUTSIDE `canonical_ws`
-///   - `gd` MUST have layout `<cd>/worktrees/<name>` (so `cd == gd/../..`)
-///   - `<gd>/gitdir` MUST reciprocally resolve to `<canonical_ws>/.git`
-///   - Only safe object/ref/worktree subdirs are returned — NEVER `cd/config` or `cd/hooks` (C1)!
+/// Strictly validates a linked git worktree once on the host:
+///   - `gd` must lie outside `canonical_ws`
+///   - `gd` must have layout `<cd>/worktrees/<name>` (so `cd == gd/../..`)
+///   - `<gd>/gitdir` must reciprocally resolve to `<canonical_ws>/.git`
+///   - Only safe object/ref/worktree subdirs are returned — never `cd/config` or `cd/hooks`.
 fn resolve_verified_linked_git_dirs(canonical_ws: &Path) -> Vec<PathBuf> {
     let dot_git = canonical_ws.join(".git");
     if !dot_git.is_file() {
@@ -616,7 +616,7 @@ fn resolve_verified_linked_git_dirs(canonical_ws: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
 
-    // N6 guard: `gd` MUST NOT be inside workspace, and `cd` MUST be `gd/../..` with `worktrees` parent
+    // Guard: `gd` and `cd` must lie outside workspace, and `cd` must be `gd/../..` under `worktrees/`.
     if gd.starts_with(canonical_ws) || cd.starts_with(canonical_ws) {
         return Vec::new();
     }
@@ -643,7 +643,7 @@ fn resolve_verified_linked_git_dirs(canonical_ws: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
 
-    // C1 guard: open ONLY `gd`, `cd/objects`, `cd/refs`, `cd/logs` — NEVER `cd/config` or `cd/hooks`!
+    // Open only `gd`, `cd/objects`, `cd/refs`, `cd/logs` — never `cd/config` or `cd/hooks`.
     let mut dirs = vec![gd];
     for sub in ["objects", "refs", "logs"] {
         let p = cd.join(sub);
@@ -680,8 +680,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn blocks_c1_dot_git_config_tampering_under_seatbelt() {
-        let base = std::env::temp_dir().join(format!("carnot-c1-{}", uuid::Uuid::new_v4()));
+    async fn blocks_dot_git_config_tampering_under_seatbelt() {
+        let base = std::env::temp_dir().join(format!("carnot-git-ro-{}", uuid::Uuid::new_v4()));
         let ws = base.join("ws");
         std::fs::create_dir_all(&ws).expect("ws");
         let init = std::process::Command::new("git")
@@ -703,7 +703,7 @@ mod tests {
         .expect("run");
         assert!(
             !out.status.success(),
-            "C1 regression: sandboxed process MUST NOT write .git/config!"
+            "sandboxed process must not write .git/config"
         );
         let cfg = std::fs::read_to_string(ws.join(".git/config")).expect("read config");
         assert!(!cfg.contains("fsmonitor"));
@@ -712,8 +712,8 @@ mod tests {
     }
 
     #[test]
-    fn blocks_n6_forged_commondir_in_fake_worktree() {
-        let base = std::env::temp_dir().join(format!("carnot-n6-{}", uuid::Uuid::new_v4()));
+    fn blocks_forged_commondir_in_fake_worktree() {
+        let base = std::env::temp_dir().join(format!("carnot-wt-{}", uuid::Uuid::new_v4()));
         let ws = base.join("ws");
         let victim = base.join("victim_repo");
         std::fs::create_dir_all(&ws).expect("ws");
@@ -743,7 +743,7 @@ mod tests {
         let policy = SandboxPolicy::for_workspace(ws.clone(), true, false);
         assert!(
             policy.frozen_git_write_dirs.is_empty(),
-            "N6 regression: forged worktree commondir MUST be rejected!"
+            "forged worktree commondir must be rejected"
         );
 
         let _ = std::fs::remove_dir_all(&base);

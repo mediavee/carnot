@@ -3,6 +3,8 @@ name = "carnot-ext-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Workspace-scoped BM25 persistent memory extension for Carnot"
 
 [lints]
 workspace = true

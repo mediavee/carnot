@@ -1,4 +1,4 @@
-//! Append-only, branching JSONL v2 session engine (Opus I1 + S-1..S-7 hardened).
+//! Append-only, branching JSONL v2 session engine.
 //!
 //! Safety invariants enforced by construction:
 //!   - Disk-first durability: serializes & writes to persistent `BufWriter` + `sync_data()` BEFORE
@@ -823,7 +823,7 @@ impl SessionStore {
     }
 
     /// Disk-first unbuffered append: write complete line (+ optional `sync_data`) BEFORE mutating
-    /// memory (fixes Opus S-3: no stale bytes retained in a BufWriter after a failed flush!).
+    /// memory so no stale bytes are retained in a buffer after a failed flush.
     fn append_entry(&mut self, entry: SessionEntry, sync: bool) -> Result<()> {
         if let Some(ref mut f) = self.writer {
             let mut buf = serde_json::to_vec(&entry)?;
@@ -1102,7 +1102,7 @@ mod tests {
         assert_eq!(recovered.active_messages().len(), 1);
         assert_eq!(recovered.active_messages()[0].text_concat(), "hello");
 
-        // N1 regression: appending after recovery and reloading a second time MUST succeed!
+        // Appending after crash recovery and reloading a second time must succeed.
         recovered
             .push_message(Message::assistant_text("after-crash"))
             .expect("append post-crash");

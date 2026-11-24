@@ -100,7 +100,7 @@ impl Tool for ReadTool {
                     Ok(m) => m,
                     Err(e) => return Ok(ToolOutput::err_text(format!("Cannot read {}: {e}", path.display()))),
                 };
-                // On-demand structural directory outline (zero Turn-1 RepoMap bloat — Opus #8 & #20!)
+                // On-demand structural directory outline (zero Turn-1 RepoMap bloat).
                 if meta.is_dir() {
                     let outline = build_directory_outline(&ws, &extra, &path, &raw_path);
                     return Ok(ToolOutput::ok_text(outline).with_details(json!({
@@ -251,7 +251,7 @@ impl Tool for ReadTool {
                 let slice_lines = &all_lines[start.saturating_sub(1)..end];
                 let raw_slice = slice_lines.join("\n");
 
-                // Check disk-coherent ReadTracker on RAW unnumbered lines (F2/F3/F4)
+                // Check disk-coherent ReadTracker on raw unnumbered lines.
                 let delta = tracker
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -324,7 +324,7 @@ impl Tool for ReadTool {
 }
 
 /// On-demand structural directory outline using bundled `tree-sitter` (zero Turn-1 cost!).
-/// Confines every entry via `symlink_metadata` + `resolve_confined_path` (Opus #20!).
+/// Confines every entry via `symlink_metadata` + `resolve_confined_path`.
 fn build_directory_outline(ws: &Path, extra: &[PathBuf], dir: &Path, raw_path: &str) -> String {
     let mut entries: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {

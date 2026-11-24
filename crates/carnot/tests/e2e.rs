@@ -1,13 +1,13 @@
 //! End-to-end integration tests verifying every Carnot architectural & security invariant:
 //!   1. Eager read-only execution + disk-coherent Read (unchanged stub, no CAS spill loop on Read)
-//!   2. Atomic Edit + silent Tier-0 tree-sitter syntax check + CRLF & mode 0755 preservation (F5/F6)
+//!   2. Atomic Edit + silent Tier-0 tree-sitter syntax check + CRLF & mode 0755 preservation
 //!   3. Atomic 256-bit BLAKE3 CAS File Handle spill (>4 KiB Bash output)
 //!   4. Verified green-boundary Rewind-Receipt + Preserved-Thinking prefix preservation + read-tracker reset
-//!   5. Strict S2 path confinement (`Read`/`Edit`/`Write` cannot escape workspace root)
-//!   6. Opus I2 effect-based parallel disjoint `Edit`/`Write` wave + gate-before-eager `RewriteInput`
+//!   5. Strict path confinement (`Read`/`Edit`/`Write` cannot escape workspace root)
+//!   6. Effect-based parallel disjoint `Edit`/`Write` wave + gate-before-eager `RewriteInput`
 //!      + malformed tool JSON safe error without execution
-//!   7. Hardened Bash: adaptive yield, live partial output, and background grandchild (`sleep 5 &`) no-hang (B1–B6)
-//!   8. Opus I4 lossless monotone-`seq` `EventLog` replay + cross-turn prefix monotonicity (I1)
+//!   7. Hardened Bash: adaptive yield, live partial output, and background grandchild (`sleep 5 &`) no-hang
+//!   8. Lossless monotone-`seq` `EventLog` replay + cross-turn prefix monotonicity
 
 use carnot::{
     CarnotBuilder, CarnotConfig, FauxProvider, Module, Profile, Result, ScriptedTurn, StopReason,
@@ -138,12 +138,12 @@ async fn e2e_read_edit_cas_spill_prefix_monotonicity_and_permission_gate() {
     // Verify gate-before-eager RewriteInput worked: alias_lib.rs returned lib.rs contents!
     let req2_txt = msgs_json(&reqs[1].messages);
     assert!(req2_txt.contains("pub fn add(a: i32, b: i32)"));
-    // Verify Read(debug.log) returned line 199 directly (F1: no CAS handle loop on Read!)
+    // Verify Read(debug.log) returned line 199 directly (no CAS handle loop on Read).
     assert!(req2_txt.contains("line 199: verbose diagnostic padding content here"));
     // Verify Bash(cat debug.log) spilled to `.carnot/h/`
     assert!(req2_txt.contains(".carnot/h/"));
 
-    // Verify strict append-only I1 prefix monotonicity across all 5 turns!
+    // Verify strict append-only prefix monotonicity across all 5 turns.
     for t in 1..reqs.len() {
         let prev = &reqs[t - 1].messages;
         let curr = &reqs[t].messages;
@@ -159,7 +159,7 @@ async fn e2e_read_edit_cas_spill_prefix_monotonicity_and_permission_gate() {
     assert!(req3_text.contains("blocked dangerous rm -rf /"));
     assert!(req3_text.contains("[unchanged:"));
 
-    // Verify I4 EventLog recorded strictly monotone sequence numbers AND rich ToolStart/ToolEnd payloads
+    // Verify EventLog recorded strictly monotone sequence numbers and rich ToolStart/ToolEnd payloads.
     let replayed = agent.event_log().replay_after(0);
     assert!(replayed.len() >= 10);
     for pair in replayed.windows(2) {
@@ -226,7 +226,7 @@ async fn e2e_multimodal_prompt_blocks_forwards_images_verbatim() {
 }
 
 #[tokio::test]
-async fn e2e_s2_path_confinement_crlf_and_permissions() {
+async fn e2e_path_confinement_crlf_and_permissions() {
     let dir = std::env::temp_dir().join(format!("carnot-s2-e2e-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).expect("mkdir");
 
@@ -279,18 +279,18 @@ async fn e2e_s2_path_confinement_crlf_and_permissions() {
         .await
         .expect("run");
 
-    // S2: escape target MUST NOT exist!
+    // Escape target must not exist.
     assert!(!escape_target.exists(), "Write escaped workspace root!");
     let req2_txt = msgs_json(&faux.recorded_requests()[1].messages);
     assert!(req2_txt.contains("outside allowed workspace root"));
 
-    // F5: CRLF preserved!
+    // CRLF line endings preserved.
     assert_eq!(
         fs::read_to_string(dir.join("win.txt")).expect("read win"),
         "hi\r\nworld\r\n"
     );
 
-    // F6: 0755 permissions preserved!
+    // Executable 0755 permissions preserved.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -310,7 +310,7 @@ async fn e2e_s2_path_confinement_crlf_and_permissions() {
 }
 
 #[tokio::test]
-async fn e2e_i2_parallel_disjoint_edits_and_invalid_json_guard() {
+async fn e2e_parallel_disjoint_edits_and_invalid_json_guard() {
     let dir = std::env::temp_dir().join(format!("carnot-i2-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).expect("mkdir");
     fs::write(dir.join("a.rs"), "pub const A: i32 = 1;\n").expect("write a");
@@ -398,13 +398,13 @@ async fn e2e_adaptive_bash_yield_live_partial_and_bg_grandchild_no_hang() {
     fs::create_dir_all(&dir).expect("mkdir");
 
     let faux = Arc::new(FauxProvider::new(vec![
-        // 1) Backgrounded grandchild holding stdout open MUST NOT hang Bash for 5s (B3)!
+        // 1) Backgrounded grandchild holding stdout open must not hang Bash for 5s.
         ScriptedTurn::tool_calls(vec![(
             "bg0",
             "Bash",
             json!({"command": "echo HI_FAST; sleep 5 &"}),
         )]),
-        // 2) Slow command with live partial output -> yields `job-1` with STEP_1 already visible (B2)!
+        // 2) Slow command with live partial output -> yields `job-1` with STEP_1 already visible.
         ScriptedTurn::tool_calls(vec![(
             "b1",
             "Bash",
@@ -451,7 +451,7 @@ async fn e2e_adaptive_bash_yield_live_partial_and_bg_grandchild_no_hang() {
 }
 
 #[tokio::test]
-async fn e2e_n2_max_tokens_pairs_truncated_tool_use_so_session_stays_usable() {
+async fn e2e_max_tokens_pairs_truncated_tool_use_so_session_stays_usable() {
     let dir = std::env::temp_dir().join(format!("carnot-n2-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).expect("mkdir");
 

@@ -3,6 +3,8 @@ name = "carnot-ext-claude-plugins"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Claude Code plugin discovery and compatibility extension for Carnot"
 
 [lints]
 workspace = true

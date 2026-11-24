@@ -5,7 +5,8 @@ Carnot is built with `#![forbid(unsafe_code)]` across every core crate and offic
 ## Security Boundaries
 
 1. **OS Kernel Sandbox (`carnot-sandbox` — fail-closed by default)**
-   - Every `Bash` command runs inside macOS Seatbelt (`sandbox-exec`) or Linux `bwrap` (`bubblewrap`) with network disabled by default (`--allow-network` required for outbound access), workspace-confined writes, protected `.git/config` / `.git/hooks`, and denylisted credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, etc.).
+   - Every `Bash` command runs inside macOS Seatbelt (`sandbox-exec`), Linux `bwrap` (`bubblewrap`), or — when `bwrap` is unavailable or blocked by container seccomp (`CLONE_NEWUSER` denied) — safe Linux Landlock (ABI v1–v6, including in-kernel TCP restrictions on ABI v4+ and signal/socket scoping on ABI v6+).
+   - Network is disabled by default (`--allow-network` required for outbound access), writes are confined to the workspace, `.git/config` / `.git/hooks` are protected, and credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, etc.) are blocked.
    - Provider API keys and sensitive env vars (discovered dynamically from `providers.json`) are scrubbed from child environments.
 
 2. **Filesystem Confinement (`carnot-tools`)**

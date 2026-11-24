@@ -216,7 +216,7 @@ impl McpManager {
                         {
                             if is_stale {
                                 // Stale-while-revalidate for NEXT session only (never mutates current prompt prefix!)
-                                // Clear era hint so a server upgraded from legacy -> 2026-07-28 re-negotiates (Opus #24!)
+                                // Clear era hint so a server upgraded from legacy -> 2026-07-28 re-negotiates.
                                 let h_bg = Arc::clone(&handle);
                                 let nm_bg = name.clone();
                                 let ck_bg = cache_key.clone();
@@ -1005,7 +1005,7 @@ for line in sys.stdin:
                     } else if method == "notifications/initialized" {
                         let _ = w.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                     } else if !has_session {
-                        // Official TypeScript/Python legacy MCP SDKs return HTTP 400 WITH a JSON-RPC `-32000` body (Opus P0 #1!)
+                        // Official TypeScript/Python legacy MCP SDKs return HTTP 400 with a JSON-RPC `-32000` body.
                         let err_body = json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Bad Request: No valid session ID provided"}}).to_string();
                         let resp = format!(
                             "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_body}",

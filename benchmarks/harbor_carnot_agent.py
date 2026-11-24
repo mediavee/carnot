@@ -121,7 +121,7 @@ class CarnotHarborAgent(BaseAgent):
         return "carnot"
 
     def version(self) -> str | None:
-        return "0.1.0-v8.0"
+        return "0.1.0"
 
     def _carnot_options(self) -> CarnotHarborOptions:
         if isinstance(self.options, CarnotHarborOptions):

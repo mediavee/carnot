@@ -1,4 +1,4 @@
-//! Multi-provider Conformance Test Matrix (Opus Phase 5 contract):
+//! Multi-provider Conformance Test Matrix:
 //! Verifies ALL 6 wire protocol adapters (`anthropic-messages`, `openai-completions`,
 //! `openai-responses`, `google-generative`, `google-cloudcode`, `subprocess-jsonl`) on:
 //!   1. Plain text streaming & exact usage accounting (including DeepSeek top-level cache hit)
@@ -757,7 +757,7 @@ for line in sys.stdin:
 
 #[test]
 fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
-    // Opus Phase 5 contract: ZERO provider-specific hostnames or match-arm hardcoding in Rust source!
+    // Contract: zero provider-specific hostnames or match-arm hardcoding in Rust source.
     let forbidden = [
         "api.x.ai",
         "openrouter.ai",

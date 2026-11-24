@@ -4,7 +4,7 @@
 //! Zero hardcoded provider names, URLs, or User-Agent strings! All endpoints, fallback URLs,
 //! headers, system preambles, and thinking styles come strictly from `providers.json`.
 //!
-//! Fidelity guarantees (Opus Phase 5):
+//! Protocol fidelity guarantees:
 //! - Captures & replays `thoughtSignature` on the EXACT `ToolUse` part (via `provider_meta`)
 //!   and on `Thinking` parts; injects `skip_thought_signature_validator` ONLY for unsigned
 //!   cross-model function calls.

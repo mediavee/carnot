@@ -67,12 +67,12 @@ CARNOT_HTTP_TOKEN=secret carnot serve --addr 127.0.0.1:7744
 
 | Benchmark | Result | Source |
 | :--- | :--- | :--- |
-| **Cold start / RAM / Binary** | `7.4 ms` · `10.3 MiB` RSS · `13.0 MB` · `922 tok` static prefix | [`results_8harnesses_v7.json`](benchmarks/results_8harnesses_v7.json) |
-| **Terminal-Bench 4** (`Opus 5.5`, `max`) | `63.2%` ex-gateway refusals (`24/38`), `97.6%` cache hit, `100%` first-try `Edit`, `-18.5%` cost vs Claude Code | [`results_tb4_carnot_v8_opus55_max.json`](benchmarks/results_tb4_carnot_v8_opus55_max.json) |
-| **Cache-Warm Compaction A/B** | `14/14` recall (0 amnesia), `-66.7%` post-compaction cost, `22.5×` context compression | [`results_compaction_ab_v9.json`](benchmarks/results_compaction_ab_v9.json) |
+| **Cold start / RAM / Binary** | `7.4 ms` · `10.3 MiB` RSS · `13.0 MB` · `922 tok` static prefix | [`harness_overhead.json`](benchmarks/harness_overhead.json) |
+| **Terminal-Bench 4** (`Opus 5.5`, `max`) | `63.2%` (`24/38` valid tasks), `97.6%` cache hit, `100%` first-try `Edit`, `-18.5%` cost vs Claude Code | [`terminal_bench_4.json`](benchmarks/terminal_bench_4.json) |
+| **Cache-Warm Compaction A/B** | `14/14` recall (0 amnesia), `-66.7%` post-compaction cost, `22.5×` context compression | [`compaction_ab.json`](benchmarks/compaction_ab.json) |
 
 <details>
-<summary>Full 8-harness comparison &amp; compaction breakdown</summary>
+<summary>Full harness comparison &amp; compaction breakdown</summary>
 
 #### Harness Overhead (15 runs + 3 warmups · Darwin arm64)
 
@@ -80,9 +80,7 @@ CARNOT_HTTP_TOKEN=secret carnot serve --addr 127.0.0.1:7744
 | :--- | ---: | ---: | ---: | ---: | :---: |
 | **Carnot (Rust)** | **7.4 ms** | **10.3 MiB** | **13.0 MB** | **922 tok** | **Yes** |
 | Unharnessed (Rust) | 7.6 ms | 81.7 MiB | 26.8 MB | 1 035 tok | No |
-| lythe / rho (Rust) | 41.4 ms | 46.6 MiB | 32.4 MB | 1 090 tok | Yes |
 | Codex CLI | 41.4 ms | 133.7 MiB | 284.4 MB | 9 730 tok | No |
-| prime-agent (Rust) | 113.8 ms | 92.6 MiB | 59.2 MB | 9 200 tok | No |
 | Claude Code | 249.9 ms | 216.0 MiB | 343.6 MB | 19 210 tok | No |
 | Pi (Node) | 462.5 ms | 159.4 MiB | 238.1 MB | 1 399 tok | No |
 | OpenCode (Bun) | 545.9 ms | 528.7 MiB | 215.3 MB | 9 644 tok | No |

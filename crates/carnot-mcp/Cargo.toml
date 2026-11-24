@@ -3,6 +3,8 @@ name = "carnot-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Multiplexed MCP 2026-07-28 and legacy client runtime for Carnot"
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 //! Cache-invariant universal `ToolSearch` + `CallDeferredTool` fallback for non-Anthropic providers
-//! (Opus architectural point #1).
+//! without mutating the static cached tool prefix.
 //!
 //! When a provider does NOT support Anthropic's native `tool_search_tool_regex_20251119` (e.g. OpenAI
 //! or local OpenAI-compatible models) and deferred tools (MCP, `WebFetch`, etc.) are registered:
@@ -404,7 +404,7 @@ impl Tool for CallDeferredTool {
             };
             let args = input.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
-            // Validate required top-level schema keys locally before dispatch (Opus point #1!)
+            // Validate required top-level schema keys locally before dispatch.
             let spec = tool.spec();
             if let Some(req_arr) = spec.input_schema.get("required").and_then(Value::as_array) {
                 for r in req_arr {
@@ -524,8 +524,8 @@ mod tests {
                 .any(|s| s.name == CALL_DEFERRED_TOOL_NAME)
         );
 
-        // Small non-MCP deferred sets (<=6) on non-native providers promote directly (Pi-style,
-        // avoiding 2-step ToolSearch+CallDeferredTool overhead for e.g. AskUser + Memory).
+        // Small non-MCP deferred sets (<=6) on non-native providers promote directly,
+        // avoiding 2-step ToolSearch+CallDeferredTool overhead for e.g. AskUser + Memory.
         let small_builtin: Vec<Arc<dyn Tool>> = vec![
             Arc::new(DummyDeferredTool {
                 name: "AskUser",

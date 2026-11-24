@@ -44,7 +44,7 @@ impl ApiAdapter for AnthropicMessagesAdapter {
     }
 }
 
-/// Hardened Anthropic Messages API provider (A1–A10 + Hybrid TTL + cache-diagnosis + TLS pre-warm).
+/// Anthropic Messages API provider with hybrid cache TTLs, cache diagnostics, and TLS pre-warm.
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -158,12 +158,12 @@ impl AnthropicProvider {
     }
 
     /// Builds the Anthropic JSON body with:
-    ///   - 4-breakpoint cache planning (Hybrid 1h static / 5m rolling tail!) placed strictly on
-    ///     the last NON-thinking block (A9)
+    ///   - 4-breakpoint cache planning (Hybrid 1h static / 5m rolling tail) placed strictly on
+    ///     the last non-thinking block
     ///   - Native `defer_loading` + server `tool_search_tool_regex_20251119` when deferred tools exist
     ///   - `eager_input_streaming: true` on `Edit` and `Write` for lower TTFT on large edits
-    ///   - Origin-aware replay: strips foreign `Thinking` signatures / foreign `Opaque` blocks!
-    ///   - Valid Anthropic role alternation & native `role: "system"` placement (A6)
+    ///   - Origin-aware replay: strips foreign `Thinking` signatures / foreign `Opaque` blocks
+    ///   - Valid Anthropic role alternation & native `role: "system"` placement
     ///   - `output_config.effort` + declarative `body_patch`
     pub fn build_body(&self, req: &ProviderRequest) -> Value {
         let cache_ctrl = |ttl: CacheTtl| match ttl {
@@ -369,7 +369,7 @@ impl AnthropicProvider {
                     None
                 };
                 if let Some(cc) = cc_for_msg {
-                    // A9: attach cache_control ONLY to the last NON-thinking / non-server-tool-use block!
+                    // Attach cache_control only to the last non-thinking / non-server-tool-use block.
                     if let Some(target) = blocks.iter_mut().rev().find(|b| {
                         !matches!(
                             b.get("type").and_then(Value::as_str),
@@ -591,7 +591,7 @@ fn encode_blocks(
         .collect()
 }
 
-/// Finds the next SSE frame delimiter (`\n\n` or `\r\n\r\n`) in raw bytes (A1 & A2 fix).
+/// Finds the next SSE frame delimiter (`\n\n` or `\r\n\r\n`) in raw bytes.
 pub fn find_sse_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i + 1 < buf.len() {
@@ -775,7 +775,7 @@ impl Provider for AnthropicProvider {
                     }
                 }
 
-                // A4: EOF without `message_stop` is a truncated stream error, NEVER a silent success!
+                // EOF without `message_stop` is a truncated stream error, never a silent success.
                 if !state.saw_message_stop {
                     let _ = tx
                         .send(StreamEvent::Error {

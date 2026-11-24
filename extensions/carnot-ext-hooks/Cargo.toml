@@ -3,6 +3,8 @@ name = "carnot-ext-hooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Declarative shell hook extension for Carnot"
 
 [lints]
 workspace = true

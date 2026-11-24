@@ -3,6 +3,8 @@ name = "carnot-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Prefix-invariant agent runtime, parallel tool scheduler, and compaction engine for Carnot"
 
 [lints]
 workspace = true

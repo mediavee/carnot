@@ -1,4 +1,4 @@
-//! I2 effect-based parallel tool scheduler: eager mid-stream read launches and conflict-free waves.
+//! Effect-based parallel tool scheduler: eager mid-stream read launches and conflict-free waves.
 
 use carnot_core::{ToolEffects, ToolOutput};
 use tokio::task::JoinHandle;

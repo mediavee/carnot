@@ -1,6 +1,6 @@
 //! Zero-cold-start user-level disk schema cache & MCP `2026-07-28` JSON Schema minifier/validator.
 //!
-//! Incorporates MCP `2026-07-28` (`SEP-2549`, `SEP-2243`, `SEP-2106`) & Opus Phase 4 audit fixes:
+//! Incorporates MCP `2026-07-28` (`SEP-2549`, `SEP-2243`, `SEP-2106`):
 //!   - Persists negotiated `ProtocolEra` (`Modern20260728` | `Legacy20251125`) + `protocol_version`
 //!     so warm starts achieve **0 negotiation round-trips**!
 //!   - Honors `CacheableResult` (`ttlMs` + `cacheScope: "public" | "private"`) and binds cache keys
@@ -400,7 +400,7 @@ pub fn load_cached_schema(cache_key: &str) -> Option<(CachedServerSchema, bool)>
     Some((entry, is_stale))
 }
 
-/// Saves a cached server schema atomically with owner-only `0600` permissions on Unix (Opus #23).
+/// Saves a cached server schema atomically with owner-only `0600` permissions on Unix.
 pub fn save_cached_schema(cache_key: &str, mut schema: CachedServerSchema) {
     if schema.ttl_ms == Some(0) {
         return;

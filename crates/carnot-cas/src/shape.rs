@@ -75,7 +75,7 @@ enum CommandKind {
     Generic,
 }
 
-/// Splits shell chain segments (`&&`, `;`, `|`) ONLY outside single/double quotes (Opus #10/#16!).
+/// Splits shell chain segments (`&&`, `;`, `|`) only outside single/double quotes.
 fn last_unquoted_command_segment(command: &str) -> &str {
     let bytes = command.as_bytes();
     let mut in_single = false;
@@ -146,7 +146,7 @@ fn last_unquoted_command_segment(command: &str) -> &str {
     tail
 }
 
-/// Dispatches purely on `argv[0]` + subcommand (Opus #4 & #16 — handles `cargo +nightly test`
+/// Dispatches purely on `argv[0]` + subcommand (handles `cargo +nightly test`
 /// and never blindly assumes `npm test` is Jest/Vitest!).
 fn classify_command(command: &str) -> CommandKind {
     let segment = last_unquoted_command_segment(command);
@@ -191,7 +191,7 @@ fn classify_command(command: &str) -> CommandKind {
         .next()
         .unwrap_or("");
     let mut sub_idx = idx + 1;
-    // Skip rustup toolchain selector e.g. `cargo +nightly test` (Opus #16!)
+    // Skip rustup toolchain selector e.g. `cargo +nightly test`.
     if bin == "cargo" && tokens.get(sub_idx).is_some_and(|t| t.starts_with('+')) {
         sub_idx += 1;
     }
@@ -235,7 +235,7 @@ fn is_genuine_diagnostic_line(line: &str) -> bool {
 
 /// Deterministic, lossless-diagnostic compressor for `cargo test|check|build|clippy`.
 /// Prioritizes errors, `failures:`, and `test result:` BEFORE warnings so truncation NEVER drops
-/// real errors behind noisy warnings (Opus #7!).
+/// real errors behind noisy warnings.
 fn compress_cargo(cleaned: &str) -> Option<(String, &'static str)> {
     let mut compiled_count = 0usize;
     let mut passed_tests = 0usize;
@@ -453,7 +453,7 @@ fn compress_tsc_or_eslint(cleaned: &str, kind: CommandKind) -> Option<(String, &
         let trim = line.trim();
         let is_keep = match kind {
             CommandKind::Tsc => {
-                // Supports BOTH standard `file(l,c): error TS...` AND `tsc --pretty` `file:l:c - error TS...` (Opus #8!)
+                // Supports both standard `file(l,c): error TS...` and `tsc --pretty` `file:l:c - error TS...`.
                 trim.contains("): error TS")
                     || trim.contains(": error TS")
                     || trim.contains(" - error TS")
@@ -552,7 +552,7 @@ pub fn shape_command_output_with_redaction(
     let cleaned = clean_terminal_noise(raw);
 
     // Without a CAS backing store, keep head + tail (8 KiB + 24 KiB) so failure diagnostics at
-    // the end of long build/test logs are preserved cleanly (Opus #15).
+    // the end of long build/test logs are preserved cleanly.
     let Some(cas) = store else {
         const NO_CAS_WIRE_CAP: usize = 32 * 1024;
         const NO_CAS_HEAD: usize = 8 * 1024;
@@ -601,7 +601,7 @@ pub fn shape_command_output_with_redaction(
         if let Some((mut comp_text, comp_name)) = compressed_opt
             && comp_text.len() * 100 <= cleaned.len() * 80
         {
-            // Store exact RAW bytes in CAS (true bit-exact zero loss — Opus #15!)
+            // Store exact raw bytes in CAS for lossless retrieval.
             let handle = cas.put_bytes(raw.as_bytes())?;
             if comp_text.len() > preview_max_bytes.saturating_mul(2).max(2_400) {
                 let cap = preview_max_bytes.saturating_mul(2).max(2_400);
@@ -640,7 +640,7 @@ pub fn shape_command_output_with_redaction(
         });
     }
 
-    // Store exact RAW bytes in CAS (true bit-exact zero loss — Opus #15!)
+    // Store exact raw bytes in CAS for lossless retrieval.
     let handle = Some(cas.put_bytes(raw.as_bytes())?);
 
     let lines: Vec<&str> = cleaned.lines().collect();

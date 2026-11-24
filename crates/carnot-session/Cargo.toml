@@ -3,6 +3,8 @@ name = "carnot-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Crash-safe append-only branching JSONL session store for Carnot"
 
 [lints]
 workspace = true

@@ -173,7 +173,7 @@ mod imp {
     }
 
     /// Looks up one or more 1-based `(start_line, end_line)` spans for a symbol query
-    /// (`name`, `Type::method`, or `Class.method`) using tree-sitter (inspired by `lythe`).
+    /// (`name`, `Type::method`, or `Class.method`) using tree-sitter.
     pub fn find_symbol_ranges(path: &Path, src: &str, query: &str) -> Vec<(usize, usize)> {
         let Some(lang) = SourceLang::from_path(path) else {
             return Vec::new();

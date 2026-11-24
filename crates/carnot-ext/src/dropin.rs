@@ -1,4 +1,4 @@
-//! Pi-style drop-in file extension host (`carnot-ext/1` JSON-RPC 2.0 over multiplexed stdio).
+//! Out-of-process drop-in file extension host (`carnot-ext/1` JSON-RPC 2.0 over multiplexed stdio).
 //!
 //! Lets users extend the compiled `carnot` binary without recompiling Rust — drop an executable
 //! script (Python, Bun/TS, Bash) or native binary into `~/.carnot/extensions/` or pass `--ext <file>`.

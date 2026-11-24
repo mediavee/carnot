@@ -3,6 +3,8 @@ name = "carnot-ext-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "SSRF-hardened WebFetch and WebSearch extension for Carnot"
 
 [lints]
 workspace = true

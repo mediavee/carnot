@@ -3,6 +3,8 @@ name = "carnot-sandbox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Fail-closed OS sandboxing (macOS Seatbelt, Linux bwrap, and Linux Landlock) for Carnot"
 
 [lints]
 workspace = true

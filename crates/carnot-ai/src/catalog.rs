@@ -1,6 +1,6 @@
 //! Declarative 3-layer Provider & Model data catalog (`providers.json`).
 //!
-//! Separation of concerns (Opus Phase 5 contract):
+//! Separation of concerns:
 //!   1. `api`      = wire protocol adapter (Rust code registered by protocol name ONLY)
 //!   2. `provider` = pure data (`base_url`, `auth_chain`, `headers`, `betas`, `compat`, `usage_map`, `body_patch`)
 //!   3. `model`    = pure data (`pricing`, `effort_map`, capability flags, `compat_override`)

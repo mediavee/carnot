@@ -1,5 +1,5 @@
 {
-  "benchmark": "carnot_v9_two_tier_cache_warm_semantic_compaction_ab",
+  "benchmark": "carnot_two_tier_cache_warm_semantic_compaction_ab",
   "date": "2026-11-22",
   "model": "claude-sonnet-5-5",
   "effort": "low",

@@ -3,6 +3,8 @@ name = "carnot-ext-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Language Server Protocol (LSP) diagnostics and symbol navigation extension for Carnot"
 
 [lints]
 workspace = true

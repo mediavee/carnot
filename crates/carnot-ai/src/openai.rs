@@ -3,7 +3,7 @@
 //! Zero hardcoded provider names, hostnames, or `detect_compat` URL heuristics!
 //! Driven 100% by `CompatFlags`, `UsageMap`, `headers`, and `body_patch` from `providers.json`.
 //!
-//! Full fidelity (Opus Phase 5 fixes):
+//! Protocol fidelity:
 //! - Multimodal user images (`image_url` data URLs) AND automatic `user` bridge message for
 //!   images returned inside `ToolResult` (since the `tool` role only accepts text!).
 //! - Streams `reasoning_content` / `reasoning` deltas -> `ThinkingDelta` + persists `Thinking`

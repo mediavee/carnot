@@ -1,12 +1,12 @@
-//! Hardened embedded HTTP/1.1 + SSE API server over `tokio::net::TcpListener` (Opus C2, N5, N20, I4).
+//! Hardened embedded HTTP/1.1 + SSE API server over `tokio::net::TcpListener`.
 //!
 //! Security & concurrency invariants:
 //!   - Bearer token authentication (`CARNOT_HTTP_TOKEN` or auto-generated 256-bit token saved in
-//!     `~/.carnot/server.token` with mode `0600`) required on all `/v1/*` routes (C2).
+//!     `~/.carnot/server.token` with mode `0600`) required on all `/v1/*` routes.
 //!   - Strict `Host` & `Origin` localhost checks + `Content-Type: application/json` enforcement on
 //!     POST routes (blocks browser CSRF & DNS rebinding).
-//!   - Bounded header count (64), header line size (8 KiB), and 15 s request read timeout (N20).
-//!   - Returns `409 Conflict` if a second `POST /v1/prompt` arrives while a run is active (N5).
+//!   - Bounded header count (64), header line size (8 KiB), and 15 s request read timeout.
+//!   - Returns `409 Conflict` if a second `POST /v1/prompt` arrives while a run is active.
 //!   - Lossless SSE streaming from `EventLog` with `id: <seq>` & `Last-Event-ID` replay on `GET /v1/events`.
 
 use crate::interaction::ChannelInteractionBroker;
@@ -278,7 +278,7 @@ async fn handle_conn(
         return write_json(&mut write_half, status, &json!({"error": msg})).await;
     }
 
-    // Host & Origin anti-CSRF / anti-DNS-rebinding guards (C2)
+    // Host & Origin anti-CSRF / anti-DNS-rebinding guards.
     if let Some(ref h) = host
         && !is_loopback_host(h)
     {
@@ -299,7 +299,7 @@ async fn handle_conn(
         .await;
     }
 
-    // Require Bearer token on all `/v1/*` routes (C2)
+    // Require Bearer token on all `/v1/*` routes.
     let authorized = auth_header
         .as_deref()
         .and_then(|h| {

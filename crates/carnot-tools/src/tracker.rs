@@ -1,6 +1,6 @@
 //! Disk-coherent read tracker using direct BLAKE3 hashing of raw (unnumbered) line slices.
 //!
-//! Fixes Opus findings F3 (no coarse mtime shortcut!) and F4 (stores & diffs raw unnumbered lines
+//! Always validates by content hash (no coarse mtime shortcut) and stores raw unnumbered lines
 //! so line-number shifts never produce bogus full-file diffs).
 
 use similar::TextDiff;
@@ -46,7 +46,7 @@ impl ReadTracker {
         self.files.clear();
     }
 
-    /// Invalidates one path (used when an eager Read is aborted/discarded — fixes Opus N3).
+    /// Invalidates one path (used when an eager Read is aborted or discarded).
     pub fn invalidate(&mut self, path: &Path) {
         self.files.remove(&tracker_key(path));
     }

@@ -25,6 +25,8 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/mediavee/carnot"
+description = "Fast, safe Rust coding-agent harness with prefix-invariant caching and fail-closed OS sandboxing"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

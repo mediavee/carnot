@@ -1,4 +1,4 @@
-//! Lossless monotone-`seq` ring-buffered `EventLog` (Opus I4 + N12 gap signaling).
+//! Lossless monotone-`seq` ring-buffered `EventLog` with explicit ring-gap signaling.
 //!
 //! Replaces `tokio::sync::broadcast(512)` which silently disconnected slow SSE/ACP/RPC
 //! clients on `RecvError::Lagged`. Subscribers read from a 4,096-event ring buffer with
@@ -106,7 +106,7 @@ impl EventLog {
     }
 }
 
-/// Async cursor over `EventLog` — never disconnects on `Lagged` and explicitly signals ring gaps (N12).
+/// Async cursor over `EventLog` — never disconnects on `Lagged` and explicitly signals ring gaps.
 #[derive(Debug)]
 pub struct EventStream {
     log: Arc<EventLog>,
@@ -129,7 +129,7 @@ impl EventStream {
             {
                 let st = self.log.state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(oldest) = st.ring.front() {
-                    // N12 gap detection: emit gap signal even if `cursor == 0` when seq 1 was evicted!
+                    // Emit a gap signal even when `cursor == 0` if seq 1 has already been evicted.
                     if oldest.seq > 1 && self.cursor + 1 < oldest.seq {
                         let dropped = oldest.seq - 1;
                         self.cursor = dropped;

@@ -263,7 +263,7 @@ impl CarnotBuilder {
         self
     }
 
-    /// Adds a Pi-style drop-in file extension path (loaded via JSON-RPC stdio in `build_async`).
+    /// Adds an out-of-process drop-in file extension path (loaded via JSON-RPC stdio in `build_async`).
     pub fn extension(mut self, path: PathBuf) -> Self {
         self.config.extension_paths.push(path);
         self

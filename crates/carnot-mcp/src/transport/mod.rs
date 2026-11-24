@@ -160,7 +160,7 @@ pub fn format_param_header_value(val: &Value) -> Option<String> {
     Some(encode_mcp_header_value(&raw))
 }
 
-/// Picks ONLY from client-implemented modern versions (never an unknown future spec — Opus #11!).
+/// Picks only from client-implemented modern versions (never an unknown future spec).
 fn pick_best_modern_version(supported: &[String]) -> Option<String> {
     SUPPORTED_MODERN_VERSIONS
         .iter()
@@ -190,7 +190,7 @@ fn inject_modern_meta(params: &mut Value, protocol_version: &str) {
             "io.modelcontextprotocol/protocolVersion".into(),
             Value::String(protocol_version.to_string()),
         );
-        // Declare `roots` AND official `io.modelcontextprotocol/tasks` extension (Opus #3!).
+        // Declare `roots` and the official `io.modelcontextprotocol/tasks` extension.
         m.insert(
             "io.modelcontextprotocol/clientCapabilities".into(),
             json!({
@@ -286,7 +286,7 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Connects to a Streamable HTTP MCP server with **0 upfront probe RTTs** (Opus A1 rule):
+    /// Connects to a Streamable HTTP MCP server with zero upfront probe RTTs:
     /// first real request goes directly as `2026-07-28`, falling back to `2025-11-25` only if needed!
     pub async fn connect_http(
         server_name: String,
@@ -465,7 +465,7 @@ impl McpClient {
     }
 
     async fn ensure_legacy_handshake(&self) -> Result<()> {
-        // Serialize concurrent legacy handshakes so 16 parallel calls emit ONLY ONE initialize (Opus #12!)
+        // Serialize concurrent legacy handshakes so parallel calls emit only one initialize.
         let _init_guard = self.legacy_init_lock.lock().await;
         let already = self
             .proto
@@ -475,7 +475,7 @@ impl McpClient {
         if already {
             return Ok(());
         }
-        // Only advertise `roots` on Stdio where server-initiated bidirectional replies work (Opus #4!)
+        // Only advertise `roots` on Stdio where server-initiated bidirectional replies work.
         let caps = match self.inner {
             McpTransportInner::Stdio(_) => json!({ "roots": { "listChanged": false } }),
             McpTransportInner::Http(_) | McpTransportInner::LegacySse(_) => json!({}),
@@ -710,7 +710,7 @@ impl McpClient {
             match status {
                 "working" | "queued" | "pending" => continue,
                 "input_required" => {
-                    // Handle task input_required via `tasks/update` (Opus #3!)
+                    // Handle task input_required via `tasks/update`.
                     input_rounds += 1;
                     if input_rounds > MAX_MRTR_ROUNDS {
                         return Err(CarnotError::Tool {
@@ -804,7 +804,7 @@ impl McpClient {
 
         match first {
             Ok(v) => Ok(v),
-            // Case 0: `-32020 HeaderMismatch` -> invalidate stale cached tool schemas (Opus #14!)
+            // Case 0: `-32020 HeaderMismatch` -> invalidate stale cached tool schemas.
             Err(TransportError::Rpc(ref e)) if e.code == ERR_HEADER_MISMATCH => {
                 crate::cache::invalidate_cached_schema(&self.cache_key);
                 Err(TransportError::Rpc(e.clone()).into_carnot(&self.server_name))
@@ -816,7 +816,7 @@ impl McpClient {
                 crate::cache::invalidate_cached_schema(&self.cache_key);
                 Err(TransportError::Rpc(e.clone()).into_carnot(&self.server_name))
             }
-            // Case 1: `-32022 UnsupportedProtocolVersion` -> retry supported modern version OR fallback to legacy (Opus #11!)
+            // Case 1: `-32022 UnsupportedProtocolVersion` -> retry supported modern version or fallback to legacy.
             Err(TransportError::Rpc(ref e)) if e.code == ERR_UNSUPPORTED_PROTOCOL_VERSION => {
                 let supported = e.supported_versions();
                 if let Some(next_ver) = pick_best_modern_version(&supported) {
@@ -901,7 +901,7 @@ impl McpClient {
                     message: format!("HTTP {status} auth error (cache invalidated): {body}"),
                 })
             }
-            // Case 3 (Opus P0 #1 FIX!): Optimistic modern HTTP hit ANY 4xx whose error body is NOT a
+            // Case 3: Optimistic modern HTTP hit a 4xx whose error body is not a
             // modern spec error (-32020..-32099) and NOT 404+-32601 -> fallback to legacy 2025-11-25!
             // Official TS/Python legacy SDKs return HTTP 400 with JSON-RPC `-32000` / `-32600`!
             Err(TransportError::HttpStatus {
@@ -952,7 +952,7 @@ impl McpClient {
                 .await
                 .map_err(|err| err.into_carnot(&self.server_name))
             }
-            // Case 5 (Opus P1 #2 FIX!): Warm-hinted modern stdio fallback ONLY on the VERY FIRST
+            // Case 5: Warm-hinted modern stdio fallback only on the very first
             // request, ONLY for -32601/-32600, and NEVER replaying non-idempotent `tools/call`!
             Err(TransportError::Rpc(ref e))
                 if matches!(self.inner, McpTransportInner::Stdio(_))

@@ -10,7 +10,7 @@
 //!   - **`WebMode::Local`:** always uses in-process Rust `WebFetch` (SSRF-safe via `carnot_mcp::ssrf`,
 //!     `Accept: text/markdown` negotiation, HTML→Markdown/Text, 2 MiB cap, pre-spill CAS redaction)
 //!     and `WebSearch` (SearXNG/Exa/Tavily/Brave), with `defer_loading: true` (0 static prefix tokens)
-//!     and `ToolEffects::global_read()` (parallel I2 waves).
+//!     and `ToolEffects::global_read()` (parallel read-only waves).
 
 pub mod html;
 pub mod search;

@@ -3,6 +3,8 @@ name = "carnot-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "ACP, JSON-RPC stdio, HTTP/SSE, and host-extension server transports for Carnot"
 
 [lints]
 workspace = true

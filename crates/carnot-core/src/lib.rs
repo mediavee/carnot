@@ -326,7 +326,7 @@ pub fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Effect declaration used by the effect-based parallel scheduler (Opus I2).
+/// Effect declaration used by the effect-based parallel scheduler.
 ///
 /// Enables parallel `Edit`/`Write` on disjoint files, concurrent eager `Read`s & trusted read-only
 /// MCP/WebFetch calls (`global_read`), and strict serialization against overlapping writes & `Bash`.
@@ -338,8 +338,8 @@ pub struct ToolEffects {
     /// Runs concurrently with other reads, but conflicts with ANY write or `serial_barrier`.
     #[serde(default)]
     pub global_read: bool,
-    /// When true, the tool may run in parallel I2 waves AFTER stream completion, but MUST NOT
-    /// launch speculatively mid-stream (e.g. paid `Subagent` calls — Opus #8!).
+    /// When true, the tool may run in parallel read-only waves AFTER stream completion, but MUST NOT
+    /// launch speculatively mid-stream (e.g. paid `Subagent` calls).
     #[serde(default)]
     pub no_eager: bool,
     /// True for tools with global side effects (`Bash`, untrusted/mutating MCP/extensions).
@@ -580,7 +580,7 @@ impl ModelPricing {
         cache_write_1h_mult: 2.0,
     };
 
-    /// Exact pricing for `claude-haiku-4-5` ($1/$5 — Opus #6 fix!).
+    /// Pricing for `claude-haiku-4-5` ($1/$5 per MTok).
     pub const HAIKU_4_5: Self = Self {
         input_per_mtok: 1.0,
         output_per_mtok: 5.0,
@@ -597,7 +597,7 @@ impl ModelPricing {
         cache_write_1h_mult: 2.0,
     };
 
-    /// Exact pricing for `claude-fable-5` / `claude-fable-5-1` ($10/$50 — Opus #6 fix!).
+    /// Pricing for `claude-fable-5` / `claude-fable-5-1` ($10/$50 per MTok).
     pub const FABLE_5_0: Self = Self {
         input_per_mtok: 10.0,
         output_per_mtok: 50.0,
@@ -606,7 +606,7 @@ impl ModelPricing {
         cache_write_1h_mult: 2.0,
     };
 
-    /// Exact pricing for `claude-mythos-*` ($8/$40 — Opus #6 fix!).
+    /// Pricing for `claude-mythos-*` ($8/$40 per MTok).
     pub const MYTHOS: Self = Self {
         input_per_mtok: 8.0,
         output_per_mtok: 40.0,
@@ -941,7 +941,7 @@ impl ThermodynamicMetrics {
     }
 }
 
-/// Sequenced event envelope stored in the lossless ring-buffered `EventLog` (Opus I4).
+/// Sequenced event envelope stored in the lossless ring-buffered `EventLog`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub seq: u64,
@@ -1035,7 +1035,7 @@ pub enum AgentEvent {
         final_text: String,
         metrics: ThermodynamicMetrics,
     },
-    /// Emitted when a subscriber's `after_seq` fell behind the 4,096-event ring buffer (Opus N12).
+    /// Emitted when a subscriber's `after_seq` fell behind the 4,096-event ring buffer.
     EventsTruncated {
         dropped_through_seq: u64,
     },
@@ -1384,7 +1384,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pricing_ratios_match_nov_2026_anthropic_table() {
+    fn pricing_ratios_match_anthropic_cache_breakeven_table() {
         assert!((ModelPricing::OPUS_5_5.breakeven_turns(CacheTtl::Short5m) - 25.0).abs() < 1e-6);
         assert!((ModelPricing::OPUS_5_5.breakeven_turns(CacheTtl::Long1h) - 40.0).abs() < 1e-6);
         assert!((ModelPricing::FABLE_5_2.breakeven_turns(CacheTtl::Short5m) - 50.0).abs() < 1e-6);

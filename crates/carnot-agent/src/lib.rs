@@ -1,7 +1,7 @@
 //! Core asynchronous agent loop with:
-//!   - Opus I2 Effect-Based Parallel Scheduler (gate-before-eager reads + parallel disjoint `Edit`/`Write`
+//!   - Effect-Based Parallel Scheduler (gate-before-eager reads + parallel disjoint `Edit`/`Write`
 //!     + strict causal ordering on overlapping paths & `Bash` barriers)
-//!   - Opus I4 Lossless monotone-`seq` `EventLog` (immune to slow-reader `Lagged` disconnects)
+//!   - Lossless monotone-`seq` `EventLog` (immune to slow-reader `Lagged` disconnects)
 //!   - Mid-turn `steer()` injection preserving `tool_result`-first ordering
 //!   - Safe `StopReason` (`MaxTokens`, `Refusal`, `ContextWindowExceeded`) & malformed tool-JSON guards
 //!   - Module lifecycle orchestration and live thermodynamic telemetry
@@ -465,7 +465,7 @@ impl Agent {
     }
 
     /// Loads an existing session file into this running `Agent` (used by ACP `session/load`).
-    /// Fails immediately if a prompt is currently running so ACP stdin never deadlocks (Opus #7).
+    /// Fails immediately if a prompt is currently running so ACP stdin never deadlocks.
     pub async fn load_session(&self, session_path: &Path) -> Result<String> {
         let Ok(_guard) = self.run_lock.try_lock() else {
             return Err(CarnotError::Session(
@@ -653,7 +653,7 @@ impl Agent {
         self.events.push(event);
     }
 
-    /// True if a `prompt()` run is currently active (used by HTTP server to return 409 Conflict — N5).
+    /// True if a `prompt()` run is currently active (used by HTTP server to return 409 Conflict).
     pub fn is_busy(&self) -> bool {
         self.run_lock.try_lock().is_err()
     }
@@ -913,7 +913,7 @@ impl Agent {
 
     fn discard_eager_launches(&self, eager_launches: HashMap<String, EagerLaunch>) {
         // Abort speculative tasks AND invalidate their ReadTracker entries so next Read never returns
-        // a false "unchanged" stub for outputs the model never saw (fixes Opus N3!).
+        // a false "unchanged" stub for outputs the model never saw.
         for (_, launch) in eager_launches {
             if let Some(jh) = launch.handle {
                 jh.abort();
@@ -925,7 +925,7 @@ impl Agent {
     }
 
     /// Runs a user text prompt through the full multi-turn agent loop until completion or halt.
-    /// Serialized per agent (N5) and guaranteed to always emit a terminal `RunSettled` or `Error` event (N8).
+    /// Serialized per agent and guaranteed to always emit a terminal `RunSettled` or `Error` event.
     pub async fn prompt(&self, user_prompt: impl Into<String>) -> Result<RunOutcome> {
         self.prompt_with_cancel(user_prompt, CancellationToken::new())
             .await
@@ -1519,7 +1519,7 @@ impl Agent {
             }
             consecutive_stream_retries = 0;
 
-            // Context window overflow reported as stop_reason -> abort eager & compact at most once (N10)
+            // Context window overflow reported as stop_reason -> abort eager & compact at most once.
             if stop_reason == StopReason::ContextWindowExceeded
                 && self.config.modules.compaction
                 && consecutive_emergency_compactions < 1
@@ -1534,7 +1534,7 @@ impl Agent {
             }
             consecutive_emergency_compactions = 0;
 
-            // Record usage & live thermodynamic AUC + structured cache telemetry (Opus #1!)
+            // Record usage & live thermodynamic AUC + structured cache telemetry.
             {
                 let mut m = self.metrics.lock().await;
                 m.context_auc_tokens += usage.total_context_tokens();
@@ -1576,7 +1576,7 @@ impl Agent {
             }
 
             // Never execute partial/truncated tool calls on MaxTokens or Refusal — AND pair any
-            // truncated `tool_use` blocks with `is_error` `tool_result`s so the session stays valid (N2)!
+            // truncated `tool_use` blocks with `is_error` `tool_result`s so the session stays valid.
             if matches!(stop_reason, StopReason::MaxTokens | StopReason::Refusal) {
                 self.discard_eager_launches(eager_launches);
                 let mut recovery_blocks: Vec<ContentBlock> = assistant_msg
@@ -1667,7 +1667,7 @@ impl Agent {
                 let mut pending_calls: Vec<ScheduledCall> = Vec::new();
                 let mut active_eager: Vec<ActiveEager> = Vec::new();
 
-                // Phase 1: Gate non-eager calls, reject malformed JSON, classify into eager vs wave queue
+                // Stage 1: Gate non-eager calls, reject malformed JSON, classify into eager vs wave queue.
                 for (idx, (call_id, tool_name, raw_input, invalid_json)) in
                     tool_calls.iter().enumerate()
                 {
@@ -1777,10 +1777,10 @@ impl Agent {
                     });
                 }
 
-                // Abort any stray eager handles not present in final assistant message & invalidate tracker (N3)
+                // Abort any stray eager handles not present in final assistant message & invalidate tracker.
                 self.discard_eager_launches(eager_launches);
 
-                // Phase 2 (Opus I2): Partition pending calls into conflict-free parallel waves!
+                // Stage 2: Partition pending calls into conflict-free parallel waves.
                 let waves = partition_conflict_free_waves(pending_calls);
 
                 // Execute each wave concurrently (awaiting any conflicting eager reads first!)
@@ -1847,7 +1847,7 @@ impl Agent {
                     outputs[ae.orig_idx] = Some((ae.effective_input, out, dur));
                 }
 
-                // Phase 3: Run `after_tool_result` hooks, emit `ToolEnd`, and build ordered `ToolResult`s
+                // Stage 3: Run `after_tool_result` hooks, emit `ToolEnd`, and build ordered `ToolResult`s.
                 let mut result_blocks = Vec::with_capacity(tool_calls.len());
                 for (idx, (call_id, tool_name, _, _)) in tool_calls.into_iter().enumerate() {
                     let (effective_input, mut out, dur_ms) =

@@ -1,4 +1,4 @@
-//! Modular, zero-hardcode multi-provider streaming wire layer (Phase 5):
+//! Modular, zero-hardcode multi-provider streaming wire layer:
 //!   - 3-layer separation: `api` (code adapters) / `provider` (data in `providers.json`) / `model` (data)
 //!   - 7 registered protocol adapters: `anthropic-messages`, `openai-completions`, `openai-responses`,
 //!     `google-generative`, `google-cloudcode`, `subprocess-jsonl`, `faux`

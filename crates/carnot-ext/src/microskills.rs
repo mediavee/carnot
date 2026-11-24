@@ -1,6 +1,6 @@
 //! Execution-verified Turn-1 repo micro-skills + `AGENTS.md`/`CLAUDE.md`/`.carnot/skills/*.md` loader.
 //!
-//! Hardened against Opus N14:
+//! Security & performance invariants:
 //!   - Runs off the async runtime in `tokio::task::spawn_blocking`
 //!   - Checks toolchain availability on `PATH` (ZERO untrusted repo binary execution!)
 //!   - Uses `host_safe_git_command` (`-c core.fsmonitor=false -c core.hooksPath=/dev/null`)
@@ -58,7 +58,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 }
 
 fn read_confined_markdown(root: &Path, path: &Path) -> Option<String> {
-    // Reject symlinks escaping workspace root (fixes Opus #11: `.carnot/skills/a.md -> ~/.aws/credentials`)
+    // Reject symlinks escaping workspace root (e.g. `.carnot/skills/a.md -> ~/.aws/credentials`).
     let meta = fs::symlink_metadata(path).ok()?;
     if meta.file_type().is_symlink() {
         return None;
@@ -292,7 +292,7 @@ fn load_agent_skills(root: &Path, extra_dirs: &[PathBuf]) -> Option<String> {
     }
 }
 
-/// Pure-Rust bounded project file overview (inspired by `lythe`: 0 subprocesses, ~0.3ms,
+/// Pure-Rust bounded project file overview (0 subprocesses, ~0.3 ms,
 /// injected ONLY into Turn-1 user context so the static cached prefix stays 100% invariant!).
 fn build_project_overview(root: &Path) -> (Option<String>, bool) {
     let mut files: Vec<String> = Vec::new();

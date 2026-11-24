@@ -1,6 +1,6 @@
 //! Declarative `.mcp.json` configuration loader with MCPoison RCE & secret-exfiltration guards.
 //!
-//! Security invariants (Opus architectural review):
+//! Security invariants:
 //!   - Workspace-local `.mcp.json` is NEVER auto-executed unless explicitly approved (`trust_workspace_mcp`
 //!     or hash-pinned in `~/.carnot/trusted-mcp.json`).
 //!   - Rejects relative binary paths (`./node_modules/.bin/x`, `../foo`) on workspace configs.
@@ -53,7 +53,7 @@ pub struct StdioServerConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Only trusted servers may declare `annotations.readOnlyHint == true` for I2 parallel execution.
+    /// Only trusted servers may declare `annotations.readOnlyHint == true` for parallel execution.
     #[serde(default)]
     pub trusted: bool,
     /// When true (default), server is only spawned on first `tools/call` if disk schema cache is warm.
@@ -84,7 +84,7 @@ pub struct HttpServerConfig {
     /// Optional one-line summary advertised in the Turn-1 deferred-tools directory.
     #[serde(default)]
     pub description: Option<String>,
-    /// Set automatically when loaded from a workspace `.mcp.json` (enforces SSRF per server — fixes Opus #5!).
+    /// Set automatically when loaded from a workspace `.mcp.json` (enforces per-server SSRF validation).
     #[serde(skip)]
     pub from_workspace: bool,
 }
@@ -154,7 +154,7 @@ impl McpServerConfig {
     }
 
     /// Hash of effective expanded auth material (used to isolate `cacheScope: "private"` entries
-    /// across rotated tokens or different authorization contexts — Opus MCP 2026-07-28 rule!).
+    /// across rotated tokens or different authorization contexts per MCP 2026-07-28.
     pub fn auth_scope_hash(&self) -> String {
         match self {
             Self::Stdio(_) => "stdio-local".into(),

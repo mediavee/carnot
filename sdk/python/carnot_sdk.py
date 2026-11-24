@@ -153,7 +153,7 @@ class CarnotClient:
 
 class CarnotExtension:
     """
-    Base class for Pi-style drop-in Carnot file extensions (`carnot-ext/1` over stdio).
+    Base class for drop-in Carnot file extensions (`carnot-ext/1` over stdio).
 
     Drop an executable script into `~/.carnot/extensions/` or pass `--ext ./my_ext.py`.
     Only hooks you actually override are advertised in `ext/init` (zero IPC on unused hooks),

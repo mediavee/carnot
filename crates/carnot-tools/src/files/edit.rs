@@ -385,7 +385,7 @@ impl Tool for EditTool {
                     }
                 }
 
-                // Store atomic CAS snapshot for instant undo (`undo_last_edit`) — fail-closed if snapshot fails (Opus #9!)
+                // Store atomic CAS snapshot for instant undo (`undo_last_edit`) — fail-closed if snapshot fails.
                 let undo_hash = match cas.put_bytes(before.as_bytes()) {
                     Ok(h) => h.hash,
                     Err(e) => {
@@ -437,7 +437,7 @@ impl Tool for EditTool {
     }
 }
 
-/// 4-tier anti-retry Edit matcher (Opus #2 — Codex `seek_sequence` + Aider relative re-indent):
+/// 4-tier resilient Edit matcher (exact -> line-trimmed -> whitespace-collapsed -> relative re-indent):
 ///   1. Exact match (with CRLF normalization)
 ///   2. Unique trailing-whitespace (`rstrip`) normalized match (NEVER applied if >1 match!)
 ///   3. Unique indentation-trimmed (`trim`) match with automatic relative re-indentation of `new_string`
@@ -452,7 +452,7 @@ pub(super) fn apply_resilient_hunk(
     let uses_crlf = content.contains("\r\n");
     let eol = if uses_crlf { "\r\n" } else { "\n" };
 
-    // Tier 1: Exact match (with CRLF normalization for BOTH old_s AND new_s — Opus #17!)
+    // Tier 1: Exact match (with CRLF normalization for both old_s and new_s).
     let eff_old = if uses_crlf && !old_s.contains("\r\n") && !content.contains(old_s) {
         old_s.replace('\n', "\r\n")
     } else {
@@ -481,7 +481,7 @@ pub(super) fn apply_resilient_hunk(
 
     // Tier 2 & 3 only apply when `replace_all == false` and match is STRICTLY UNIQUE!
     if !replace_all {
-        // Strip a single trailing newline from `old_s`/`new_s` so trailing-LF needles match cleanly (Opus #18!)
+        // Strip a single trailing newline from `old_s`/`new_s` so trailing-LF needles match cleanly.
         let trimmed_old = old_s
             .strip_suffix("\r\n")
             .or_else(|| old_s.strip_suffix('\n'))

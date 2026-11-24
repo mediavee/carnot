@@ -119,7 +119,7 @@ impl StdioActor {
             let mut buf = Vec::with_capacity(4096);
             loop {
                 buf.clear();
-                // Bound line read BEFORE allocating >16 MiB (Opus #13 anti-OOM!)
+                // Bound line read before allocating >16 MiB to prevent OOM.
                 let n = (&mut reader)
                     .take((MAX_WIRE_MESSAGE_BYTES + 1) as u64)
                     .read_until(b'\n', &mut buf)

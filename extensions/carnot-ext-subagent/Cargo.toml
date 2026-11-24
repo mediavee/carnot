@@ -3,6 +3,8 @@ name = "carnot-ext-subagent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Disposable-context parallel subagent extension for Carnot"
 
 [lints]
 workspace = true

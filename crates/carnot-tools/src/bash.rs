@@ -1,11 +1,11 @@
-//! Adaptive-Yield Sandboxed Shell (`Bash`) + Background `JobRegistry` — hardened (Opus B1–B6):
-//!   - `watch::channel<Option<i32>>` eliminates lost-wakeup race on fast commands (B1)
+//! Adaptive-Yield Sandboxed Shell (`Bash`) + Background `JobRegistry`:
+//!   - `watch::channel<Option<i32>>` eliminates lost-wakeup races on fast commands
 //!   - Live streaming chunked stdout/stderr into bounded 8 MiB ring/head+tail buffer so polling
-//!     a yielded job returns partial output immediately (B2)
-//!   - 500 ms post-exit pipe drain grace so backgrounded grandchildren (`sleep 8 &`) never hang (B3)
-//!   - Entire process-group SIGTERM/SIGKILL cleanup without `unsafe` (`kill -KILL -<pgid>`) (B4)
-//!   - Signal exit codes reported as `128 + sig`, saturating timeout arithmetic (B5)
-//!   - Finished jobs pruned on collection & bounded to 64 retained entries (B6)
+//!     a yielded job returns partial output immediately
+//!   - 500 ms post-exit pipe drain grace so backgrounded grandchildren (`sleep 8 &`) never hang
+//!   - Entire process-group SIGTERM/SIGKILL cleanup without `unsafe` (`kill -KILL -<pgid>`)
+//!   - Signal exit codes reported as `128 + sig`, saturating timeout arithmetic
+//!   - Finished jobs pruned on collection and bounded to 64 retained entries
 
 use crate::files::resolve_confined_path;
 use crate::{BoxFuture, Tool};
@@ -26,7 +26,7 @@ const MAX_RETAINED_JOBS: usize = 64;
 
 #[derive(Debug, Default)]
 struct BoundedOutput {
-    /// Raw unread byte ring (O(1) front eviction capped at `MAX_JOB_BUFFER_BYTES` — fixes B3 & N15!)
+    /// Raw unread byte ring (O(1) front eviction capped at `MAX_JOB_BUFFER_BYTES`).
     pending_bytes: std::collections::VecDeque<u8>,
     omitted_bytes: usize,
 }
@@ -87,7 +87,7 @@ impl JobRegistry {
         *c += 1;
         let id = format!("job-{}", *c);
         let mut map = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        // Evict oldest finished jobs if cap exceeded (B6)
+        // Evict oldest finished jobs if cap exceeded.
         if map.len() >= MAX_RETAINED_JOBS {
             let finished: Vec<String> = map
                 .iter()
@@ -513,7 +513,7 @@ impl Tool for BashTool {
                     }
                 };
 
-                // Drain stdout/stderr up to 500 ms so backgrounded grandchildren never hang Bash (B3)!
+                // Drain stdout/stderr up to 500 ms so backgrounded grandchildren never hang Bash.
                 let out_abort = out_task.abort_handle();
                 let err_abort = err_task.abort_handle();
                 let drain = async {
@@ -531,7 +531,7 @@ impl Tool for BashTool {
                 let _ = exit_tx.send(Some(exit));
             });
 
-            // Wait up to `yield_ms` via watch::Receiver (zero lost wakeup — B1!)
+            // Wait up to `yield_ms` via watch::Receiver (zero lost wakeup).
             let mut wait_rx = exit_rx;
             let waited_done = tokio::select! {
                 _ = cancel.cancelled() => {

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 /// Detects binary raster image formats by magic bytes (PNG, JPEG, GIF87a/89a, WebP).
-/// SVG stays plain UTF-8 text per Opus multimodal spec.
+/// SVG stays plain UTF-8 text so models can inspect and edit it directly.
 pub(super) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" {
         Some("image/png")
@@ -134,7 +134,7 @@ pub(super) fn effect_key_path(
 ) -> Option<PathBuf> {
     let raw = input.get("file_path").and_then(Value::as_str)?;
     let resolved = resolve_confined_path(workspace_root, extra_roots, raw).ok()?;
-    // On case-insensitive filesystems (macOS APFS / Windows), fold ASCII case so `Foo.rs` and `foo.rs` conflict (N19).
+    // On case-insensitive filesystems (macOS APFS / Windows), fold ASCII case so `Foo.rs` and `foo.rs` conflict.
     if cfg!(any(target_os = "macos", target_os = "windows")) {
         Some(PathBuf::from(
             resolved.to_string_lossy().to_ascii_lowercase(),
@@ -144,7 +144,7 @@ pub(super) fn effect_key_path(
     }
 }
 
-/// Symlink-safe, permission-preserving atomic write with temp cleanup on failure (F6).
+/// Symlink-safe, permission-preserving atomic write with temp cleanup on failure.
 pub(super) fn atomic_write_confined(
     workspace_root: &Path,
     extra_roots: &[PathBuf],
@@ -191,7 +191,7 @@ pub(super) fn atomic_write_confined(
     Ok(())
 }
 
-/// Atomic byte write (`tmp + sync_all + rename`) preserving permissions (used by CAS Undo — Opus #19!).
+/// Atomic byte write (`tmp + sync_all + rename`) preserving permissions (used by CAS undo).
 pub(crate) fn atomic_write_raw_bytes(target: &Path, bytes: &[u8]) -> Result<()> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let existing_perms = fs::metadata(target).ok().map(|m| m.permissions());

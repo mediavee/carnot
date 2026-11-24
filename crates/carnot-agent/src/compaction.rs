@@ -520,7 +520,7 @@ pub(crate) async fn execute_compaction(
         (tok, cnt)
     };
 
-    // Invoke `Module::before_compact` hooks (Pi-style extensibility; EmergencyOverflow cannot be vetoed)
+    // Invoke `Module::before_compact` hooks (`EmergencyOverflow` cannot be vetoed)
     let mut focus_parts: Vec<String> = Vec::new();
     if let Some(f) = custom_focus.map(str::trim).filter(|s| !s.is_empty()) {
         focus_parts.push(f.to_string());
