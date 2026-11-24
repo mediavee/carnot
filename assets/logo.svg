@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="Carnot">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1C2029"/>
+      <stop offset="100%" stop-color="#0D1017"/>
+    </linearGradient>
+    <linearGradient id="ember" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFB156"/>
+      <stop offset="100%" stop-color="#EE4B1F"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="22" fill="url(#bg)"/>
+  <rect x="0.75" y="0.75" width="94.5" height="94.5" rx="21.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="1.5"/>
+  <path d="M68 31.5 L48 20 L24 34 L24 62 L48 76 L68 64.5" fill="none" stroke="#F4F6FA" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <polygon points="56,37 68,48 56,59 44,48" fill="url(#ember)"/>
+</svg>

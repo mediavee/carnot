@@ -1,0 +1,74 @@
+{
+  "benchmark": "carnot_two_tier_cache_warm_semantic_compaction_ab",
+  "date": "2026-11-22",
+  "model": "claude-sonnet-5-5",
+  "effort": "low",
+  "protocol": "Identical 4-phase resumed session (--resume) over 10 bulky clearing log shards (~240 KB) with 5 buried directives + Phase-1 anchored schema constraints, verified against 14 strict assertions.",
+  "arm_a": {
+    "label": "no_compact",
+    "compact_at": 0,
+    "score": "14/14",
+    "passed_all": true,
+    "failed_checks": [],
+    "requests": 20,
+    "wall_s": 69.7,
+    "peak_ctx_est": 74112,
+    "total_cost_usd": 0.7475,
+    "context_auc_tokens": 2660304,
+    "output_tokens": 9347,
+    "cache_hit_pct": 93.95,
+    "compactions": [],
+    "compaction_call_cache_hit_pct": null,
+    "compaction_call_cache_write_tokens": null,
+    "compaction_call_cost_usd": null,
+    "phase2_3_read_calls": 1,
+    "phases": {
+      "phase1": { "reqs": 11, "cost_usd": 0.5279, "auc": 1231481 },
+      "phase2": { "reqs": 4, "cost_usd": 0.0879, "auc": 626355 },
+      "phase3": { "reqs": 2, "cost_usd": 0.0421, "auc": 317386 },
+      "phase4": { "reqs": 3, "cost_usd": 0.0896, "auc": 485082 }
+    }
+  },
+  "arm_b": {
+    "label": "semantic_compact",
+    "compact_at": 30000,
+    "score": "14/14",
+    "passed_all": true,
+    "failed_checks": [],
+    "requests": 18,
+    "wall_s": 75.3,
+    "peak_ctx_est": 55422,
+    "total_cost_usd": 0.5593,
+    "context_auc_tokens": 593369,
+    "output_tokens": 10116,
+    "cache_hit_pct": 72.55,
+    "compactions": [
+      {
+        "seq": 44,
+        "event": "compaction_applied",
+        "mode": "soft",
+        "tokens_before": 68775,
+        "tokens_after": 3059,
+        "semantic_llm": true
+      }
+    ],
+    "compaction_call_cache_hit_pct": 80.31,
+    "compaction_call_cache_write_tokens": 29811,
+    "compaction_call_cost_usd": 0.116,
+    "phase2_3_read_calls": 0,
+    "phases": {
+      "phase1": { "reqs": 10, "cost_usd": 0.486, "auc": 495838 },
+      "phase2": { "reqs": 3, "cost_usd": 0.0233, "auc": 30920 },
+      "phase3": { "reqs": 2, "cost_usd": 0.0124, "auc": 23558 },
+      "phase4": { "reqs": 3, "cost_usd": 0.0375, "auc": 43053 }
+    }
+  },
+  "summary": {
+    "total_cost_delta_pct": -25.2,
+    "post_compaction_cost_delta_pct": -66.7,
+    "total_auc_delta_pct": -77.7,
+    "post_compaction_auc_delta_pct": -93.2,
+    "context_compression_pct": -95.6,
+    "redundant_rereads_delta": -1
+  }
+}

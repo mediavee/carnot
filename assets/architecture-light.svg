@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 256" width="760" height="256" role="img" aria-label="Carnot 3-layer architecture">
+  <defs>
+    <style>
+      .frame { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
+      .band { fill: #f6f8fa; stroke: #d8dee4; stroke-width: 1; }
+      .band-core { fill: #fff8f5; stroke: #E54D2E; stroke-opacity: 0.45; stroke-width: 1.2; }
+      .chip { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
+      .tag { fill: #656d76; font: 600 10px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; letter-spacing: 0.08em; }
+      .tag-hi { fill: #D93818; font: 600 10px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; letter-spacing: 0.08em; }
+      .name { fill: #1f2328; font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .desc { fill: #57606a; font: 400 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .arrow { stroke: #afb8c1; stroke-width: 1.5; fill: none; }
+    </style>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="759" height="255" rx="12"/>
+
+  <!-- Layer 1: Surfaces -->
+  <rect class="band" x="18" y="16" width="724" height="62" rx="9"/>
+  <text class="tag" x="30" y="33">SURFACES</text>
+  <rect class="chip" x="30" y="41" width="132" height="28" rx="6"/>
+  <text class="name" x="96" y="59" text-anchor="middle">TUI &amp; CLI</text>
+  <rect class="chip" x="172" y="41" width="132" height="28" rx="6"/>
+  <text class="name" x="238" y="59" text-anchor="middle">IDE (ACP stdio)</text>
+  <rect class="chip" x="314" y="41" width="132" height="28" rx="6"/>
+  <text class="name" x="380" y="59" text-anchor="middle">Host RPC</text>
+  <rect class="chip" x="456" y="41" width="132" height="28" rx="6"/>
+  <text class="name" x="522" y="59" text-anchor="middle">HTTP / SSE</text>
+  <rect class="chip" x="598" y="41" width="132" height="28" rx="6"/>
+  <text class="name" x="664" y="59" text-anchor="middle">Rust SDK</text>
+
+  <line class="arrow" x1="380" y1="78" x2="380" y2="94"/>
+
+  <!-- Layer 2: Core Engine -->
+  <rect class="band-core" x="18" y="94" width="724" height="72" rx="9"/>
+  <text class="tag-hi" x="30" y="111">CORE ENGINE · #![forbid(unsafe_code)]</text>
+  <rect class="chip" x="30" y="119" width="166" height="38" rx="6"/>
+  <text class="name" x="113" y="136" text-anchor="middle">Agent &amp; Scheduler</text>
+  <text class="desc" x="113" y="150" text-anchor="middle">Parallel effects · EventLog</text>
+
+  <rect class="chip" x="206" y="119" width="166" height="38" rx="6"/>
+  <text class="name" x="289" y="136" text-anchor="middle">5 Tools + CAS</text>
+  <text class="desc" x="289" y="150" text-anchor="middle">Read · Edit · Write · Grep · Bash</text>
+
+  <rect class="chip" x="382" y="119" width="166" height="38" rx="6"/>
+  <text class="name" x="465" y="136" text-anchor="middle">Session &amp; Cache</text>
+  <text class="desc" x="465" y="150" text-anchor="middle">Invariant prefix · Compaction</text>
+
+  <rect class="chip" x="558" y="119" width="172" height="38" rx="6"/>
+  <text class="name" x="644" y="136" text-anchor="middle">OS Sandbox</text>
+  <text class="desc" x="644" y="150" text-anchor="middle">Seatbelt · bwrap · Landlock</text>
+
+  <line class="arrow" x1="380" y1="166" x2="380" y2="182"/>
+
+  <!-- Layer 3: Pluggable Providers & Extensions -->
+  <rect class="band" x="18" y="182" width="724" height="58" rx="9"/>
+  <text class="tag" x="30" y="199">PLUGGABLE PROVIDERS &amp; EXTENSIONS</text>
+  <rect class="chip" x="30" y="207" width="166" height="24" rx="6"/>
+  <text class="desc" x="113" y="223" text-anchor="middle">Data-driven providers.json</text>
+  <rect class="chip" x="206" y="207" width="166" height="24" rx="6"/>
+  <text class="desc" x="289" y="223" text-anchor="middle">MCP (2026-07-28 · SSE)</text>
+  <rect class="chip" x="382" y="207" width="194" height="24" rx="6"/>
+  <text class="desc" x="479" y="223" text-anchor="middle">web · lsp · subagent · memory · hooks</text>
+  <rect class="chip" x="586" y="207" width="144" height="24" rx="6"/>
+  <text class="desc" x="658" y="223" text-anchor="middle">Drop-in ext &amp; Plugins</text>
+</svg>

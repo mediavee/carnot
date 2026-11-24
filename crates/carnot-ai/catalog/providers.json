@@ -1,0 +1,805 @@
+{
+  "schema_version": 1,
+  "providers": {
+    "anthropic": {
+      "api": "anthropic-messages",
+      "aliases": ["claude"],
+      "description": "Anthropic Messages API (Claude 4.x / 5.x, direct x-api-key or Bearer gateway)",
+      "base_url": "https://api.anthropic.com",
+      "base_url_envs": ["ANTHROPIC_BASE_URL"],
+      "default_model": "claude-sonnet-5-5",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "ANTHROPIC_AUTH_TOKEN" },
+        { "scheme": "x-api-key", "env": "ANTHROPIC_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "headers": {
+        "anthropic-version": "2023-06-01"
+      },
+      "betas": [],
+      "cache_diagnosis_beta": "cache-diagnosis-2026-04-07",
+      "native_tool_search": true,
+      "compat": {
+        "supports_prompt_cache_key": false,
+        "supports_eager_input_streaming": true,
+        "requires_thinking_signature": true,
+        "supports_native_web_search": true,
+        "supports_native_web_fetch": true,
+        "native_web_fetch_beta": "web-fetch-2025-09-10"
+      }
+    },
+    "openai": {
+      "api": "openai-completions",
+      "aliases": ["gpt"],
+      "description": "OpenAI Chat Completions API",
+      "base_url": "https://api.openai.com/v1",
+      "base_url_envs": ["OPENAI_BASE_URL"],
+      "default_model": "gpt-5.4",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "OPENAI_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_completion_tokens",
+        "supports_developer_role": true,
+        "supports_reasoning_effort": true,
+        "supports_xhigh_reasoning": true,
+        "supports_prompt_cache_key": true,
+        "supports_prompt_cache_retention": true,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "openai-responses": {
+      "api": "openai-responses",
+      "aliases": ["responses", "codex"],
+      "description": "OpenAI Stateless Responses API (encrypted reasoning replay, store=false)",
+      "base_url": "https://api.openai.com/v1",
+      "base_url_envs": ["OPENAI_BASE_URL"],
+      "default_model": "gpt-5.4",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "OPENAI_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "store": false,
+        "include_encrypted_reasoning": true,
+        "supports_reasoning_effort": true,
+        "supports_xhigh_reasoning": true,
+        "supports_prompt_cache_key": true,
+        "supports_prompt_cache_retention": true,
+        "supports_native_web_search": true,
+        "supports_native_web_fetch": true
+      }
+    },
+    "grok": {
+      "api": "openai-completions",
+      "aliases": ["xai"],
+      "description": "xAI Grok API (OpenAI-compatible endpoint with sticky conversation routing)",
+      "base_url": "https://api.x.ai/v1",
+      "base_url_envs": ["XAI_BASE_URL", "GROK_BASE_URL"],
+      "default_model": "grok-4",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "XAI_API_KEY" },
+        { "scheme": "bearer", "env": "GROK_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_completion_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "session_id_header": "x-grok-conv-id",
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "muse": {
+      "api": "openai-completions",
+      "aliases": ["meta", "llama", "muse-code"],
+      "description": "Meta / Muse OpenAI-compatible API (override base_url via MUSE_BASE_URL or switch to subprocess-jsonl in ~/.carnot/providers.json)",
+      "base_url": "https://api.llama.com/compat/v1",
+      "base_url_envs": ["MUSE_BASE_URL", "META_BASE_URL", "LLAMA_BASE_URL"],
+      "default_model": "Llama-4-Maverick-17B-128E-Instruct-FP8",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "MUSE_API_KEY" },
+        { "scheme": "bearer", "env": "META_API_KEY" },
+        { "scheme": "bearer", "env": "LLAMA_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_completion_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "gemini": {
+      "api": "google-generative",
+      "aliases": ["google", "google-gemini"],
+      "description": "Google Gemini Generative Language API (native SSE + thoughtSignature replay)",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "base_url_envs": ["GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL"],
+      "default_model": "gemini-3-pro-preview",
+      "auth_chain": [
+        { "scheme": "header", "header_name": "x-goog-api-key", "env": "GEMINI_API_KEY" },
+        { "scheme": "header", "header_name": "x-goog-api-key", "env": "GOOGLE_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "oauth": {
+        "flow": "pkce",
+        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "client_id_env": "GEMINI_OAUTH_CLIENT_ID",
+        "client_secret_env": "GEMINI_OAUTH_CLIENT_SECRET",
+        "scopes": [
+          "https://www.googleapis.com/auth/generative-language.retriever",
+          "https://www.googleapis.com/auth/cloud-platform"
+        ],
+        "extra_auth_params": {
+          "access_type": "offline",
+          "prompt": "consent"
+        }
+      },
+      "compat": {
+        "thinking_style": "level",
+        "include_thoughts": true,
+        "sanitize_tool_schemas": false,
+        "supports_native_web_search": true,
+        "supports_native_web_fetch": true
+      }
+    },
+    "antigravity": {
+      "api": "google-cloudcode",
+      "aliases": ["google-antigravity", "agy"],
+      "description": "Google Cloud Code / Antigravity envelope adapter (daily->prod fallback, schema sanitizer)",
+      "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+      "fallback_base_urls": [
+        "https://cloudcode-pa.googleapis.com"
+      ],
+      "base_url_envs": ["ANTIGRAVITY_BASE_URL"],
+      "project_env": "ANTIGRAVITY_PROJECT_ID",
+      "default_model": "gemini-3-pro-high",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "ANTIGRAVITY_ACCESS_TOKEN" },
+        { "scheme": "bearer", "env": "ANTIGRAVITY_API_KEY" }
+      ],
+      "headers": {
+        "User-Agent": "antigravity/1.15.8 darwin/arm64",
+        "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+        "Client-Metadata": "{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}"
+      },
+      "compat": {
+        "thinking_style": "level",
+        "include_thoughts": true,
+        "sanitize_tool_schemas": true,
+        "envelope_request_type": "agent",
+        "envelope_user_agent": "antigravity",
+        "system_preamble": "You are Antigravity, a powerful agentic AI coding assistant designed by the Google DeepMind team."
+      }
+    },
+    "openrouter": {
+      "api": "openai-completions",
+      "aliases": ["or"],
+      "description": "OpenRouter unified gateway (OAuth PKCE login + Anthropic/Gemini prompt cache_control breakpoints)",
+      "base_url": "https://openrouter.ai/api/v1",
+      "base_url_envs": ["OPENROUTER_BASE_URL"],
+      "default_model": "anthropic/claude-sonnet-4.5",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "OPENROUTER_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "oauth": {
+        "flow": "pkce_key_exchange",
+        "authorize_url": "https://openrouter.ai/auth",
+        "exchange_url": "https://openrouter.ai/api/v1/auth/keys"
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "reasoning_object_effort": true,
+        "supports_prompt_cache_key": false,
+        "supports_cache_control": true,
+        "cache_control_model_prefixes": ["anthropic/", "google/gemini"],
+        "supports_cache_control_1h_ttl": true,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "cache_write_ptr": "/prompt_tokens_details/cache_write_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "deepseek": {
+      "api": "openai-completions",
+      "aliases": ["ds"],
+      "description": "DeepSeek API (preserves reasoning_content across tool loops, top-level cache hit tokens)",
+      "base_url": "https://api.deepseek.com/v1",
+      "base_url_envs": ["DEEPSEEK_BASE_URL"],
+      "default_model": "deepseek-reasoner",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "DEEPSEEK_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "requires_reasoning_content_on_assistant_messages": true,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_cache_hit_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "ollama": {
+      "api": "openai-completions",
+      "aliases": ["local"],
+      "description": "Local Ollama OpenAI-compatible server (forces num_ctx=65536 to prevent silent prompt truncation)",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "base_url_envs": ["OLLAMA_BASE_URL"],
+      "default_model": "qwen3-coder",
+      "auth_chain": [
+        { "scheme": "none" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "body_patch": {
+        "options": { "num_ctx": 65536 }
+      }
+    },
+    "groq": {
+      "api": "openai-completions",
+      "aliases": ["groqcloud"],
+      "description": "Groq ultra-low-latency inference API (OpenAI-compatible)",
+      "base_url": "https://api.groq.com/openai/v1",
+      "base_url_envs": ["GROQ_BASE_URL"],
+      "default_model": "llama-3.3-70b-versatile",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "GROQ_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_completion_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "mistral": {
+      "api": "openai-completions",
+      "aliases": ["codestral", "devstral"],
+      "description": "Mistral AI API (Devstral, Mistral Large, Codestral)",
+      "base_url": "https://api.mistral.ai/v1",
+      "base_url_envs": ["MISTRAL_BASE_URL"],
+      "default_model": "devstral-medium-latest",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "MISTRAL_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": false
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "fireworks": {
+      "api": "openai-completions",
+      "aliases": ["fw"],
+      "description": "Fireworks AI inference API (OpenAI-compatible)",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "base_url_envs": ["FIREWORKS_BASE_URL"],
+      "default_model": "accounts/fireworks/models/deepseek-v3p1",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "FIREWORKS_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "together": {
+      "api": "openai-completions",
+      "aliases": ["togetherai"],
+      "description": "Together AI inference API (OpenAI-compatible)",
+      "base_url": "https://api.together.xyz/v1",
+      "base_url_envs": ["TOGETHER_BASE_URL"],
+      "default_model": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "TOGETHER_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "cerebras": {
+      "api": "openai-completions",
+      "aliases": [],
+      "description": "Cerebras Wafer-Scale inference API (OpenAI-compatible)",
+      "base_url": "https://api.cerebras.ai/v1",
+      "base_url_envs": ["CEREBRAS_BASE_URL"],
+      "default_model": "qwen-3-coder-480b",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "CEREBRAS_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_completion_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "kimi": {
+      "api": "openai-completions",
+      "aliases": ["moonshot"],
+      "description": "Moonshot AI / Kimi API (preserves reasoning_content across tool loops)",
+      "base_url": "https://api.moonshot.ai/v1",
+      "base_url_envs": ["MOONSHOT_BASE_URL", "KIMI_BASE_URL"],
+      "default_model": "kimi-k2.5",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "MOONSHOT_API_KEY" },
+        { "scheme": "bearer", "env": "KIMI_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "requires_reasoning_content_on_assistant_messages": true,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "qwen": {
+      "api": "openai-completions",
+      "aliases": ["dashscope", "alibaba"],
+      "description": "Alibaba Qwen / DashScope OpenAI-compatible API",
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "base_url_envs": ["DASHSCOPE_BASE_URL", "QWEN_BASE_URL"],
+      "default_model": "qwen3-coder-plus",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "DASHSCOPE_API_KEY" },
+        { "scheme": "bearer", "env": "QWEN_API_KEY" },
+        { "scheme": "oauth" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      },
+      "usage_map": {
+        "input_ptr": "/prompt_tokens",
+        "output_ptr": "/completion_tokens",
+        "cache_read_ptr": "/prompt_tokens_details/cached_tokens",
+        "reasoning_ptr": "/completion_tokens_details/reasoning_tokens",
+        "cached_included_in_input": true
+      }
+    },
+    "lmstudio": {
+      "api": "openai-completions",
+      "aliases": ["lms"],
+      "description": "Local LM Studio OpenAI-compatible server",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "base_url_envs": ["LMSTUDIO_BASE_URL"],
+      "default_model": "local-model",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "LMSTUDIO_API_KEY" },
+        { "scheme": "none" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      }
+    },
+    "vllm": {
+      "api": "openai-completions",
+      "aliases": [],
+      "description": "Self-hosted vLLM OpenAI-compatible server",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "base_url_envs": ["VLLM_BASE_URL"],
+      "default_model": "default",
+      "auth_chain": [
+        { "scheme": "bearer", "env": "VLLM_API_KEY" },
+        { "scheme": "none" }
+      ],
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_developer_role": false,
+        "supports_reasoning_effort": false,
+        "supports_prompt_cache_key": false,
+        "send_stream_options": true
+      }
+    },
+    "faux": {
+      "api": "faux",
+      "aliases": ["mock"],
+      "description": "Deterministic zero-cost local provider for offline CI & replay testing",
+      "base_url": "",
+      "default_model": "faux-1",
+      "auth_chain": [
+        { "scheme": "none" }
+      ]
+    }
+  },
+  "models": {
+    "claude-opus-5-5": {
+      "provider": "anthropic",
+      "label": "Claude Opus 5.5",
+      "order": 10,
+      "pricing": { "input_per_mtok": 4.0, "output_per_mtok": 20.0, "cache_read_mult": 0.05, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "supports_mid_system_role": true,
+      "supports_effort": true,
+      "supports_xhigh": true,
+      "needs_adaptive_thinking": false
+    },
+    "claude-sonnet-5-5": {
+      "provider": "anthropic",
+      "label": "Claude Sonnet 5.5",
+      "order": 11,
+      "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 10.0, "cache_read_mult": 0.05, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "supports_mid_system_role": true,
+      "supports_effort": true,
+      "supports_xhigh": true,
+      "needs_adaptive_thinking": false
+    },
+    "claude-haiku-5-5": {
+      "provider": "anthropic",
+      "label": "Claude Haiku 5.5",
+      "order": 12,
+      "pricing": { "input_per_mtok": 0.10, "output_per_mtok": 0.50, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 200000,
+      "max_output_tokens": 32768,
+      "supports_mid_system_role": true,
+      "supports_effort": true,
+      "supports_xhigh": true,
+      "needs_adaptive_thinking": false
+    },
+    "claude-opus-4-8": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.8",
+      "order": 14,
+      "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "supports_mid_system_role": true,
+      "supports_effort": true,
+      "supports_xhigh": true,
+      "needs_adaptive_thinking": true
+    },
+    "claude-opus-4-7": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.7",
+      "order": 15,
+      "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "supports_mid_system_role": false,
+      "supports_effort": true,
+      "supports_xhigh": true,
+      "needs_adaptive_thinking": true
+    },
+    "claude-opus-4-6": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.6",
+      "order": 16,
+      "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "supports_mid_system_role": false,
+      "supports_effort": true,
+      "supports_xhigh": false,
+      "needs_adaptive_thinking": true
+    },
+    "claude-opus-4-5": {
+      "provider": "anthropic",
+      "label": "Claude Opus 4.5",
+      "order": 17,
+      "pricing": { "input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 200000,
+      "max_output_tokens": 32768,
+      "supports_mid_system_role": false,
+      "supports_effort": false,
+      "supports_xhigh": false,
+      "needs_adaptive_thinking": false,
+      "thinking_mode": "budget"
+    },
+    "claude-sonnet-4-6": {
+      "provider": "anthropic",
+      "label": "Claude Sonnet 4.6",
+      "order": 18,
+      "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "supports_mid_system_role": false,
+      "supports_effort": true,
+      "supports_xhigh": false,
+      "needs_adaptive_thinking": true
+    },
+    "claude-sonnet-4-5": {
+      "provider": "anthropic",
+      "label": "Claude Sonnet 4.5",
+      "order": 19,
+      "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 200000,
+      "max_output_tokens": 32768,
+      "supports_mid_system_role": false,
+      "supports_effort": false,
+      "supports_xhigh": false,
+      "needs_adaptive_thinking": false,
+      "thinking_mode": "budget"
+    },
+    "claude-haiku-4-5": {
+      "provider": "anthropic",
+      "label": "Claude Haiku 4.5",
+      "order": 20,
+      "pricing": { "input_per_mtok": 1.0, "output_per_mtok": 5.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 200000,
+      "max_output_tokens": 32768,
+      "supports_mid_system_role": false,
+      "supports_effort": false,
+      "supports_xhigh": false,
+      "needs_adaptive_thinking": false,
+      "thinking_mode": "budget"
+    },
+    "claude-fable-5-2": {
+      "provider": "anthropic",
+      "label": "Claude Fable 5.2",
+      "order": 13,
+      "pricing": { "input_per_mtok": 8.0, "output_per_mtok": 40.0, "cache_read_mult": 0.025, "cache_write_5m_mult": 1.25, "cache_write_1h_mult": 2.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000,
+      "supports_mid_system_role": true,
+      "supports_effort": true,
+      "supports_xhigh": true,
+      "needs_adaptive_thinking": false
+    },
+    "grok-4": {
+      "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 256000,
+      "max_output_tokens": 32768,
+      "compat_override": {
+        "supports_reasoning_effort": false
+      }
+    },
+    "grok-4-fast": {
+      "pricing": { "input_per_mtok": 0.20, "output_per_mtok": 0.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 2000000,
+      "max_output_tokens": 32768,
+      "compat_override": {
+        "supports_reasoning_effort": false
+      }
+    },
+    "grok-3-mini": {
+      "pricing": { "input_per_mtok": 0.30, "output_per_mtok": 0.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 131072,
+      "max_output_tokens": 16384,
+      "compat_override": {
+        "supports_reasoning_effort": true
+      }
+    },
+    "gemini-2.5-pro": {
+      "pricing": { "input_per_mtok": 1.25, "output_per_mtok": 10.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "compat_override": {
+        "thinking_style": "budget",
+        "supports_native_web_search": false,
+        "supports_native_web_fetch": false
+      }
+    },
+    "gemini-2.5-flash": {
+      "pricing": { "input_per_mtok": 0.30, "output_per_mtok": 2.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "compat_override": {
+        "thinking_style": "budget",
+        "supports_native_web_search": false,
+        "supports_native_web_fetch": false
+      }
+    },
+    "gemini-3-pro-preview": {
+      "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 12.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "compat_override": {
+        "thinking_style": "level"
+      }
+    },
+    "gemini-3-flash-preview": {
+      "pricing": { "input_per_mtok": 0.50, "output_per_mtok": 3.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "compat_override": {
+        "thinking_style": "level"
+      }
+    },
+    "gemini-3-pro-high": {
+      "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 12.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1048576,
+      "max_output_tokens": 65536,
+      "compat_override": {
+        "thinking_style": "level"
+      }
+    },
+    "gpt-5.4": {
+      "pricing": { "input_per_mtok": 2.50, "output_per_mtok": 10.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 64000
+    },
+    "gpt-5.4-mini": {
+      "pricing": { "input_per_mtok": 0.40, "output_per_mtok": 1.60, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 400000,
+      "max_output_tokens": 64000
+    },
+    "gpt-5.4-nano": {
+      "pricing": { "input_per_mtok": 0.10, "output_per_mtok": 0.40, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 400000,
+      "max_output_tokens": 32768
+    },
+    "o3": {
+      "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 8.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "compat_override": {
+        "supports_xhigh_reasoning": false
+      }
+    },
+    "o4-mini": {
+      "pricing": { "input_per_mtok": 1.10, "output_per_mtok": 4.40, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "compat_override": {
+        "supports_xhigh_reasoning": false
+      }
+    },
+    "deepseek-reasoner": {
+      "pricing": { "input_per_mtok": 0.55, "output_per_mtok": 2.19, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 128000,
+      "max_output_tokens": 32768
+    },
+    "deepseek-chat": {
+      "pricing": { "input_per_mtok": 0.27, "output_per_mtok": 1.10, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 128000,
+      "max_output_tokens": 8192
+    },
+    "qwen3-coder": {
+      "pricing": { "input_per_mtok": 0.0, "output_per_mtok": 0.0, "cache_read_mult": 1.0, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 65536,
+      "max_output_tokens": 16384
+    },
+    "Llama-4-Maverick-17B-128E-Instruct-FP8": {
+      "pricing": { "input_per_mtok": 0.25, "output_per_mtok": 0.75, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 32768
+    },
+    "kimi-k2.5": {
+      "pricing": { "input_per_mtok": 0.60, "output_per_mtok": 2.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 256000,
+      "max_output_tokens": 32768
+    },
+    "qwen3-coder-plus": {
+      "pricing": { "input_per_mtok": 1.0, "output_per_mtok": 5.0, "cache_read_mult": 0.20, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 1000000,
+      "max_output_tokens": 65536
+    },
+    "devstral-medium-latest": {
+      "pricing": { "input_per_mtok": 0.40, "output_per_mtok": 2.0, "cache_read_mult": 1.0, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 128000,
+      "max_output_tokens": 32768
+    },
+    "mistral-large-latest": {
+      "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 6.0, "cache_read_mult": 1.0, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 128000,
+      "max_output_tokens": 32768
+    },
+    "llama-3.3-70b-versatile": {
+      "pricing": { "input_per_mtok": 0.59, "output_per_mtok": 0.79, "cache_read_mult": 1.0, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 128000,
+      "max_output_tokens": 32768
+    },
+    "qwen-3-coder-480b": {
+      "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 2.0, "cache_read_mult": 1.0, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
+      "context_window": 131072,
+      "max_output_tokens": 32768
+    }
+  }
+}

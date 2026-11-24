@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check minimal carnot-tools (no tree-sitter)
+        run: cargo check -p carnot-tools --no-default-features
+      - name: Clippy default (pure core)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy all-features (core + all extensions)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace test suite (pure core)
+        run: cargo test --workspace
+      - name: Run workspace test suite (all extensions)
+        run: cargo test --workspace --all-features
+      - name: Prefix invariance & doctor gate
+        run: |
+          cargo run --bin carnot --features all-ext -- audit-prefix
+          cargo run --bin carnot --features all-ext -- doctor

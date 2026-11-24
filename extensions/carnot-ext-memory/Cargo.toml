@@ -1,0 +1,24 @@
+[package]
+name = "carnot-ext-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Workspace-scoped BM25 persistent memory extension for Carnot"
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+carnot-cas.workspace = true
+carnot-core.workspace = true
+carnot-ext.workspace = true
+carnot-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true
