@@ -99,9 +99,9 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliProfile::Carnot)]
     profile: CliProfile,
 
-    /// Provider name or alias from providers.json (run `carnot providers` to list all)
-    #[arg(long, default_value = "anthropic")]
-    provider: String,
+    /// Provider name or alias from providers.json (auto-detects first configured provider if omitted)
+    #[arg(long)]
+    provider: Option<String>,
 
     /// Model identifier (defaults to the selected provider's catalog default_model)
     #[arg(short = 'm', long)]
@@ -155,10 +155,15 @@ struct Cli {
     #[arg(long = "trust-workspace-ext")]
     trust_workspace_extensions: bool,
 
-    /// Enable compiled-in Rust `carnot-ext-web` extension (hybrid native + local search & fetch)
+    /// Enable compiled-in Rust `carnot-ext-web` extension (enabled by default in standalone `carnot` profile)
     #[cfg(feature = "ext-web")]
     #[arg(long)]
     web: bool,
+
+    /// Disable compiled-in `carnot-ext-web` extension
+    #[cfg(feature = "ext-web")]
+    #[arg(long = "no-web")]
+    no_web: bool,
 
     /// Web extension mode: `auto` (prefer native provider search/fetch, fallback local), `native`, or `local`
     #[cfg(feature = "ext-web")]
@@ -175,15 +180,25 @@ struct Cli {
     #[arg(long = "web-block-domain")]
     web_block_domains: Vec<String>,
 
-    /// Enable compiled-in Rust `carnot-ext-lsp` extension (`LspQuery` + warm diagnostics, requires `--features ext-lsp`)
+    /// Enable compiled-in Rust `carnot-ext-lsp` extension (enabled by default in standalone `carnot` profile)
     #[cfg(feature = "ext-lsp")]
     #[arg(long)]
     lsp: bool,
 
-    /// Enable disposable-context `Subagent` delegation extension (requires `--features ext-subagent`)
+    /// Disable compiled-in `carnot-ext-lsp` extension
+    #[cfg(feature = "ext-lsp")]
+    #[arg(long = "no-lsp")]
+    no_lsp: bool,
+
+    /// Enable disposable-context `Subagent` delegation extension (enabled by default in standalone `carnot` profile)
     #[cfg(feature = "ext-subagent")]
     #[arg(long)]
     subagent: bool,
+
+    /// Disable compiled-in `Subagent` delegation extension
+    #[cfg(feature = "ext-subagent")]
+    #[arg(long = "no-subagent")]
+    no_subagent: bool,
 
     /// Declarative Claude Code / Carnot hooks JSON file(s) (repeatable, requires `--features ext-hooks`)
     #[cfg(feature = "ext-hooks")]
@@ -210,10 +225,15 @@ struct Cli {
     #[arg(long = "load-installed-claude-plugins")]
     load_installed_claude_plugins: bool,
 
-    /// Enable cross-session persistent memory extension (`MemorySearch`/`MemorySave`, requires `--features ext-memory`)
+    /// Enable cross-session persistent memory extension (enabled by default in standalone `carnot` profile)
     #[cfg(feature = "ext-memory")]
     #[arg(long)]
     memory: bool,
+
+    /// Disable cross-session persistent memory extension
+    #[cfg(feature = "ext-memory")]
+    #[arg(long = "no-memory")]
+    no_memory: bool,
 
     /// Custom root directory for persistent memory store (defaults to `~/.carnot/memory`)
     #[cfg(feature = "ext-memory")]
@@ -658,24 +678,26 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                     || !std::io::stdout().is_terminal()
                     || std::env::var_os("CARNOT_PLAIN").is_some()
                     || matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"));
+                let reg_opt = ProviderRegistry::load_default(&cli.provider_configs).ok();
+                let default_provider = cli.resolved_provider(reg_opt.as_ref());
                 #[cfg(feature = "tui")]
                 let rc = if !want_plain {
                     tui::run_tui(
                         agent,
                         tui::TuiLaunchInfo {
-                            default_provider: cli.provider.clone(),
+                            default_provider,
                             provider_configs: cli.provider_configs.clone(),
                             active_extensions: active_extension_badges(&cli),
                         },
                     )
                     .await
                 } else {
-                    repl::run_repl(agent, cli.provider.clone(), cli.provider_configs.clone()).await
+                    repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
                 };
                 #[cfg(not(feature = "tui"))]
                 let rc = {
                     let _ = want_plain;
-                    repl::run_repl(agent, cli.provider.clone(), cli.provider_configs.clone()).await
+                    repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
                 };
                 mcp.shutdown_all().await;
                 return rc;
@@ -822,19 +844,19 @@ fn compiled_extensions() -> Vec<&'static str> {
 fn active_extension_badges(cli: &Cli) -> Vec<String> {
     let mut out = Vec::new();
     #[cfg(feature = "ext-web")]
-    if cli.web {
+    if cli.web_enabled() {
         out.push("web".to_string());
     }
     #[cfg(feature = "ext-memory")]
-    if cli.memory || cli.memory_dir.is_some() {
+    if cli.memory_enabled() {
         out.push("memory".to_string());
     }
     #[cfg(feature = "ext-subagent")]
-    if cli.subagent {
+    if cli.subagent_enabled() {
         out.push("subagent".to_string());
     }
     #[cfg(feature = "ext-lsp")]
-    if cli.lsp {
+    if cli.lsp_enabled() {
         out.push("lsp".to_string());
     }
     #[cfg(feature = "ext-hooks")]
@@ -854,6 +876,73 @@ fn active_extension_badges(cli: &Cli) -> Vec<String> {
     out
 }
 
+impl Cli {
+    /// Standalone `carnot` (not `--host-extension`) on the default `carnot` profile enables
+    /// standard zero-prefix-cost extensions out of the box (opt out with `--no-*` or `--profile minimal`).
+    #[cfg(any(
+        feature = "ext-web",
+        feature = "ext-lsp",
+        feature = "ext-subagent",
+        feature = "ext-memory"
+    ))]
+    fn default_batteries(&self) -> bool {
+        !self.host_extension && matches!(self.profile, CliProfile::Carnot)
+    }
+
+    #[cfg(feature = "ext-web")]
+    fn web_enabled(&self) -> bool {
+        !self.no_web && (self.web || self.default_batteries())
+    }
+
+    #[cfg(feature = "ext-lsp")]
+    fn lsp_enabled(&self) -> bool {
+        !self.no_lsp && (self.lsp || self.default_batteries())
+    }
+
+    #[cfg(feature = "ext-subagent")]
+    fn subagent_enabled(&self) -> bool {
+        !self.no_subagent && (self.subagent || self.default_batteries())
+    }
+
+    #[cfg(feature = "ext-memory")]
+    fn memory_enabled(&self) -> bool {
+        !self.no_memory && (self.memory || self.memory_dir.is_some() || self.default_batteries())
+    }
+
+    /// Resolves `--provider`, or auto-selects the first configured cloud provider before falling
+    /// back to `"anthropic"`.
+    fn resolved_provider(&self, reg: Option<&ProviderRegistry>) -> String {
+        if let Some(ref explicit) = self.provider {
+            return explicit.clone();
+        }
+        if let Some(r) = reg {
+            let summaries = r.summaries();
+            const PREFERRED: &[&str] = &[
+                "anthropic",
+                "openai",
+                "openai-responses",
+                "google",
+                "openrouter",
+                "deepseek",
+                "xai",
+            ];
+            for pref in PREFERRED {
+                if summaries.iter().any(|s| s.id == *pref && s.configured) {
+                    return (*pref).to_string();
+                }
+            }
+            if let Some(first) = summaries.iter().find(|s| {
+                s.configured
+                    && s.api != "faux"
+                    && !matches!(s.id.as_str(), "ollama" | "vllm" | "lmstudio")
+            }) {
+                return first.id.clone();
+            }
+        }
+        "anthropic".to_string()
+    }
+}
+
 async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
     let prefix = assert_prefix_invariance(|_date, _cwd, _sid| {
         (static_system_prompt().to_string(), canonical_tool_specs())
@@ -861,18 +950,19 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
     let reg = ProviderRegistry::load_default(&cli.provider_configs);
     let (provider_status, selected_model, context_window) = match &reg {
         Ok(r) => {
+            let target_prov = cli.resolved_provider(Some(r));
             let canonical_id = r
                 .catalog()
-                .find_provider(&cli.provider)
+                .find_provider(&target_prov)
                 .map(|(id, _)| id.to_string())
-                .unwrap_or_else(|| cli.provider.clone());
+                .unwrap_or_else(|| target_prov.clone());
             let summary = r
                 .summaries()
                 .into_iter()
                 .find(|s| s.id.eq_ignore_ascii_case(&canonical_id));
             let model = cli.model.clone().unwrap_or_else(|| {
                 r.catalog()
-                    .find_provider(&cli.provider)
+                    .find_provider(&target_prov)
                     .and_then(|(_, e)| e.default_model.clone())
                     .unwrap_or_else(|| "claude-sonnet-5-5".to_string())
             });
@@ -885,7 +975,7 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
                     "auth_source": s.auth_source,
                     "base_url": s.base_url,
                 }),
-                None => json!({ "id": cli.provider, "error": "unknown provider" }),
+                None => json!({ "id": target_prov, "error": "unknown provider" }),
             };
             (st, model, ctx)
         }
@@ -898,7 +988,9 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
 
     let sb = detect_sandbox_backend();
     let sandbox_backend = match sb.detail {
-        Some(detail) => json!({ "backend": sb.backend, "available": sb.available, "detail": detail }),
+        Some(detail) => {
+            json!({ "backend": sb.backend, "available": sb.available, "detail": detail })
+        }
         None => json!({ "backend": sb.backend, "available": sb.available }),
     };
 
@@ -1012,10 +1104,11 @@ impl AcpHost for CliAcpHost {
 
     fn resolve_model(&self, model_id: &str) -> carnot::Result<ResolvedAcpModel> {
         let reg = ProviderRegistry::load_default(&self.cli.provider_configs)?;
+        let fallback_prov = self.cli.resolved_provider(Some(&reg));
         let prov_id = reg
             .catalog()
             .provider_for_model(model_id)
-            .unwrap_or(&self.cli.provider);
+            .unwrap_or(&fallback_prov);
         let provider = reg.build_provider(prov_id, Some(model_id))?;
         let context_window = reg.context_window_for_model(model_id);
         let max_output_tokens = reg.max_output_tokens_for_model(model_id);
@@ -1083,7 +1176,7 @@ fn family_version_tuple(model_id: &str, family: &str) -> Option<Vec<u64>> {
 
 fn list_rpc_models(reg: &ProviderRegistry, include_unconfigured: bool) -> Vec<RpcModelInfo> {
     let cat = reg.catalog();
-    reg.available_models(include_unconfigured)
+    reg.available_models(!include_unconfigured)
         .into_iter()
         .map(|m| {
             let entry = cat.find_model(&m.id);
@@ -1126,7 +1219,7 @@ fn resolve_model_spec_in_registry(
         (None, trimmed)
     };
 
-    let all_models = reg.available_models(true);
+    let all_models = reg.available_models(false);
     // 1. Exact (provider, id) match
     if let Some(ref wp) = wanted_prov
         && let Some(found) = all_models
@@ -1182,8 +1275,14 @@ impl RpcHost for CliRpcHost {
     ) -> carnot::Result<ResolvedRpcModel> {
         let reg = ProviderRegistry::load_default(&self.cli.provider_configs)?;
         let (prov_id, model_id) =
-            resolve_model_spec_in_registry(&reg, model_spec, provider_override)
-                .unwrap_or_else(|| (self.cli.provider.clone(), model_spec.trim().to_string()));
+            resolve_model_spec_in_registry(&reg, model_spec, provider_override).unwrap_or_else(
+                || {
+                    (
+                        self.cli.resolved_provider(Some(&reg)),
+                        model_spec.trim().to_string(),
+                    )
+                },
+            );
         let provider = reg.build_provider(&prov_id, Some(&model_id))?;
         let context_window = reg.context_window_for_model(&model_id);
         let max_output_tokens = reg.max_output_tokens_for_model(&model_id);
@@ -1234,26 +1333,22 @@ async fn build_agent_full(
         "1h" | "long" => CacheTtl::Long1h,
         _ => CacheTtl::Hybrid,
     };
+    let reg_opt = ProviderRegistry::load_default(&cli.provider_configs).ok();
+    let default_provider = cli.resolved_provider(reg_opt.as_ref());
     let (effective_provider, effective_model) = if let Some(ref m) = cli.model {
-        if let Ok(reg) = ProviderRegistry::load_default(&cli.provider_configs) {
-            if cli.provider == "anthropic" {
-                if let Some((prov, mid)) = resolve_model_spec_in_registry(&reg, m, None) {
-                    (prov, Some(mid))
-                } else {
-                    (cli.provider.clone(), Some(m.clone()))
-                }
-            } else if let Some((prov, mid)) =
-                resolve_model_spec_in_registry(&reg, m, Some(&cli.provider))
+        if let Some(ref reg) = reg_opt {
+            if let Some((prov, mid)) =
+                resolve_model_spec_in_registry(reg, m, cli.provider.as_deref())
             {
                 (prov, Some(mid))
             } else {
-                (cli.provider.clone(), Some(m.clone()))
+                (default_provider, Some(m.clone()))
             }
         } else {
-            (cli.provider.clone(), Some(m.clone()))
+            (default_provider, Some(m.clone()))
         }
     } else {
-        (cli.provider.clone(), None)
+        (default_provider, None)
     };
 
     let sys_override = if let Some(ref spf) = cli.system_prompt_file {
@@ -1292,10 +1387,10 @@ async fn build_agent_full(
 
     #[cfg(feature = "ext-subagent")]
     {
-        b = b.subagent(cli.subagent);
+        b = b.subagent(cli.subagent_enabled());
     }
     #[cfg(feature = "ext-web")]
-    if cli.web {
+    if cli.web_enabled() {
         b = b.web_config(carnot::WebConfig {
             mode: cli.web_mode,
             allowed_domains: cli.web_allow_domains.clone(),
@@ -1305,7 +1400,7 @@ async fn build_agent_full(
     }
     #[cfg(feature = "ext-lsp")]
     {
-        b = b.lsp_diagnostics(cli.lsp);
+        b = b.lsp_diagnostics(cli.lsp_enabled());
     }
     #[cfg(feature = "ext-hooks")]
     {
@@ -1340,7 +1435,7 @@ async fn build_agent_full(
         });
     }
     #[cfg(feature = "ext-memory")]
-    if cli.memory || cli.memory_dir.is_some() {
+    if cli.memory_enabled() {
         let mut mc = carnot::MemoryConfig::default();
         if let Some(ref dir) = cli.memory_dir {
             mc.root_dir = dir.clone();

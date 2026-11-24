@@ -2016,7 +2016,7 @@ impl TuiApp {
     fn draw_welcome(&self, frame: &mut Frame<'_>, area: Rect) {
         let p = &self.palette;
         let ext_line = if self.launch.active_extensions.is_empty() {
-            "core only (pass --web --memory --subagent --lsp to enable)".to_string()
+            "core only".to_string()
         } else {
             self.launch.active_extensions.join(" · ")
         };

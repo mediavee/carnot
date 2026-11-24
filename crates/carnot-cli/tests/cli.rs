@@ -407,7 +407,14 @@ fn cli_auth_login_status_and_logout_with_custom_profile() {
 
 #[test]
 fn cli_models_list_and_resolve_family_alias() {
+    let dir = std::env::temp_dir().join(format!("carnot-cli-models-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
     let list_out = carnot_bin()
+        .env("HOME", &dir)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
         .args(["models", "--json", "--all"])
         .output()
         .expect("carnot models --json --all");
@@ -425,12 +432,17 @@ fn cli_models_list_and_resolve_family_alias() {
     );
 
     let res_out = carnot_bin()
+        .env("HOME", &dir)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
         .args(["models", "--resolve", "anthropic/sonnet"])
         .output()
         .expect("carnot models --resolve");
     assert!(res_out.status.success(), "resolve failed: {res_out:?}");
     let resolved = String::from_utf8_lossy(&res_out.stdout).trim().to_string();
     assert_eq!(resolved, "anthropic/claude-sonnet-5-5");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

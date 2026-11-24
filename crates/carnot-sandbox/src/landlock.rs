@@ -215,9 +215,8 @@ fn enforce_landlock(spec: &LandlockSpec) -> std::result::Result<(), String> {
         }
     }
 
-    let mut rw_paths: Vec<PathBuf> = Vec::with_capacity(
-        1 + spec.extra_writable_roots.len() + spec.frozen_git_write_dirs.len(),
-    );
+    let mut rw_paths: Vec<PathBuf> =
+        Vec::with_capacity(1 + spec.extra_writable_roots.len() + spec.frozen_git_write_dirs.len());
     rw_paths.push(spec.workspace_root.clone());
     rw_paths.extend(spec.extra_writable_roots.iter().cloned());
     rw_paths.extend(spec.frozen_git_write_dirs.iter().cloned());
@@ -228,9 +227,15 @@ fn enforce_landlock(spec: &LandlockSpec) -> std::result::Result<(), String> {
     let created = ruleset
         .create()
         .map_err(|e| format!("create ruleset: {e}"))?
-        .add_rules(path_beneath_rules(&ro_paths, AccessFs::from_read(target_abi)))
+        .add_rules(path_beneath_rules(
+            &ro_paths,
+            AccessFs::from_read(target_abi),
+        ))
         .map_err(|e| format!("add read rules: {e}"))?
-        .add_rules(path_beneath_rules(&rw_paths, AccessFs::from_all(target_abi)))
+        .add_rules(path_beneath_rules(
+            &rw_paths,
+            AccessFs::from_all(target_abi),
+        ))
         .map_err(|e| format!("add write rules: {e}"))?
         .add_rules(path_beneath_rules(&dev_rw_files, dev_file_access))
         .map_err(|e| format!("add /dev rules: {e}"))?;
