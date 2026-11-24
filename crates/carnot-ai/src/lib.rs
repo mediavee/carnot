@@ -23,8 +23,8 @@ pub mod subprocess;
 mod conformance_tests;
 
 use carnot_core::{
-    CacheTtl, Message, NativeWebConfig, ProviderWebCapabilities, ReasoningEffort, Result,
-    StopReason, ToolSpec, Usage,
+    CacheTtl, Message, NativeWebConfig, ProviderWebCapabilities, RateLimitWindow, ReasoningEffort,
+    Result, StopReason, ToolSpec, Usage,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -109,6 +109,7 @@ pub enum StreamEvent {
         message: Message,
         usage: Usage,
         stop_reason: StopReason,
+        rate_limits: Vec<RateLimitWindow>,
     },
     Error {
         message: String,

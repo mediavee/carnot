@@ -7,7 +7,7 @@
 use crate::catalog::{ProviderCatalog, ResolvedAuth, ResolvedProviderSpec};
 use crate::compat::{
     can_replay_origin, is_context_overflow, is_retryable_status, normalize_tool_call_id,
-    parse_retry_after_ms, repair_json,
+    parse_rate_limit_windows, parse_retry_after_ms, repair_json,
 };
 use crate::registry::ApiAdapter;
 use crate::{BoxFuture, Provider, ProviderRequest, StreamEvent};
@@ -689,6 +689,7 @@ impl Provider for AnthropicProvider {
                 });
             }
 
+            let rate_limits = parse_rate_limit_windows(resp.headers());
             let (tx, rx) = mpsc::channel(64);
             let pricing = self.spec.effective_pricing(&request.model);
             let default_ttl = request.cache_ttl;
@@ -804,6 +805,7 @@ impl Provider for AnthropicProvider {
                         },
                         usage: state.usage,
                         stop_reason: state.stop_reason,
+                        rate_limits,
                     })
                     .await;
             });

@@ -1,20 +1,29 @@
-//! Hardened OS-native process sandboxing (macOS Seatbelt) and strict environment allowlisting.
+//! Hardened OS-native process sandboxing (macOS Seatbelt, Linux bwrap + Landlock fallback) and
+//! strict environment allowlisting.
 //!
 //! Security invariants (verified against Opus 5.5 High red-team exploits C1, S1, S3, N6, N7):
-//!   - `<workspace>/.git` is READ-ONLY inside Seatbelt (closes C1: sandboxed process can NEVER
-//!     write `.git/config` or `.git/hooks/*` to hijack host-side `git`!).
+//!   - `<workspace>/.git` is READ-ONLY inside Seatbelt & bwrap (closes C1: sandboxed process can
+//!     NEVER write `.git/config` or `.git/hooks/*` to hijack host-side `git`!).
 //!   - Linked git worktrees are verified strictly (`gd` outside workspace, `cd == gd/../..`,
 //!     reciprocal `worktrees/<name>/gitdir` -> `<ws>/.git` — closes N6) and ONLY `worktrees/<name>`
 //!     + `cd/{objects,refs,logs}` are writable — NEVER `cd/config` or `cd/hooks`!
 //!   - Host-side git invocations use `host_safe_git_command()` (`-c core.fsmonitor=false -c core.hooksPath=/dev/null`).
 //!   - Strict environment allowlist (`env_clear()` + safe baseline vars + isolated `ZDOTDIR`,
-//!     no `BASH_ENV`/`ENV`) + Seatbelt denies `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`,
-//!     `~/.secrets`, `~/.zshenv`, `~/.zshrc`, `~/.claude`, `~/.codex`, `~/.config/agentsafe`,
-//!     `~/.docker`, `~/.kube` (closes S3 & N7).
+//!     no `BASH_ENV`/`ENV`) + Seatbelt/bwrap/Landlock block `~/.ssh`, `~/.aws`, `~/.gnupg`,
+//!     `~/.config/gh`, `~/.secrets`, `~/.zshenv`, `~/.zshrc`, `~/.claude`, `~/.codex`,
+//!     `~/.config/agentsafe`, `~/.docker`, `~/.kube` (closes S3 & N7).
 //!   - Workspace-isolated `TMPDIR` (`.carnot/tmp`), network OFF by default, fail-closed if no OS sandbox.
+
+mod landlock;
+
+pub use landlock::{
+    LANDLOCK_EXEC_ARG, detect_landlock_abi, landlock_helper, register_landlock_helper,
+    try_handle_landlock_exec_arg,
+};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::process::Command;
 
 /// Safe environment variables preserved across `env_clear()`.
@@ -154,6 +163,53 @@ pub fn build_sandboxed_shell(
     build_sandboxed_shell_in_dir(policy, shell_cmd, &policy.workspace_root, extra_env)
 }
 
+/// Summary of the active OS sandbox backend on this host (for diagnostics such as `carnot doctor`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxBackendInfo {
+    pub backend: &'static str,
+    pub available: bool,
+    pub detail: Option<String>,
+}
+
+/// Detects the OS sandbox backend that `build_sandboxed_shell` will use on this host.
+pub fn detect_sandbox_backend() -> SandboxBackendInfo {
+    if cfg!(target_os = "macos") {
+        let ok = Path::new("/usr/bin/sandbox-exec").is_file();
+        return SandboxBackendInfo {
+            backend: "seatbelt",
+            available: ok,
+            detail: None,
+        };
+    }
+    if cfg!(target_os = "linux") {
+        if working_bwrap_binary().is_some() {
+            return SandboxBackendInfo {
+                backend: "bwrap",
+                available: true,
+                detail: None,
+            };
+        }
+        if let Some(abi) = detect_landlock_abi() {
+            let helper_ready = landlock_helper().is_some();
+            return SandboxBackendInfo {
+                backend: "landlock",
+                available: helper_ready,
+                detail: Some(format!("ABI v{abi}")),
+            };
+        }
+        return SandboxBackendInfo {
+            backend: "none",
+            available: false,
+            detail: None,
+        };
+    }
+    SandboxBackendInfo {
+        backend: "none",
+        available: false,
+        detail: None,
+    }
+}
+
 /// Same as `build_sandboxed_shell`, starting the shell in a verified working directory `cwd`.
 pub fn build_sandboxed_shell_in_dir(
     policy: &SandboxPolicy,
@@ -165,12 +221,17 @@ pub fn build_sandboxed_shell_in_dir(
         if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
             build_macos_seatbelt_command(policy, shell_cmd)
         } else if cfg!(target_os = "linux")
-            && let Some(bwrap_bin) = resolve_bwrap_binary()
+            && let Some(bwrap_bin) = working_bwrap_binary()
         {
-            build_linux_bwrap_command(&bwrap_bin, policy, shell_cmd, cwd)
+            build_linux_bwrap_command(bwrap_bin, policy, shell_cmd, cwd)
+        } else if cfg!(target_os = "linux")
+            && detect_landlock_abi().is_some()
+            && let Some(helper) = landlock_helper()
+        {
+            landlock::build_linux_landlock_command(helper, policy, shell_cmd, cwd)?
         } else {
             return Err(
-                "OS sandbox requested (`sandbox: true`) but no supported kernel sandbox (macOS sandbox-exec / Linux bwrap) is available on this host (pass `--no-sandbox` to explicitly disable)"
+                "OS sandbox requested (`sandbox: true`) but no supported kernel sandbox (macOS sandbox-exec / Linux bwrap or Landlock) is available on this host (pass `--no-sandbox` to explicitly disable)"
                     .into(),
             );
         }
@@ -372,6 +433,34 @@ fn resolve_bwrap_binary() -> Option<PathBuf> {
             .map(|d| d.join("bwrap"))
             .find(|p| p.is_file())
     })
+}
+
+/// Probes once whether `bwrap --unshare-all` actually succeeds on this host (false inside standard
+/// Docker containers where seccomp blocks `CLONE_NEWUSER`, triggering automatic Landlock fallback).
+fn working_bwrap_binary() -> Option<&'static Path> {
+    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let bin = resolve_bwrap_binary()?;
+            let ok = std::process::Command::new(&bin)
+                .args([
+                    "--unshare-all",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    resolve_shell_binary(),
+                    "-c",
+                    "true",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            ok.then_some(bin)
+        })
+        .as_deref()
 }
 
 fn build_linux_bwrap_command(

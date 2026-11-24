@@ -380,6 +380,7 @@ async fn conformance_openai_compat_images_reasoning_deepseek_usage_and_retry_aft
                 message,
                 usage,
                 stop_reason,
+                ..
             } => {
                 done_ev = Some((message, usage, stop_reason));
             }

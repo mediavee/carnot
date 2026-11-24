@@ -410,6 +410,7 @@ impl Provider for SubprocessProvider {
                                     message,
                                     usage,
                                     stop_reason,
+                                    rate_limits: Vec::new(),
                                 })
                                 .await;
                             break;

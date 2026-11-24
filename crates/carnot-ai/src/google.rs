@@ -813,6 +813,7 @@ impl Provider for GoogleProvider {
                         },
                         usage,
                         stop_reason,
+                        rate_limits: Vec::new(),
                     })
                     .await;
             });

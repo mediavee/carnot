@@ -437,6 +437,7 @@ async fn try_semantic_llm_handoff(
                         message,
                         usage: u,
                         stop_reason,
+                        ..
                     } => {
                         // Pi guard: never persist a length-truncated or tool-calling summary
                         if stop_reason == StopReason::MaxTokens || message.has_tool_use() {
@@ -591,6 +592,7 @@ pub(crate) async fn execute_compaction(
             events.push(AgentEvent::UsageRecorded {
                 turn: turn_num,
                 usage,
+                rate_limits: Vec::new(),
             });
             Some(text)
         } else {

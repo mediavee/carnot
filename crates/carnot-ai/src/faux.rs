@@ -318,6 +318,7 @@ impl Provider for FauxProvider {
                         },
                         usage,
                         stop_reason: next_turn.stop_reason,
+                        rate_limits: Vec::new(),
                     })
                     .await;
             });

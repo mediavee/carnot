@@ -625,6 +625,7 @@ impl Provider for OpenAiResponsesProvider {
                         },
                         usage,
                         stop_reason,
+                        rate_limits: Vec::new(),
                     })
                     .await;
             });

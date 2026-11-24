@@ -43,9 +43,9 @@ pub use carnot_cas::{
 };
 pub use carnot_core::{
     AgentEvent, CacheTtl, CarnotConfig, CarnotError, EventEnvelope, Message, ModelPricing,
-    ModuleSwitches, NativeWebConfig, Profile, ProviderWebCapabilities, ReasoningEffort, Result,
-    StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolSpec, Usage, UserQuestion,
-    UserQuestionAnswer, UserQuestionOption, canonicalize_json,
+    ModuleSwitches, NativeWebConfig, Profile, ProviderWebCapabilities, RateLimitWindow,
+    ReasoningEffort, Result, StopReason, ThermodynamicMetrics, ToolEffects, ToolOutput, ToolSpec,
+    Usage, UserQuestion, UserQuestionAnswer, UserQuestionOption, canonicalize_json,
 };
 pub use carnot_ext::{
     BoundaryAction, CompactionHookAction, CompactionHookContext, Module, PermissionBroker,
@@ -98,6 +98,9 @@ pub use carnot_protocol::{
         read_host_registration, serve_rpc_stdio, serve_rpc_stdio_with_extension,
         serve_rpc_stdio_with_host,
     },
+};
+pub use carnot_sandbox::{
+    SandboxBackendInfo, detect_sandbox_backend, try_handle_landlock_exec_arg,
 };
 pub use carnot_tools::{Tool, ToolRegistry};
 

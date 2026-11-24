@@ -11,9 +11,9 @@ use carnot::{
     AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, HostRpcBridge,
     HostRpcModule, McpManager, McpServerConfig, Profile, ProviderRegistry, ReasoningEffort,
     ResolvedAcpModel, ResolvedRpcModel, RpcCommandInfo, RpcHost, RpcModelInfo,
-    assert_prefix_invariance, discover_dropin_specs, load_mcp_configs, parse_acp_mcp_servers,
-    read_host_registration, serve_acp_stdio_with_host, serve_http, serve_rpc_stdio_with_extension,
-    serve_rpc_stdio_with_host,
+    assert_prefix_invariance, detect_sandbox_backend, discover_dropin_specs, load_mcp_configs,
+    parse_acp_mcp_servers, read_host_registration, serve_acp_stdio_with_host, serve_http,
+    serve_rpc_stdio_with_extension, serve_rpc_stdio_with_host, try_handle_landlock_exec_arg,
 };
 use carnot_ext::microskills::discover_agent_skills;
 use carnot_ext::prefix_guard::static_system_prompt;
@@ -384,6 +384,7 @@ fn init_tracing_if_requested() {
 }
 
 fn main() {
+    try_handle_landlock_exec_arg();
     init_tracing_if_requested();
 
     let cli = Cli::parse();
@@ -895,18 +896,10 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
         ),
     };
 
-    let sandbox_backend = if cfg!(target_os = "macos") {
-        let ok = std::path::Path::new("/usr/bin/sandbox-exec").is_file();
-        json!({ "backend": "seatbelt", "available": ok })
-    } else if cfg!(target_os = "linux") {
-        let ok = std::process::Command::new("bwrap")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        json!({ "backend": "bwrap", "available": ok })
-    } else {
-        json!({ "backend": "none", "available": false })
+    let sb = detect_sandbox_backend();
+    let sandbox_backend = match sb.detail {
+        Some(detail) => json!({ "backend": sb.backend, "available": sb.available, "detail": detail }),
+        None => json!({ "backend": sb.backend, "available": sb.available }),
     };
 
     let mcp_cfgs = load_mcp_configs(cwd, &cli.mcp_configs, cli.trust_workspace_mcp);

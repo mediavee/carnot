@@ -1346,6 +1346,7 @@ impl Agent {
             let mut assistant_msg = Message::assistant_text("");
             let mut usage = Usage::default();
             let mut stop_reason = StopReason::EndTurn;
+            let mut rate_limits = Vec::new();
             let mut stream_err: Option<(String, bool)> = None;
             let mut stream_overflow: Option<String> = None;
 
@@ -1431,10 +1432,12 @@ impl Agent {
                         message,
                         usage: u,
                         stop_reason: sr,
+                        rate_limits: rl,
                     } => {
                         assistant_msg = message;
                         usage = u;
                         stop_reason = sr;
+                        rate_limits = rl;
                     }
                     StreamEvent::Error { message, retryable } => {
                         stream_err = Some((message, retryable));
@@ -1535,6 +1538,7 @@ impl Agent {
             self.events.push(AgentEvent::UsageRecorded {
                 turn: turn_num,
                 usage,
+                rate_limits,
             });
 
             let last_text = assistant_msg.text_concat();

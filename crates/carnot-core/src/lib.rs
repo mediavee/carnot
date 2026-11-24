@@ -756,6 +756,21 @@ impl ModelPricing {
     }
 }
 
+/// Normalized provider rate-limit window parsed from HTTP response headers
+/// (e.g. Anthropic `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitWindow {
+    pub id: String,
+    /// Fraction of window consumed in `[0.0, 1.0]` (or percentage when > 1.0).
+    pub utilization: f64,
+    /// Unix epoch seconds when this window resets, if reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<f64>,
+    /// Window duration in seconds (e.g. `18000.0` for 5h, `604800.0` for 7d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<f64>,
+}
+
 /// Token usage and exact billed cost for a single model request.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -923,6 +938,8 @@ pub enum AgentEvent {
     UsageRecorded {
         turn: u64,
         usage: Usage,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rate_limits: Vec<RateLimitWindow>,
     },
     TurnEnd {
         turn: u64,

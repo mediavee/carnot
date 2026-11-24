@@ -4,7 +4,7 @@
 //! ZERO provider names or URLs live in this module.
 
 use crate::catalog::UsageMap;
-use carnot_core::{ContentOrigin, Usage};
+use carnot_core::{ContentOrigin, RateLimitWindow, Usage};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
@@ -44,6 +44,37 @@ pub fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64>
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|secs| (secs * 1000.0).ceil() as u64)
+}
+
+/// Parses unified subscription rate-limit headers (e.g. Anthropic's
+/// `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`) into normalized windows.
+pub fn parse_rate_limit_windows(headers: &reqwest::header::HeaderMap) -> Vec<RateLimitWindow> {
+    const SPECS: &[(&str, f64)] = &[("5h", 5.0 * 3600.0), ("7d", 7.0 * 86_400.0)];
+    let mut windows = Vec::new();
+    for &(id, window_seconds) in SPECS {
+        let util_key = format!("anthropic-ratelimit-unified-{id}-utilization");
+        let Some(utilization) = headers
+            .get(&util_key)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        else {
+            continue;
+        };
+        let reset_key = format!("anthropic-ratelimit-unified-{id}-reset");
+        let resets_at = headers
+            .get(&reset_key)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0);
+        windows.push(RateLimitWindow {
+            id: id.to_string(),
+            utilization,
+            resets_at,
+            window_seconds: Some(window_seconds),
+        });
+    }
+    windows
 }
 
 /// True if an HTTP status code is transient and safe to retry with backoff.
@@ -508,5 +539,33 @@ mod tests {
         let a = session_cache_key("same_prefix_hash", "sess-a");
         let b = session_cache_key("same_prefix_hash", "sess-b");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn parse_rate_limit_windows_extracts_anthropic_unified_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.42".parse().expect("hdr"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            "1790000000".parse().expect("hdr"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.15".parse().expect("hdr"),
+        );
+
+        let windows = parse_rate_limit_windows(&headers);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].id, "5h");
+        assert!((windows[0].utilization - 0.42).abs() < 1e-9);
+        assert_eq!(windows[0].resets_at, Some(1_790_000_000.0));
+        assert_eq!(windows[0].window_seconds, Some(18_000.0));
+        assert_eq!(windows[1].id, "7d");
+        assert!((windows[1].utilization - 0.15).abs() < 1e-9);
+        assert_eq!(windows[1].resets_at, None);
+        assert_eq!(windows[1].window_seconds, Some(604_800.0));
     }
 }
