@@ -23,6 +23,20 @@ export interface ThermodynamicMetrics {
   };
 }
 
+export interface ContextBreakdown {
+  system: number;
+  tools: number;
+  memory: number;
+  messages: number;
+  tool_results: number;
+  estimated: boolean;
+}
+
+export interface ImageAttachment {
+  media_type: string;
+  data_base64: string;
+}
+
 export interface EventEnvelope {
   seq: number;
   event: string;
@@ -59,6 +73,9 @@ export class CarnotHttpClient {
     session_id: string;
     prefix_hash: string;
     latest_seq: number;
+    context_tokens: number;
+    context_window: number;
+    context_breakdown: ContextBreakdown | null;
     metrics: ThermodynamicMetrics;
   }> {
     const res = await fetch(`${this.baseUrl}/v1/metrics`, {
@@ -68,11 +85,12 @@ export class CarnotHttpClient {
     return res.json();
   }
 
-  async prompt(prompt: string): Promise<PromptResponse> {
+  async prompt(prompt: string, images?: ImageAttachment[]): Promise<PromptResponse> {
+    const body = images?.length ? { prompt, images, stream: false } : { prompt, stream: false };
     const res = await fetch(`${this.baseUrl}/v1/prompt`, {
       method: "POST",
       headers: this.authHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ prompt, stream: false }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
     return res.json();
@@ -119,11 +137,12 @@ export class CarnotHttpClient {
     return res.json();
   }
 
-  async *promptStream(prompt: string): AsyncGenerator<EventEnvelope> {
+  async *promptStream(prompt: string, images?: ImageAttachment[]): AsyncGenerator<EventEnvelope> {
+    const body = images?.length ? { prompt, images, stream: true } : { prompt, stream: true };
     const res = await fetch(`${this.baseUrl}/v1/prompt`, {
       method: "POST",
       headers: this.authHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ prompt, stream: true }),
+      body: JSON.stringify(body),
     });
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
     yield* parseSseStream(res.body);

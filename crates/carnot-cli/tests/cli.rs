@@ -883,3 +883,211 @@ fn cli_rpc_host_extension_scripted_tool_calls_ephemeral_cache_invariance_and_con
     assert!(status.success(), "carnot exited with {status}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_user_config_toml_applies_defaults_and_flags_override() {
+    let dir = std::env::temp_dir().join(format!("carnot-cfg-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        r#"
+provider = "openai"
+model = "gpt-5.4"
+effort = "medium"
+profile = "minimal"
+cache_ttl = "5m"
+"#,
+    )
+    .expect("write config");
+
+    // Config sets profile = "minimal" and model = "gpt-5.4".
+    let mods = carnot_bin()
+        .env("CARNOT_CONFIG", &cfg_path)
+        .arg("modules")
+        .output()
+        .expect("modules");
+    assert!(mods.status.success(), "modules failed: {:?}", mods);
+    let mv: serde_json::Value = serde_json::from_slice(&mods.stdout).expect("json");
+    assert_eq!(mv["profile"], "minimal");
+
+    // Explicit CLI flag overrides config.toml.
+    let mods_override = carnot_bin()
+        .env("CARNOT_CONFIG", &cfg_path)
+        .args(["--profile", "standard", "modules"])
+        .output()
+        .expect("modules override");
+    assert!(mods_override.status.success());
+    let mvo: serde_json::Value = serde_json::from_slice(&mods_override.stdout).expect("json");
+    assert_eq!(mvo["profile"], "standard");
+
+    // `doctor` reflects config model & reports config_file.
+    let doc = carnot_bin()
+        .env("CARNOT_CONFIG", &cfg_path)
+        .arg("doctor")
+        .output()
+        .expect("doctor");
+    assert!(doc.status.success());
+    let dv: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("json");
+    assert_eq!(dv["model"], "gpt-5.4");
+    assert_eq!(
+        dv["config_file"].as_str(),
+        Some(cfg_path.to_string_lossy().as_ref())
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_continue_resumes_latest_workspace_session_and_piped_stdin_plus_image_work() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = std::env::temp_dir().join(format!("carnot-unix-cli-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let ws = dir.join("ws");
+    let sdir = dir.join("sessions");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+    std::fs::create_dir_all(&sdir).expect("mkdir sdir");
+
+    let ws_s = ws.to_str().expect("ws utf8");
+    let sdir_s = sdir.to_str().expect("sdir utf8");
+
+    // 1. `-c` fails cleanly when no session exists yet for this workspace.
+    let no_sess = carnot_bin()
+        .args([
+            "-C",
+            ws_s,
+            "--session-dir",
+            sdir_s,
+            "--provider",
+            "faux",
+            "--no-sandbox",
+            "-c",
+            "-p",
+            "continue please",
+        ])
+        .output()
+        .expect("run -c empty");
+    assert_eq!(no_sess.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&no_sess.stderr).contains("no previous session found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&no_sess.stderr)
+    );
+
+    // 2. Run a first turn with piped stdin + `-p` + `--image` (1x1 valid PNG).
+    let png_path = dir.join("pixel.png");
+    let png_bytes: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    std::fs::write(&png_path, png_bytes).expect("write png");
+
+    let mut child = carnot_bin()
+        .args([
+            "-C",
+            ws_s,
+            "--session-dir",
+            sdir_s,
+            "--provider",
+            "faux",
+            "--no-sandbox",
+            "--mode",
+            "json",
+            "--image",
+            png_path.to_str().expect("png utf8"),
+            "-p",
+            "inspect piped diff and screenshot",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first turn");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(b"diff --git a/a.rs b/a.rs\n+fn hi() {}\n")
+        .expect("write stdin");
+    let out1 = child.wait_with_output().expect("wait first turn");
+    assert!(
+        out1.status.success(),
+        "first turn failed: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    let session_files: Vec<_> = std::fs::read_dir(&sdir)
+        .expect("read sdir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    assert_eq!(session_files.len(), 1, "expected 1 persisted session");
+    let raw_session = std::fs::read_to_string(&session_files[0]).expect("read session");
+    assert!(raw_session.contains("inspect piped diff and screenshot"));
+    assert!(raw_session.contains("diff --git a/a.rs b/a.rs"));
+    assert!(raw_session.contains("image/png"));
+
+    // 3. `-c` resumes that exact session (no second file created).
+    let out2 = carnot_bin()
+        .args([
+            "-C",
+            ws_s,
+            "--session-dir",
+            sdir_s,
+            "--provider",
+            "faux",
+            "--no-sandbox",
+            "--mode",
+            "json",
+            "-c",
+            "-p",
+            "follow up turn",
+        ])
+        .output()
+        .expect("run -c");
+    assert!(
+        out2.status.success(),
+        "-c failed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let session_files_after: Vec<_> = std::fs::read_dir(&sdir)
+        .expect("read sdir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    assert_eq!(
+        session_files_after.len(),
+        1,
+        "-c should append to existing session"
+    );
+    let raw_after = std::fs::read_to_string(&session_files_after[0]).expect("read session");
+    assert!(raw_after.contains("follow up turn"));
+
+    // 4. Unsupported `--image` exits with code 2.
+    let bad_img = dir.join("notes.txt");
+    std::fs::write(&bad_img, "not an image").expect("write txt");
+    let out_bad = carnot_bin()
+        .args([
+            "--no-session",
+            "--provider",
+            "faux",
+            "--no-sandbox",
+            "--image",
+            bad_img.to_str().expect("bad img utf8"),
+            "-p",
+            "check",
+        ])
+        .output()
+        .expect("run bad image");
+    assert_eq!(out_bad.status.code(), Some(2));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

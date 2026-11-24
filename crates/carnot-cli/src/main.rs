@@ -3,17 +3,20 @@
 //! prefix-invariance CI audit, production diagnostics (`carnot doctor`), session resume,
 //! budget/timeout guardrails, and graceful signal handling.
 
+mod config;
 mod repl;
 #[cfg(feature = "tui")]
 mod tui;
 
+use base64::Engine as _;
 use carnot::{
-    AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, HostRpcBridge,
-    HostRpcModule, McpManager, McpServerConfig, Profile, ProviderRegistry, ReasoningEffort,
-    ResolvedAcpModel, ResolvedRpcModel, RpcCommandInfo, RpcHost, RpcModelInfo,
+    AcpHost, AcpModelInfo, AgentEvent, CacheTtl, CarnotBuilder, CasStore, ContentBlock,
+    HostRpcBridge, HostRpcModule, McpManager, McpServerConfig, Profile, ProviderRegistry,
+    ReasoningEffort, ResolvedAcpModel, ResolvedRpcModel, RpcCommandInfo, RpcHost, RpcModelInfo,
     assert_prefix_invariance, detect_sandbox_backend, discover_dropin_specs, load_mcp_configs,
-    parse_acp_mcp_servers, read_host_registration, serve_acp_stdio_with_host, serve_http,
-    serve_rpc_stdio_with_extension, serve_rpc_stdio_with_host, try_handle_landlock_exec_arg,
+    parse_acp_mcp_servers, read_host_registration, read_session_header, serve_acp_stdio_with_host,
+    serve_http, serve_rpc_stdio_with_extension, serve_rpc_stdio_with_host,
+    try_handle_landlock_exec_arg,
 };
 use carnot_ext::microskills::discover_agent_skills;
 use carnot_ext::prefix_guard::static_system_prompt;
@@ -87,6 +90,10 @@ struct Cli {
     #[arg(long = "prompt-file")]
     prompt_file: Option<PathBuf>,
 
+    /// Attach image file(s) (`png`, `jpg`, `webp`, `gif`) to a one-shot prompt (repeatable)
+    #[arg(short = 'i', long = "image")]
+    images: Vec<PathBuf>,
+
     /// Execution surface mode
     #[arg(long, value_enum, default_value_t = Mode::Text)]
     mode: Mode,
@@ -95,9 +102,9 @@ struct Cli {
     #[arg(long)]
     plain: bool,
 
-    /// Module profile preset
-    #[arg(long, value_enum, default_value_t = CliProfile::Carnot)]
-    profile: CliProfile,
+    /// Module profile preset (defaults to `carnot`, or `~/.carnot/config.toml`)
+    #[arg(long, value_enum)]
+    profile: Option<CliProfile>,
 
     /// Provider name or alias from providers.json (auto-detects first configured provider if omitted)
     #[arg(long)]
@@ -111,23 +118,27 @@ struct Cli {
     #[arg(long = "provider-config")]
     provider_configs: Vec<PathBuf>,
 
-    /// Reasoning effort level (low, medium, high, max)
-    #[arg(long, value_enum, default_value_t = CliEffort::High)]
-    effort: CliEffort,
+    /// Reasoning effort level (low, medium, high, xhigh, max; defaults to `high` or `~/.carnot/config.toml`)
+    #[arg(long, value_enum)]
+    effort: Option<CliEffort>,
 
-    /// Prompt cache TTL (hybrid, 5m, or 1h)
-    #[arg(long, default_value = "hybrid")]
-    cache_ttl: String,
+    /// Prompt cache TTL (hybrid, 5m, or 1h; defaults to `hybrid` or `~/.carnot/config.toml`)
+    #[arg(long)]
+    cache_ttl: Option<String>,
 
     /// Workspace directory (defaults to current directory)
     #[arg(short = 'C', long)]
     cwd: Option<PathBuf>,
 
+    /// Resume the most recent session for this workspace
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
+    continue_last: bool,
+
     /// Resume an existing session JSONL file (or session ID under ~/.carnot/sessions)
     #[arg(long)]
     resume: Option<String>,
 
-    /// With `--resume`: fork into a brand-new session file without modifying the original
+    /// With `--resume` or `--continue`: fork into a brand-new session file without modifying the original
     #[arg(long)]
     fork: bool,
 
@@ -407,7 +418,22 @@ fn main() {
     try_handle_landlock_exec_arg();
     init_tracing_if_requested();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if !cli.host_extension {
+        match config::load_user_config() {
+            Ok(Some((path, cfg))) => {
+                if let Err(e) = cli.apply_user_config(&cfg) {
+                    eprintln!("config error ({}): {e}", path.display());
+                    std::process::exit(2);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("config error: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     let cwd = cli
         .cwd
         .clone()
@@ -437,9 +463,10 @@ fn main() {
                 }
             }
             Commands::Modules => {
-                let sw = carnot::ModuleSwitches::from_profile(cli.profile.into());
+                let eff_profile = cli.effective_profile();
+                let sw = carnot::ModuleSwitches::from_profile(eff_profile.into());
                 let out = json!({
-                    "profile": format!("{:?}", cli.profile).to_lowercase(),
+                    "profile": format!("{eff_profile:?}").to_lowercase(),
                     "modules": sw,
                     "canonical_tools": canonical_tool_specs().iter().map(|t| &t.name).collect::<Vec<_>>(),
                     "compiled_extensions": compiled_extensions(),
@@ -653,60 +680,64 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
             }
         }
         Mode::Text | Mode::Json => {
-            let prompt = if let Some(ref pf) = cli.prompt_file {
-                match std::fs::read_to_string(pf) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("error reading --prompt-file {}: {e}", pf.display());
-                        mcp.shutdown_all().await;
-                        return 2;
-                    }
-                }
-            } else if cli.prompt.as_deref() == Some("-") {
+            let stdin_is_tty = std::io::stdin().is_terminal();
+            let prompt = match resolve_one_shot_prompt(&cli, stdin_is_tty, || {
                 use std::io::Read;
                 let mut buf = String::new();
-                if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-                    eprintln!("error reading prompt from stdin: {e}");
+                std::io::stdin().read_to_string(&mut buf)?;
+                Ok(buf)
+            }) {
+                Ok(Some(p)) => p,
+                Ok(None) if matches!(cli.mode, Mode::Text) && stdin_is_tty => {
+                    let want_plain = cli.plain
+                        || !std::io::stdout().is_terminal()
+                        || std::env::var_os("CARNOT_PLAIN").is_some()
+                        || matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"));
+                    let reg_opt = ProviderRegistry::load_default(&cli.provider_configs).ok();
+                    let default_provider = cli.resolved_provider(reg_opt.as_ref());
+                    #[cfg(feature = "tui")]
+                    let rc = if !want_plain {
+                        tui::run_tui(
+                            agent,
+                            tui::TuiLaunchInfo {
+                                default_provider,
+                                provider_configs: cli.provider_configs.clone(),
+                                active_extensions: active_extension_badges(&cli),
+                            },
+                        )
+                        .await
+                    } else {
+                        repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
+                    };
+                    #[cfg(not(feature = "tui"))]
+                    let rc = {
+                        let _ = want_plain;
+                        repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
+                    };
+                    mcp.shutdown_all().await;
+                    return rc;
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "usage: carnot [-p \"<prompt>\" | --prompt-file <path>] [--image <path>] [-c] | carnot doctor | carnot audit-prefix | carnot providers | carnot modules | carnot --mode acp|rpc | carnot serve | carnot mcp list"
+                    );
                     mcp.shutdown_all().await;
                     return 2;
                 }
-                buf
-            } else if let Some(p) = cli.prompt {
-                p
-            } else if matches!(cli.mode, Mode::Text) && std::io::stdin().is_terminal() {
-                let want_plain = cli.plain
-                    || !std::io::stdout().is_terminal()
-                    || std::env::var_os("CARNOT_PLAIN").is_some()
-                    || matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"));
-                let reg_opt = ProviderRegistry::load_default(&cli.provider_configs).ok();
-                let default_provider = cli.resolved_provider(reg_opt.as_ref());
-                #[cfg(feature = "tui")]
-                let rc = if !want_plain {
-                    tui::run_tui(
-                        agent,
-                        tui::TuiLaunchInfo {
-                            default_provider,
-                            provider_configs: cli.provider_configs.clone(),
-                            active_extensions: active_extension_badges(&cli),
-                        },
-                    )
-                    .await
-                } else {
-                    repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
-                };
-                #[cfg(not(feature = "tui"))]
-                let rc = {
-                    let _ = want_plain;
-                    repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
-                };
-                mcp.shutdown_all().await;
-                return rc;
-            } else {
-                eprintln!(
-                    "usage: carnot [-p \"<prompt>\" | --prompt-file <path>] | carnot doctor | carnot audit-prefix | carnot providers | carnot modules | carnot --mode acp|rpc | carnot serve | carnot mcp list"
-                );
-                mcp.shutdown_all().await;
-                return 2;
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    mcp.shutdown_all().await;
+                    return 2;
+                }
+            };
+
+            let image_blocks = match load_image_blocks(&cli.images) {
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    eprintln!("image error: {e}");
+                    mcp.shutdown_all().await;
+                    return 2;
+                }
             };
 
             let is_json = matches!(cli.mode, Mode::Json);
@@ -747,10 +778,18 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 agent_sig.abort().await;
             });
 
+            let run_fut = async {
+                if image_blocks.is_empty() {
+                    agent.prompt(prompt).await
+                } else {
+                    let mut blocks = Vec::with_capacity(1 + image_blocks.len());
+                    blocks.push(ContentBlock::Text { text: prompt });
+                    blocks.extend(image_blocks);
+                    agent.prompt_blocks(blocks).await
+                }
+            };
             let run_res = if let Some(secs) = cli.timeout_secs {
-                match tokio::time::timeout(Duration::from_secs(secs.max(1)), agent.prompt(prompt))
-                    .await
-                {
+                match tokio::time::timeout(Duration::from_secs(secs.max(1)), run_fut).await {
                     Ok(res) => res,
                     Err(_) => {
                         agent.abort().await;
@@ -761,7 +800,7 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                     }
                 }
             } else {
-                agent.prompt(prompt).await
+                run_fut.await
             };
 
             sig_task.abort();
@@ -877,6 +916,110 @@ fn active_extension_badges(cli: &Cli) -> Vec<String> {
 }
 
 impl Cli {
+    fn effective_profile(&self) -> CliProfile {
+        self.profile.unwrap_or(CliProfile::Carnot)
+    }
+
+    fn effective_effort(&self) -> CliEffort {
+        self.effort.unwrap_or(CliEffort::High)
+    }
+
+    fn effective_cache_ttl(&self) -> &str {
+        self.cache_ttl.as_deref().unwrap_or("hybrid")
+    }
+
+    /// Merges `~/.carnot/config.toml` defaults into `Cli` without overriding explicit CLI flags.
+    fn apply_user_config(&mut self, cfg: &config::UserConfig) -> Result<(), String> {
+        if self.provider.is_none() {
+            self.provider = cfg.provider.clone();
+        }
+        if self.model.is_none() {
+            self.model = cfg.model.clone();
+        }
+        if self.effort.is_none()
+            && let Some(ref e) = cfg.effort
+        {
+            self.effort = Some(CliEffort::from_str(e, true).map_err(|_| {
+                format!("invalid effort `{e}` (expected low|medium|high|xhigh|max)")
+            })?);
+        }
+        if self.cache_ttl.is_none() {
+            self.cache_ttl = cfg.cache_ttl.clone();
+        }
+        if self.profile.is_none()
+            && let Some(ref p) = cfg.profile
+        {
+            self.profile = Some(CliProfile::from_str(p, true).map_err(|_| {
+                format!("invalid profile `{p}` (expected minimal|standard|carnot)")
+            })?);
+        }
+        if !self.plain && cfg.plain == Some(true) {
+            self.plain = true;
+        }
+        if !self.no_sandbox && cfg.sandbox == Some(false) {
+            self.no_sandbox = true;
+        }
+        if !self.allow_network && cfg.allow_network == Some(true) {
+            self.allow_network = true;
+        }
+        if !self.no_session && cfg.persist_session == Some(false) {
+            self.no_session = true;
+        }
+        if self.session_dir.is_none() {
+            self.session_dir = cfg.session_dir.clone();
+        }
+        if self.max_turns.is_none() {
+            self.max_turns = cfg.max_turns;
+        }
+        if self.max_cost_usd.is_none() {
+            self.max_cost_usd = cfg.max_cost_usd;
+        }
+        if self.compact_at.is_none() {
+            self.compact_at = cfg.compact_at;
+        }
+        if self.timeout_secs.is_none() {
+            self.timeout_secs = cfg.timeout_secs;
+        }
+        if self.exclude_tools.is_empty()
+            && let Some(ref tools) = cfg.exclude_tools
+        {
+            self.exclude_tools = tools.clone();
+        }
+        if !self.no_mcp && cfg.extensions.mcp == Some(false) {
+            self.no_mcp = true;
+        }
+        #[cfg(feature = "ext-web")]
+        match cfg.extensions.web {
+            Some(false) if !self.web => self.no_web = true,
+            Some(true) if !self.no_web => self.web = true,
+            _ => {}
+        }
+        #[cfg(feature = "ext-lsp")]
+        match cfg.extensions.lsp {
+            Some(false) if !self.lsp => self.no_lsp = true,
+            Some(true) if !self.no_lsp => self.lsp = true,
+            _ => {}
+        }
+        #[cfg(feature = "ext-subagent")]
+        match cfg.extensions.subagent {
+            Some(false) if !self.subagent => self.no_subagent = true,
+            Some(true) if !self.no_subagent => self.subagent = true,
+            _ => {}
+        }
+        #[cfg(feature = "ext-memory")]
+        {
+            match cfg.extensions.memory {
+                Some(false) if !self.memory => self.no_memory = true,
+                Some(true) if !self.no_memory => self.memory = true,
+                _ => {}
+            }
+            if self.memory_dir.is_none() {
+                self.memory_dir = cfg.extensions.memory_dir.clone();
+            }
+        }
+        Ok(())
+    }
+
     /// Standalone `carnot` (not `--host-extension`) on the default `carnot` profile enables
     /// standard zero-prefix-cost extensions out of the box (opt out with `--no-*` or `--profile minimal`).
     #[cfg(any(
@@ -886,7 +1029,7 @@ impl Cli {
         feature = "ext-memory"
     ))]
     fn default_batteries(&self) -> bool {
-        !self.host_extension && matches!(self.profile, CliProfile::Carnot)
+        !self.host_extension && matches!(self.effective_profile(), CliProfile::Carnot)
     }
 
     #[cfg(feature = "ext-web")]
@@ -1003,6 +1146,9 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
     let skills = discover_agent_skills(cwd, &cli.skills_dirs);
     let skills_names: Vec<&str> = skills.iter().map(|(n, _, _)| n.as_str()).collect();
     let dropin_exts = discover_dropin_specs(cwd, &cli.extensions, cli.trust_workspace_extensions);
+    let active_config = config::user_config_path()
+        .filter(|(p, _)| p.is_file())
+        .map(|(p, _)| p);
 
     let out = json!({
         "status": if prefix.is_ok() { "ok" } else { "degraded" },
@@ -1010,6 +1156,7 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "workspace": cwd,
+        "config_file": active_config,
         "prefix_invariance": prefix.as_ref().map(|h| json!({"pass": true, "blake3": h})).unwrap_or_else(|e| json!({"pass": false, "error": e.to_string()})),
         "provider": provider_status,
         "model": selected_model,
@@ -1131,13 +1278,13 @@ impl AcpHost for CliAcpHost {
             eff_cli.model = Some(m);
         }
         if let Some(e) = effort {
-            eff_cli.effort = match e {
+            eff_cli.effort = Some(match e {
                 ReasoningEffort::Low => CliEffort::Low,
                 ReasoningEffort::Medium => CliEffort::Medium,
                 ReasoningEffort::High => CliEffort::High,
                 ReasoningEffort::Xhigh => CliEffort::Xhigh,
                 ReasoningEffort::Max => CliEffort::Max,
-            };
+            });
         }
         Box::pin(async move {
             let extra_mcp = parse_acp_mcp_servers(&mcp_servers, &cwd);
@@ -1328,7 +1475,7 @@ async fn build_agent_full(
     extra_modules: Vec<Arc<dyn carnot::Module>>,
     system_prompt_append: Option<String>,
 ) -> carnot::Result<(Arc<carnot::Agent>, Arc<McpManager>)> {
-    let ttl = match cli.cache_ttl.to_ascii_lowercase().as_str() {
+    let ttl = match cli.effective_cache_ttl().to_ascii_lowercase().as_str() {
         "5m" | "short" => CacheTtl::Short5m,
         "1h" | "long" => CacheTtl::Long1h,
         _ => CacheTtl::Hybrid,
@@ -1359,11 +1506,15 @@ async fn build_agent_full(
 
     let interactive_surface = matches!(cli.mode, Mode::Acp | Mode::Rpc)
         || matches!(cli.command, Some(Commands::Serve { .. }))
-        || (cli.prompt.is_none() && cli.prompt_file.is_none() && cli.command.is_none());
+        || (cli.prompt.is_none()
+            && cli.prompt_file.is_none()
+            && cli.images.is_empty()
+            && cli.command.is_none()
+            && std::io::stdin().is_terminal());
     let mut b = CarnotBuilder::new(cwd.clone())
-        .profile(cli.profile.into())
+        .profile(cli.effective_profile().into())
         .model_opt(effective_model)
-        .effort(cli.effort.into())
+        .effort(cli.effective_effort().into())
         .provider_name(effective_provider)
         .cache_ttl(ttl)
         .persist_session(!cli.no_session)
@@ -1468,14 +1619,19 @@ async fn build_agent_full(
     for d in &cli.skills_dirs {
         b = b.skills_dir(d.clone());
     }
+    let default_sdir = || {
+        cli.session_dir.clone().unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".carnot").join("sessions"))
+                .unwrap_or_else(|| cwd.join(".carnot").join("sessions"))
+        })
+    };
     if let Some(ref res) = cli.resume {
         let p = PathBuf::from(res);
         let resolved = if p.is_file() {
             p
         } else {
-            let sdir = std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".carnot").join("sessions"))
-                .unwrap_or_else(|| cwd.join(".carnot").join("sessions"));
+            let sdir = default_sdir();
             if res.ends_with(".jsonl") {
                 sdir.join(res)
             } else {
@@ -1483,6 +1639,16 @@ async fn build_agent_full(
             }
         };
         b = b.resume_session(resolved).fork_session(cli.fork);
+    } else if cli.continue_last {
+        let sdir = default_sdir();
+        let latest = find_latest_session_for_workspace(&sdir, &cwd).ok_or_else(|| {
+            carnot::CarnotError::Session(format!(
+                "no previous session found for workspace `{}` in `{}`",
+                cwd.display(),
+                sdir.display()
+            ))
+        })?;
+        b = b.resume_session(latest).fork_session(cli.fork);
     }
     if cli.no_sandbox {
         b = b
@@ -1719,5 +1885,210 @@ async fn run_auth_cmd(cli: &Cli, action: &AuthCommands) -> i32 {
                 }
             }
         }
+    }
+}
+
+/// Resolves a one-shot prompt from `--prompt-file`, `-p`, and/or piped `stdin`.
+///
+/// Supports combining piped stdin with an explicit `-p` instruction (e.g. `git diff | carnot -p "review"`),
+/// standalone piped stdin (`cat err.log | carnot`), explicit `-p -`, and `--image` without text.
+fn resolve_one_shot_prompt(
+    cli: &Cli,
+    stdin_is_tty: bool,
+    read_stdin: impl FnOnce() -> std::io::Result<String>,
+) -> Result<Option<String>, String> {
+    if let Some(ref pf) = cli.prompt_file {
+        let content = std::fs::read_to_string(pf)
+            .map_err(|e| format!("reading --prompt-file {}: {e}", pf.display()))?;
+        return Ok(Some(content));
+    }
+    if cli.prompt.as_deref() == Some("-") {
+        let buf = read_stdin().map_err(|e| format!("reading prompt from stdin: {e}"))?;
+        return Ok(Some(buf));
+    }
+    let piped = if !stdin_is_tty {
+        let buf = read_stdin().map_err(|e| format!("reading prompt from stdin: {e}"))?;
+        if buf.trim().is_empty() {
+            None
+        } else {
+            Some(buf)
+        }
+    } else {
+        None
+    };
+
+    match (cli.prompt.as_deref(), piped) {
+        (Some(p), Some(s)) => Ok(Some(format!("{p}\n\n{s}"))),
+        (Some(p), None) => Ok(Some(p.to_string())),
+        (None, Some(s)) => Ok(Some(s)),
+        (None, None) if !cli.images.is_empty() => Ok(Some("Analyze the attached image(s).".into())),
+        (None, None) => Ok(None),
+    }
+}
+
+const MAX_CLI_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn detect_image_mime(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn load_image_blocks(paths: &[PathBuf]) -> Result<Vec<ContentBlock>, String> {
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let meta = std::fs::metadata(p)
+            .map_err(|e| format!("cannot stat image `{}`: {e}", p.display()))?;
+        if meta.len() > MAX_CLI_IMAGE_BYTES as u64 {
+            return Err(format!(
+                "image `{}` exceeds 20 MiB limit ({} bytes)",
+                p.display(),
+                meta.len()
+            ));
+        }
+        let bytes =
+            std::fs::read(p).map_err(|e| format!("cannot read image `{}`: {e}", p.display()))?;
+        let media_type = detect_image_mime(p, &bytes).ok_or_else(|| {
+            format!(
+                "unsupported image format `{}` (expected png, jpeg, webp, or gif)",
+                p.display()
+            )
+        })?;
+        let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        out.push(ContentBlock::Image {
+            media_type: media_type.to_string(),
+            data_base64,
+        });
+    }
+    Ok(out)
+}
+
+/// Finds the most recently modified session JSONL in `session_dir` belonging to `cwd`.
+fn find_latest_session_for_workspace(
+    session_dir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Option<PathBuf> {
+    let target_ws = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let entries = std::fs::read_dir(session_dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") || !path.is_file() {
+            continue;
+        }
+        let Some(hdr) = read_session_header(&path) else {
+            continue;
+        };
+        let Some(ws) = hdr.workspace_root else {
+            continue;
+        };
+        let ws_path = PathBuf::from(&ws);
+        let ws_canon = std::fs::canonicalize(&ws_path).unwrap_or(ws_path);
+        if ws_canon != target_ws {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let is_newer = match &best {
+            None => true,
+            Some((best_t, best_p)) => mtime > *best_t || (mtime == *best_t && path > *best_p),
+        };
+        if is_newer {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_prompt_combines_flag_and_piped_stdin() {
+        let cli = Cli::try_parse_from(["carnot", "-p", "review this diff"]).expect("parse");
+        let combined = resolve_one_shot_prompt(&cli, false, || Ok("diff --git a/x b/x".into()))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(combined, "review this diff\n\ndiff --git a/x b/x");
+
+        let tty = resolve_one_shot_prompt(&cli, true, || unreachable!("should not read tty"))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(tty, "review this diff");
+    }
+
+    #[test]
+    fn resolve_prompt_reads_standalone_piped_stdin() {
+        let cli = Cli::try_parse_from(["carnot"]).expect("parse");
+        let piped = resolve_one_shot_prompt(&cli, false, || Ok("fix cargo test\n".into()))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(piped, "fix cargo test\n");
+
+        let empty_tty = resolve_one_shot_prompt(&cli, true, || unreachable!()).expect("ok");
+        assert!(empty_tty.is_none());
+    }
+
+    #[test]
+    fn cli_flags_override_user_config_values() {
+        let mut cli = Cli::try_parse_from(["carnot", "--provider", "openai", "--effort", "low"])
+            .expect("cli");
+        let cfg = config::UserConfig {
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-5-5".into()),
+            effort: Some("max".into()),
+            cache_ttl: Some("5m".into()),
+            sandbox: Some(false),
+            ..Default::default()
+        };
+        cli.apply_user_config(&cfg).expect("apply");
+        assert_eq!(cli.provider.as_deref(), Some("openai"));
+        assert_eq!(cli.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(matches!(cli.effective_effort(), CliEffort::Low));
+        assert_eq!(cli.effective_cache_ttl(), "5m");
+        assert!(cli.no_sandbox);
+    }
+
+    #[test]
+    fn detect_image_mime_recognizes_magic_bytes() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        assert_eq!(
+            detect_image_mime(std::path::Path::new("blob.bin"), png),
+            Some("image/png")
+        );
+        let jpg = &[0xFF, 0xD8, 0xFF, 0xE0];
+        assert_eq!(
+            detect_image_mime(std::path::Path::new("blob"), jpg),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            detect_image_mime(std::path::Path::new("notes.txt"), b"hello"),
+            None
+        );
     }
 }

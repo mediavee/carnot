@@ -36,16 +36,17 @@ cargo build --release --bin carnot --features all-ext
 export ANTHROPIC_API_KEY=...
 carnot
 
-# Run a one-shot task
+# Run a one-shot task (supports piped stdin & multimodal --image)
 carnot -p "Fix the failing tests and summarize the root cause"
+git diff | carnot -p "Review this diff" --image ui.png
 
-# Resume a session, or run as an IDE / Host / HTTP server
-carnot --resume <session-id> -p "Continue"
+# Resume the latest workspace session, or run as an IDE / Host / HTTP server
+carnot -c
 carnot --mode acp
 CARNOT_HTTP_TOKEN=secret carnot serve --addr 127.0.0.1:7744
 ```
 
-> Standalone `carnot` enables `web`, `lsp`, `subagent`, and `memory` out of the box with zero static prefix-cache cost. Pass `--no-web` / `--no-lsp` / `--no-subagent` / `--no-memory` or `--profile minimal` to trim them, or run `carnot doctor` to inspect your setup.
+> Standalone `carnot` enables `web`, `lsp`, `subagent`, and `memory` out of the box with zero static prefix-cache cost. Persist personal defaults in `~/.carnot/config.toml`, override with CLI flags (`--no-web`, `--profile minimal`, etc.), or run `carnot doctor` to inspect your setup.
 
 ## Highlights
 

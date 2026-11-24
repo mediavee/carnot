@@ -41,6 +41,7 @@ carnot-ext-web = { workspace = true, optional = true }
 carnot-mcp.workspace = true
 carnot-protocol.workspace = true
 carnot-sandbox.workspace = true
+carnot-session.workspace = true
 carnot-tools.workspace = true
 tokio.workspace = true
 

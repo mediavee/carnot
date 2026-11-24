@@ -103,6 +103,11 @@ const SLASH_COMMANDS: &[SlashSpec] = &[
         desc: "Show turns, context, cache hit & USD cost",
     },
     SlashSpec {
+        name: "context",
+        usage: "/context",
+        desc: "Show context window breakdown by category",
+    },
+    SlashSpec {
         name: "cache",
         usage: "/cache",
         desc: "Show prompt-cache audit, prefix hash & TTL tiers",
@@ -923,12 +928,14 @@ impl TuiApp {
                     "  /fork               Fork session into a new branch JSONL",
                     "  /undo               Revert last Edit/Write via CAS",
                     "  /cost               Show turns, context %, cache & USD",
+                    "  /context            Show context breakdown by category",
                     "  /session            Show session ID, prefix hash & workspace",
                     "  /clear              Clear visual transcript (^L)",
                     "  /exit               Quit Carnot",
                     "",
-                    "Shortcuts: Enter send · Shift+Enter / ^J newline · Esc abort turn",
-                    "           ^P models · ^T thinking · ^O expand tools · PgUp/PgDn scroll",
+                    "Shortcuts: Enter send/steer · Alt+Enter follow-up (while running)",
+                    "           Shift+Enter / ^J newline · Esc abort turn · ^P models",
+                    "           ^T thinking · ^O expand tools · PgUp/PgDn scroll",
                 ]
                 .join("\n");
                 self.push_notice(NoticeKind::Info, "Carnot Commands & Shortcuts", Some(body));
@@ -1041,6 +1048,50 @@ impl TuiApp {
                     u.cost_usd
                 );
                 self.push_notice(NoticeKind::Info, "Session Telemetry", Some(body));
+            }
+            "context" | "ctx" => {
+                self.refresh_agent_snapshot().await;
+                let (tokens, breakdown) = self.agent.current_context_with_breakdown().await;
+                let window = self.agent.current_context_window().await.max(1);
+                let pct = (tokens as f64 / window as f64) * 100.0;
+                let body = match breakdown {
+                    Some(b) => {
+                        let row = |label: &str, val: u64| {
+                            let share = if tokens > 0 {
+                                (val as f64 / tokens as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            let filled = ((val as f64 / window as f64) * 20.0).round() as usize;
+                            let bar = format!(
+                                "{}{}",
+                                "█".repeat(filled.min(20)),
+                                "░".repeat(20usize.saturating_sub(filled.min(20)))
+                            );
+                            format!(
+                                "  {label:<13} [{bar}] {:>7} ({share:>4.1}%)",
+                                fmt_tokens(val)
+                            )
+                        };
+                        let est = if b.estimated { " (estimated)" } else { "" };
+                        format!(
+                            "  Total: {} / {} ({pct:.1}%){est}\n{}\n{}\n{}\n{}\n{}",
+                            fmt_tokens(tokens),
+                            fmt_tokens(window),
+                            row("system", b.system),
+                            row("tools", b.tools),
+                            row("memory", b.memory),
+                            row("messages", b.messages),
+                            row("tool_results", b.tool_results),
+                        )
+                    }
+                    None => format!(
+                        "  Total: {} / {} ({pct:.1}%)\n  Breakdown pending next provider turn (reset after compaction).",
+                        fmt_tokens(tokens),
+                        fmt_tokens(window),
+                    ),
+                };
+                self.push_notice(NoticeKind::Info, "Context Breakdown", Some(body));
             }
             "cache" => {
                 let m = self.agent.metrics().await;
@@ -1436,10 +1487,9 @@ impl TuiApp {
         // Standard composer editing
         match key.code {
             KeyCode::Enter => {
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                {
+                let is_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+                if is_shift || (is_alt && !self.running) {
                     self.editor.insert_char('\n');
                 } else {
                     let raw = self.editor.take_and_record();
@@ -1450,13 +1500,30 @@ impl TuiApp {
                     if let Some(cmd) = trimmed.strip_prefix('/') {
                         return self.handle_slash_command(cmd).await;
                     }
-                    if self.running || self.compacting {
+                    if self.compacting {
                         self.push_notice(
                             NoticeKind::Warning,
-                            "A turn is already running — press Esc to abort first",
+                            "Compaction in progress — wait a moment before sending",
                             None,
                         );
                         self.editor.set_text(&raw);
+                    } else if self.running {
+                        let preview = markdown::truncate_display(&trimmed.replace('\n', " "), 80);
+                        if is_alt {
+                            self.agent.follow_up(trimmed.to_string()).await;
+                            self.push_notice(
+                                NoticeKind::Info,
+                                format!("Follow-up queued → {preview}"),
+                                None,
+                            );
+                        } else {
+                            self.agent.steer(trimmed.to_string()).await;
+                            self.push_notice(
+                                NoticeKind::Info,
+                                format!("Steer queued → {preview}"),
+                                None,
+                            );
+                        }
                     } else {
                         self.start_prompt(trimmed.to_string());
                     }
@@ -2973,6 +3040,39 @@ mod tests {
         // 6. Tiny viewport safety
         let mut tiny = Terminal::new(TestBackend::new(24, 10)).expect("tiny backend");
         tiny.draw(|f| app.draw(f)).expect("draw tiny");
+
+        // 7. `/context` command (before and after a turn) and live steer / follow-up while running
+        assert!(!app.handle_slash_command("context").await);
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            TranscriptItem::Notice { title, body: Some(d), .. }
+                if title == "Context Breakdown" && d.contains("Total:")
+        )));
+        let _ = app.agent.prompt("hello").await.expect("faux turn");
+        assert!(!app.handle_slash_command("context").await);
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            TranscriptItem::Notice { title, body: Some(d), .. }
+                if title == "Context Breakdown" && d.contains("system") && d.contains("tools")
+        )));
+
+        app.running = true;
+        app.editor.set_text("change direction");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            TranscriptItem::Notice { title, .. } if title.contains("Steer queued")
+        )));
+
+        app.editor.set_text("run tests next");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+            .await;
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            TranscriptItem::Notice { title, .. } if title.contains("Follow-up queued")
+        )));
+        app.running = false;
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -42,8 +42,8 @@ pub use carnot_cas::{
     shape_text_output,
 };
 pub use carnot_core::{
-    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContextBreakdown, EventEnvelope, Message,
-    ModelPricing, ModuleSwitches, NativeWebConfig, Profile, ProviderWebCapabilities,
+    AgentEvent, CacheTtl, CarnotConfig, CarnotError, ContentBlock, ContextBreakdown, EventEnvelope,
+    Message, ModelPricing, ModuleSwitches, NativeWebConfig, Profile, ProviderWebCapabilities,
     RateLimitWindow, ReasoningEffort, Result, StopReason, ThermodynamicMetrics, ToolEffects,
     ToolOutput, ToolSpec, Usage, UserQuestion, UserQuestionAnswer, UserQuestionOption,
     canonicalize_json,
@@ -103,6 +103,7 @@ pub use carnot_protocol::{
 pub use carnot_sandbox::{
     SandboxBackendInfo, detect_sandbox_backend, try_handle_landlock_exec_arg,
 };
+pub use carnot_session::{SessionHeaderSummary, read_session_header};
 pub use carnot_tools::{Tool, ToolRegistry};
 
 use std::path::PathBuf;

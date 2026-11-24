@@ -103,8 +103,15 @@ class CarnotClient:
         await self._proc.stdin.drain()
         return await fut
 
-    async def prompt(self, message: str) -> dict[str, Any]:
-        return await self.call("prompt", {"message": message})
+    async def prompt(
+        self,
+        message: str,
+        images: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"message": message}
+        if images:
+            params["images"] = images
+        return await self.call("prompt", params)
 
     async def steer(self, message: str) -> dict[str, Any]:
         return await self.call("steer", {"message": message})
@@ -127,6 +134,9 @@ class CarnotClient:
 
     async def get_metrics(self) -> dict[str, Any]:
         return await self.call("get_metrics")
+
+    async def get_session_stats(self) -> dict[str, Any]:
+        return await self.call("get_session_stats")
 
     async def list_pending(self) -> dict[str, Any]:
         return await self.call("list_pending")

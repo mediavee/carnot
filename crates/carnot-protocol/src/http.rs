@@ -11,7 +11,7 @@
 
 use crate::interaction::ChannelInteractionBroker;
 use carnot_agent::Agent;
-use carnot_core::{AgentEvent, Result, UserQuestionAnswer};
+use carnot_core::{AgentEvent, ContentBlock, Result, UserQuestionAnswer};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -334,10 +334,20 @@ async fn handle_conn(
             let sid = agent.session_id().await;
             let ph = agent.prefix_hash().await;
             let seq = agent.latest_event_seq();
+            let (ctx_tokens, ctx_breakdown) = agent.current_context_with_breakdown().await;
+            let ctx_window = agent.current_context_window().await;
             write_json(
                 &mut write_half,
                 200,
-                &json!({"session_id": sid, "prefix_hash": ph, "latest_seq": seq, "metrics": met}),
+                &json!({
+                    "session_id": sid,
+                    "prefix_hash": ph,
+                    "latest_seq": seq,
+                    "context_tokens": ctx_tokens,
+                    "context_window": ctx_window,
+                    "context_breakdown": ctx_breakdown,
+                    "metrics": met,
+                }),
             )
             .await
         }
@@ -491,13 +501,44 @@ async fn handle_conn(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let mut image_blocks = Vec::new();
+            if let Some(images) = payload.get("images").and_then(Value::as_array) {
+                for img in images {
+                    let media_type = img
+                        .get("media_type")
+                        .or_else(|| img.get("mimeType"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png");
+                    if let Some(data) = img
+                        .get("data_base64")
+                        .or_else(|| img.get("data"))
+                        .and_then(Value::as_str)
+                        && !data.is_empty()
+                    {
+                        image_blocks.push(ContentBlock::Image {
+                            media_type: media_type.to_string(),
+                            data_base64: data.to_string(),
+                        });
+                    }
+                }
+            }
             let stream_sse = payload
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
             if !stream_sse {
-                match agent.prompt(prompt).await {
+                let res = if image_blocks.is_empty() {
+                    agent.prompt(prompt).await
+                } else {
+                    let mut blocks = Vec::with_capacity(1 + image_blocks.len());
+                    if !prompt.is_empty() {
+                        blocks.push(ContentBlock::Text { text: prompt });
+                    }
+                    blocks.extend(image_blocks);
+                    agent.prompt_blocks(blocks).await
+                };
+                match res {
                     Ok(o) => {
                         write_json(
                             &mut write_half,
@@ -522,7 +563,18 @@ async fn handle_conn(
                 let start_seq = agent.latest_event_seq();
                 let mut ev_stream = agent.subscribe_from(start_seq);
                 let ag_run = agent.clone();
-                let run_task = tokio::spawn(async move { ag_run.prompt(prompt).await });
+                let run_task = tokio::spawn(async move {
+                    if image_blocks.is_empty() {
+                        ag_run.prompt(prompt).await
+                    } else {
+                        let mut blocks = Vec::with_capacity(1 + image_blocks.len());
+                        if !prompt.is_empty() {
+                            blocks.push(ContentBlock::Text { text: prompt });
+                        }
+                        blocks.extend(image_blocks);
+                        ag_run.prompt_blocks(blocks).await
+                    }
+                });
 
                 loop {
                     match tokio::time::timeout(
