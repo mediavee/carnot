@@ -115,6 +115,16 @@ pub fn host_safe_git_command(repo_root: &Path) -> std::process::Command {
 
 /// Applies strict environment allowlist (`env_clear()`) + safe `LC_*` + `extra_env` to any child process
 /// (used by `Bash`, `McpStdioClient`, and `SubprocessExtension`).
+/// Default non-interactive environment variables applied to agent subshells before `extra_env`
+/// so pagers, credential prompts, and progress bars never hang or flood observation budgets.
+const NON_INTERACTIVE_SHELL_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("PIP_PROGRESS_BAR", "off"),
+    ("TQDM_DISABLE", "1"),
+];
+
 pub fn apply_safe_env(cmd: &mut Command, extra_env: &BTreeMap<String, String>) {
     let mut kept: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in std::env::vars() {
@@ -130,6 +140,9 @@ pub fn apply_safe_env(cmd: &mut Command, extra_env: &BTreeMap<String, String>) {
     // Neutralize shell startup scripts that could reload host secrets.
     cmd.env("BASH_ENV", "");
     cmd.env("ENV", "");
+    for (k, v) in NON_INTERACTIVE_SHELL_ENV {
+        cmd.env(k, v);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -149,6 +162,9 @@ pub fn apply_unsandboxed_env(
     cmd.env("AI_AGENT", "carnot");
     cmd.env("BASH_ENV", "");
     cmd.env("ENV", "");
+    for (k, v) in NON_INTERACTIVE_SHELL_ENV {
+        cmd.env(k, v);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -867,6 +883,40 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim(),
             "BLOCKED",
             "Seatbelt must still block {target:?} even when HOME is overridden to {fake_home:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn non_interactive_shell_env_defaults_and_extra_env_override() {
+        let dir = std::env::temp_dir().join(format!("carnot-sb-nonint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let policy = SandboxPolicy::for_workspace(dir.clone(), false, true);
+
+        let out = build_sandboxed_shell(
+            &policy,
+            "printf '%s|%s|%s|%s|%s' \"$GIT_TERMINAL_PROMPT\" \"$PAGER\" \"$MANPAGER\" \"$PIP_PROGRESS_BAR\" \"$TQDM_DISABLE\"",
+            &BTreeMap::new(),
+        )
+        .expect("cmd")
+        .output()
+        .await
+        .expect("run");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "0|cat|cat|off|1");
+
+        let mut extra = BTreeMap::new();
+        extra.insert("PAGER".into(), "custom-pager".into());
+        let out_override =
+            build_sandboxed_shell(&policy, "printf '%s' \"$PAGER\"", &extra)
+                .expect("cmd")
+                .output()
+                .await
+                .expect("run");
+        assert!(out_override.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out_override.stdout),
+            "custom-pager"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
