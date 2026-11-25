@@ -3734,6 +3734,12 @@ async fn e2e_codemode_batches_tools_enforces_policy_guard_and_preserves_prefix_i
     fs::create_dir_all(&dir2).expect("mkdir 2");
     fs::write(dir1.join("a.txt"), "alpha=10\n").expect("write a");
     fs::write(dir1.join("b.txt"), "beta=20\n").expect("write b");
+    fs::write(dir1.join("secret_cfg.txt"), "cfg=important_content\n").expect("write secret_cfg");
+    fs::write(
+        dir1.join("multi.txt"),
+        "k0=old\nk1=old\nk2=old\nk3=old\nk4=old\nk5=old\nk6=old\nk7=old\n",
+    )
+    .expect("write multi");
     fs::write(dir1.join(".env"), "TOP_SECRET=never_expose_me\n").expect("write env");
 
     let faux1 = Arc::new(FauxProvider::new(vec![
@@ -3742,10 +3748,15 @@ async fn e2e_codemode_batches_tools_enforces_policy_guard_and_preserves_prefix_i
             "CodeMode",
             json!({
                 "code": r#"
-                    const [a, b] = await Promise.all([
+                    const [a, b, cfg] = await Promise.all([
                         tools.Read({ file_path: "a.txt" }),
                         tools.Read({ file_path: "b.txt" }),
+                        tools.Read({ file_path: "secret_cfg.txt" }),
                     ]);
+                    // 8 concurrent Edits to the SAME file must serialize without losing any update!
+                    await Promise.all([0,1,2,3,4,5,6,7].map(i =>
+                        tools.Edit({ file_path: "multi.txt", old_string: `k${i}=old`, new_string: `k${i}=new` })
+                    ));
                     let blocked = false;
                     try {
                         await tools.Read({ file_path: ".env" });
@@ -3753,9 +3764,15 @@ async fn e2e_codemode_batches_tools_enforces_policy_guard_and_preserves_prefix_i
                         blocked = String(e.message).includes("denied");
                     }
                     store("done", true);
-                    return { a_ok: a.includes("alpha=10"), b_ok: b.includes("beta=20"), env_blocked: blocked };
+                    return { a_ok: a.includes("alpha=10"), b_ok: b.includes("beta=20"), cfg_len: cfg.length, env_blocked: blocked };
                 "#
             }),
+        )]),
+        // Turn 2: Model reads `secret_cfg.txt` directly -> MUST return real content, NOT `[unchanged]` stub!
+        ScriptedTurn::tool_calls(vec![(
+            "r_cfg",
+            "Read",
+            json!({"file_path": "secret_cfg.txt"}),
         )]),
         ScriptedTurn::text("Batched safely via CodeMode."),
     ]));
@@ -3772,13 +3789,22 @@ async fn e2e_codemode_batches_tools_enforces_policy_guard_and_preserves_prefix_i
         .expect("build agent1");
 
     let out = agent1
-        .prompt("Inspect a.txt, b.txt, and check .env policy via CodeMode")
+        .prompt("Inspect a.txt, b.txt, multi.txt, and check .env policy via CodeMode")
         .await
         .expect("prompt");
     assert_eq!(out.final_text, "Batched safely via CodeMode.");
 
+    // All 8 parallel edits inside CodeMode MUST survive on disk!
+    let multi_disk = fs::read_to_string(dir1.join("multi.txt")).expect("read multi");
+    for i in 0..8 {
+        assert!(
+            multi_disk.contains(&format!("k{i}=new")),
+            "lost parallel CodeMode edit k{i}! disk:\n{multi_disk}"
+        );
+    }
+
     let reqs = faux1.recorded_requests();
-    assert_eq!(reqs.len(), 2, "expected 2 provider turns");
+    assert_eq!(reqs.len(), 3, "expected 3 provider turns");
     let turn2_json = msgs_json(&reqs[1].messages);
     assert!(
         turn2_json.contains("\\\"a_ok\\\":true")
@@ -3789,6 +3815,12 @@ async fn e2e_codemode_batches_tools_enforces_policy_guard_and_preserves_prefix_i
     assert!(
         !turn2_json.contains("never_expose_me"),
         "secret from .env must NEVER leak through CodeMode"
+    );
+    // Turn 3 must see actual content of `secret_cfg.txt`, proving CodeMode Read did not poison ReadTracker!
+    let turn3_json = msgs_json(&reqs[2].messages);
+    assert!(
+        turn3_json.contains("cfg=important_content") && !turn3_json.contains("[unchanged:"),
+        "Read after CodeMode Read must return real content, not unchanged stub! got:\n{turn3_json}"
     );
 
     // Cross-CWD prefix invariance with `codemode(true)` must hold byte-for-byte.

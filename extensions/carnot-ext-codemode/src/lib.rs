@@ -39,6 +39,8 @@ pub struct CodeModeConfig {
     pub max_stack_size_bytes: usize,
     /// Maximum nested tool calls permitted within a single `CodeMode` invocation (default: 64).
     pub max_tool_calls: usize,
+    /// Maximum nested tool calls executing concurrently via `Promise.all` (default: 8).
+    pub max_concurrent_tool_calls: usize,
     /// Inline output byte threshold before spilling full output to CAS (default: 16 KiB).
     pub max_output_bytes: usize,
     /// Maximum total bytes captured by `console.*` per invocation (default: 64 KiB).
@@ -57,6 +59,7 @@ impl Default for CodeModeConfig {
             memory_limit_bytes: 64 * 1024 * 1024,
             max_stack_size_bytes: 2 * 1024 * 1024,
             max_tool_calls: 64,
+            max_concurrent_tool_calls: 8,
             max_output_bytes: 16_384,
             max_log_bytes: 65_536,
             max_store_bytes: 512 * 1024,
@@ -700,6 +703,88 @@ mod tests {
         assert!(
             txt.contains("full output saved at"),
             "oversized output must spill to CAS, got: {txt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unresolved_promise_cancels_on_timeout_and_external_cancel_and_try_catch_cannot_swallow_exit()
+     {
+        let (tool, dir) = make_tool(CodeModeConfig::default());
+
+        // 1. Unresolved `await new Promise(() => {})` MUST terminate promptly on timeout_ms!
+        let t0 = Instant::now();
+        let hang = tool
+            .execute(
+                json!({"code": "await new Promise(() => {});", "timeout_ms": 150}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("hang timeout");
+        assert!(hang.is_error, "hanging promise must fail on timeout");
+        assert!(
+            hang.text_only().contains("timed out"),
+            "expected timeout error, got: {}",
+            hang.text_only()
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "hanging promise must terminate promptly, elapsed={:?}",
+            t0.elapsed()
+        );
+
+        // 2. External CancellationToken cancels unresolved promise immediately!
+        let cancel = CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            cancel_trigger.cancel();
+        });
+        let t1 = Instant::now();
+        let cancelled = tool
+            .execute(
+                json!({"code": "await new Promise(() => {});", "timeout_ms": 60000}),
+                cancel,
+            )
+            .await
+            .expect("hang cancel");
+        assert!(cancelled.is_error, "cancelled promise must fail");
+        assert!(
+            cancelled.text_only().contains("cancelled"),
+            "expected cancelled error, got: {}",
+            cancelled.text_only()
+        );
+        assert!(
+            t1.elapsed() < Duration::from_secs(2),
+            "cancel must wake hanging promise promptly, elapsed={:?}",
+            t1.elapsed()
+        );
+
+        // 3. `exit()` inside `try/catch` cannot be swallowed and commits `store`.
+        let ex = tool
+            .execute(
+                json!({
+                    "code": "store('k', 42); try { exit('escaped-try'); } catch (e) { text('swallowed'); } text('after');"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("exit inside try");
+        assert!(
+            !ex.is_error,
+            "exit() inside try/catch must succeed: {}",
+            ex.text_only()
+        );
+        assert!(
+            ex.text_only().contains("escaped-try"),
+            "got: {}",
+            ex.text_only()
+        );
+        assert!(
+            !ex.text_only().contains("swallowed") && !ex.text_only().contains("after"),
+            "try/catch must not swallow exit(): {}",
+            ex.text_only()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

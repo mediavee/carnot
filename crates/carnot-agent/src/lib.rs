@@ -76,16 +76,21 @@ pub(crate) fn current_utc_date_ymd() -> String {
     format_utc_date_ymd(secs)
 }
 
-/// Extracts the most recent `[date: YYYY-MM-DD]` line recorded in `messages`, if any.
+/// Extracts the most recent `[date: YYYY-MM-DD UTC]` (or legacy `[date: YYYY-MM-DD]`) line
+/// recorded in `Role::User` messages, ignoring assistant text so models cannot spoof the tag.
 pub(crate) fn last_date_tag_in_messages(messages: &[Arc<Message>]) -> Option<String> {
     for msg in messages.iter().rev() {
+        if msg.role != Role::User {
+            continue;
+        }
         for block in msg.content.iter().rev() {
             if let ContentBlock::Text { text } = block {
                 for line in text.lines().rev() {
                     let trimmed = line.trim();
                     if let Some(rest) = trimmed.strip_prefix("[date: ")
-                        && let Some(date) = rest.strip_suffix(']')
+                        && let Some(inner) = rest.strip_suffix(']')
                     {
+                        let date = inner.strip_suffix(" UTC").unwrap_or(inner);
                         let b = date.as_bytes();
                         if b.len() == 10
                             && b[4] == b'-'
@@ -102,6 +107,115 @@ pub(crate) fn last_date_tag_in_messages(messages: &[Arc<Message>]) -> Option<Str
         }
     }
     None
+}
+
+/// Deadlock-free effect-based async lock coordinator used by [`Agent::invoke_tool_gated`].
+///
+/// Enforces the same conflict rules as Carnot's wave scheduler for nested orchestration calls
+/// (`CodeMode` `Promise.all`, future extensions):
+/// - `ToolEffects::serial()` acquires the exclusive global write lock.
+/// - Non-serial tools acquire the shared global read lock, then acquire per-path `RwLock`s
+///   (write for `effects.writes`, read for `effects.reads`) in canonical sorted path order.
+#[derive(Debug, Default)]
+struct ToolEffectLocks {
+    serial: Arc<tokio::sync::RwLock<()>>,
+    /// Ensures `global_read` tools (e.g. `Grep`) never race with any write, while still allowing
+    /// disjoint writes (`Edit(a)` + `Edit(b)`) to execute in parallel (`global_read` acquires
+    /// write; writers acquire read).
+    global_read_vs_write: Arc<tokio::sync::RwLock<()>>,
+    paths: std::sync::Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::RwLock<()>>>>,
+}
+
+#[derive(Debug)]
+struct ToolEffectGuard {
+    _serial_write: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    _serial_read: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _global_rw_write: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    _global_rw_read: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _path_writes: Vec<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    _path_reads: Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl ToolEffectLocks {
+    fn normalize_key(path: &Path) -> std::path::PathBuf {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            std::path::PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            path.to_path_buf()
+        }
+    }
+
+    fn path_lock(&self, key: &Path) -> Arc<tokio::sync::RwLock<()>> {
+        let mut map = self
+            .paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            map.entry(key.to_path_buf())
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(()))),
+        )
+    }
+
+    async fn acquire(&self, effects: &ToolEffects) -> ToolEffectGuard {
+        if effects.serial_barrier {
+            let w = Arc::clone(&self.serial).write_owned().await;
+            return ToolEffectGuard {
+                _serial_write: Some(w),
+                _serial_read: None,
+                _global_rw_write: None,
+                _global_rw_read: None,
+                _path_writes: Vec::new(),
+                _path_reads: Vec::new(),
+            };
+        }
+        let sr = Arc::clone(&self.serial).read_owned().await;
+
+        let (global_rw_write, global_rw_read) = if effects.global_read {
+            (
+                Some(Arc::clone(&self.global_read_vs_write).write_owned().await),
+                None,
+            )
+        } else if !effects.writes.is_empty() {
+            (
+                None,
+                Some(Arc::clone(&self.global_read_vs_write).read_owned().await),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Deduplicate & sort all touched paths in canonical order (write wins over read) -> deadlock-free.
+        let mut targets: std::collections::BTreeMap<std::path::PathBuf, bool> =
+            std::collections::BTreeMap::new();
+        for p in &effects.reads {
+            targets.entry(Self::normalize_key(p)).or_insert(false);
+        }
+        for p in &effects.writes {
+            targets.insert(Self::normalize_key(p), true);
+        }
+
+        let mut path_writes = Vec::new();
+        let mut path_reads = Vec::new();
+        for (key, is_write) in targets {
+            let lock = self.path_lock(&key);
+            if is_write {
+                path_writes.push(lock.write_owned().await);
+            } else {
+                path_reads.push(lock.read_owned().await);
+            }
+        }
+        ToolEffectGuard {
+            _serial_write: None,
+            _serial_read: Some(sr),
+            _global_rw_write: global_rw_write,
+            _global_rw_read: global_rw_read,
+            _path_writes: path_writes,
+            _path_reads: path_reads,
+        }
+    }
 }
 
 /// Snapshot captured from a parent `Agent` to construct a prompt-cache-warm forked child.
@@ -199,6 +313,13 @@ pub struct Agent {
     /// Provider-billed context tokens from the previous turn on the same unbroken prefix,
     /// used to compute `SessionMetrics::prefix_retention_rate()`.
     last_prompt_context_tokens: Mutex<Option<u64>>,
+    /// Effect-based async lock coordinator for nested tool calls (`invoke_tool_gated`).
+    effect_locks: ToolEffectLocks,
+    /// Active segment facts shared by both direct tool waves and nested `invoke_tool_gated` calls
+    /// so compaction never loses track of files mutated or CAS handles created inside `CodeMode`.
+    active_segment: Mutex<SegmentTracker>,
+    /// Cached UTC `YYYY-MM-DD` of the last emitted `[date: ... UTC]` note (O(1) per turn).
+    last_emitted_date: Mutex<Option<String>>,
 }
 
 fn effective_static_system_prompt(config: &CarnotConfig) -> String {
@@ -487,6 +608,8 @@ impl Agent {
             max_output_tokens: config.max_output_tokens,
         };
 
+        let initial_date = last_date_tag_in_messages(session.active_messages());
+
         Self {
             config,
             runtime: Mutex::new(runtime),
@@ -510,6 +633,9 @@ impl Agent {
             deferred_server_descriptions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             last_prefix_state: Mutex::new(None),
             last_prompt_context_tokens: Mutex::new(None),
+            effect_locks: ToolEffectLocks::default(),
+            active_segment: Mutex::new(SegmentTracker::default()),
+            last_emitted_date: Mutex::new(initial_date),
         }
     }
 
@@ -537,12 +663,15 @@ impl Agent {
         let has_msgs = !loaded.active_messages().is_empty();
         let (hydrated_goal, hydrated_followups) =
             hydrate_anchors_from_session(loaded.active_messages());
+        let loaded_date = last_date_tag_in_messages(loaded.active_messages());
         *self.session.lock().await = loaded;
         *self.turn1_injected.lock().await = has_msgs;
         *self.raw_user_goal.lock().await = hydrated_goal;
         *self.user_instructions.lock().await = hydrated_followups;
         *self.last_prefix_state.lock().await = None;
         *self.last_prompt_context_tokens.lock().await = None;
+        *self.active_segment.lock().await = SegmentTracker::default();
+        *self.last_emitted_date.lock().await = loaded_date;
         self.tools.reset_read_tracker();
         Ok(sid)
     }
@@ -710,12 +839,16 @@ impl Agent {
         self.tools.specs()
     }
 
-    /// Executes one tool call through Carnot's full security pipeline (`before_tool_call` module
-    /// hooks, `PermissionBroker`, `Tool::execute_with_id`, and `after_tool_result` hooks such as
-    /// secret redaction and LSP diagnostics).
-    ///
-    /// Used by orchestration extensions such as `carnot-ext-codemode` so nested tool invocations
-    /// can never bypass policies, hooks, or interactive approval gates.
+    /// Executes one tool call through Carnot's full security, concurrency, and observability
+    /// pipeline:
+    /// - emits balanced `ToolStart` / `ToolEnd` events (so TUI/ACP correlate permission requests),
+    /// - runs `before_tool_call` modules (`PolicyGuard`, `Hooks`) and `PermissionBroker`,
+    /// - enforces effect-based locking (`serial` vs per-path `RwLock`s) so concurrent `Promise.all`
+    ///   calls to `Edit`/`Write`/`Bash` never race or lose updates,
+    /// - suppresses model-facing `ReadTracker` view/stub mutations so internal reads never poison
+    ///   the LLM's view and always return full text to the script,
+    /// - runs `after_tool_result` hooks (secret redaction, LSP diagnostics) and updates the active
+    ///   `SegmentTracker` so compaction retains every edited file and CAS handle.
     pub async fn invoke_tool_gated(
         &self,
         call_id: &str,
@@ -726,25 +859,81 @@ impl Agent {
         let Some(tool) = self.tools.get(tool_name) else {
             return Ok(ToolOutput::err_text(format!("Unknown tool `{tool_name}`")));
         };
+        let t0 = Instant::now();
+        self.events.push(AgentEvent::ToolStart {
+            call_id: call_id.to_string(),
+            tool: tool_name.to_string(),
+            eager: false,
+            input: raw_input.clone(),
+        });
+
         let (effective_input, denied) = self.gate_tool_call(call_id, tool_name, &raw_input).await;
         if let Some(reason) = denied {
-            return Ok(ToolOutput::err_text(format!(
-                "Tool `{tool_name}` denied: {reason}"
-            )));
+            let out = ToolOutput::err_text(format!("Tool `{tool_name}` denied: {reason}"));
+            self.events.push(AgentEvent::ToolEnd {
+                call_id: call_id.to_string(),
+                tool: tool_name.to_string(),
+                is_error: true,
+                duration_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output_preview: clip_utf8_preview(&out.text_only(), 8_192),
+            });
+            return Ok(out);
         }
-        let mut out = match tool
-            .execute_with_id(call_id, effective_input.clone(), cancel)
-            .await
+
+        let effects = tool.effects(&effective_input);
+        let effect_guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                self.events.push(AgentEvent::ToolEnd {
+                    call_id: call_id.to_string(),
+                    tool: tool_name.to_string(),
+                    is_error: true,
+                    duration_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    output_preview: "Cancelled".to_string(),
+                });
+                return Err(CarnotError::Cancelled);
+            }
+            guard = self.effect_locks.acquire(&effects) => guard,
+        };
+
+        let mut out = match carnot_tools::tracker::with_suppressed_read_tracking(
+            tool.execute_with_id(call_id, effective_input.clone(), cancel),
+        )
+        .await
         {
             Ok(out) => out,
-            Err(CarnotError::Cancelled) => return Err(CarnotError::Cancelled),
+            Err(CarnotError::Cancelled) => {
+                self.events.push(AgentEvent::ToolEnd {
+                    call_id: call_id.to_string(),
+                    tool: tool_name.to_string(),
+                    is_error: true,
+                    duration_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    output_preview: "Cancelled".to_string(),
+                });
+                return Err(CarnotError::Cancelled);
+            }
             Err(e) => ToolOutput::err_text(format!("Tool `{tool_name}` error: {e}")),
         };
+        drop(effect_guard);
+
         for m in &self.modules {
             let _ = m
                 .after_tool_result(tool_name, &effective_input, &mut out)
                 .await;
         }
+        {
+            let mut seg = self.active_segment.lock().await;
+            self.record_segment_facts(tool_name, &effective_input, &out, &mut seg)
+                .await;
+        }
+
+        self.events.push(AgentEvent::ToolEnd {
+            call_id: call_id.to_string(),
+            tool: tool_name.to_string(),
+            is_error: out.is_error,
+            duration_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+            output_preview: clip_utf8_preview(&out.text_only(), 8_192),
+        });
         Ok(out)
     }
 
@@ -973,7 +1162,10 @@ impl Agent {
     pub async fn compact_now_with_focus(&self, focus: Option<&str>) -> Result<(u64, u64, bool)> {
         let _run_guard = self.run_lock.lock().await;
         let (eff_cfg, eff_provider) = self.effective_config_and_provider().await;
-        let seg = SegmentTracker::default();
+        let seg_snapshot = {
+            let g = self.active_segment.lock().await;
+            g.clone()
+        };
         let res = execute_compaction(
             CompactionMode::Manual,
             &eff_cfg,
@@ -986,7 +1178,7 @@ impl Agent {
             &self.events,
             &self.raw_user_goal,
             &self.user_instructions,
-            &seg,
+            &seg_snapshot,
             focus,
             CancellationToken::new(),
         )
@@ -994,6 +1186,8 @@ impl Agent {
         if res.is_ok() {
             *self.last_prefix_state.lock().await = None;
             *self.last_prompt_context_tokens.lock().await = None;
+            *self.active_segment.lock().await = SegmentTracker::default();
+            *self.last_emitted_date.lock().await = Some(current_utc_date_ymd());
         }
         res
     }
@@ -1233,6 +1427,24 @@ impl Agent {
             }
         }
 
+        // Sparse UTC calendar date note (NEVER in the static system prompt, so `audit-prefix`
+        // stays byte-identical): emitted once on the first user turn (placed AFTER Turn-1 context
+        // blocks and directly before the user prompt) and again only if the UTC calendar date
+        // changed across a resumed session.
+        if !continue_existing {
+            let today = current_utc_date_ymd();
+            let mut last_date = self.last_emitted_date.lock().await;
+            if last_date.as_deref() != Some(today.as_str()) {
+                *last_date = Some(today.clone());
+                let tag = format!("[date: {today} UTC]");
+                if initial_text.is_empty() {
+                    initial_text = tag;
+                } else {
+                    initial_text = format!("{tag}\n\n{initial_text}");
+                }
+            }
+        }
+
         // Inject execution-verified Turn-1 context (NEVER into static system prompt!)
         {
             let mut injected = self.turn1_injected.lock().await;
@@ -1272,25 +1484,6 @@ impl Agent {
                     } else {
                         initial_text = format!("{}\n\n{initial_text}", turn1_blocks.join("\n\n"));
                     }
-                }
-            }
-        }
-
-        // Sparse calendar date note (NEVER in the static system prompt, so `audit-prefix` stays
-        // byte-identical): emitted once on the first user turn and again only if the UTC calendar
-        // date changed across a resumed session (or after compaction drops older messages).
-        if !continue_existing {
-            let today = current_utc_date_ymd();
-            let needs_date = {
-                let s = self.session.lock().await;
-                last_date_tag_in_messages(s.active_messages()).as_deref() != Some(today.as_str())
-            };
-            if needs_date {
-                let tag = format!("[date: {today}]");
-                if initial_text.is_empty() {
-                    initial_text = tag;
-                } else {
-                    initial_text = format!("{tag}\n\n{initial_text}");
                 }
             }
         }
@@ -1379,7 +1572,7 @@ impl Agent {
             s.mark_checkpoint("user_turn")?;
         }
 
-        let mut seg = SegmentTracker::default();
+        self.active_segment.lock().await.reset();
         let mut final_text = String::new();
         let mut halted_reason: Option<String> = None;
         let mut settled_normally = false;
@@ -1411,9 +1604,9 @@ impl Agent {
                 let trigger = effective_proactive_trigger(&eff_cfg);
                 if trigger > 0 && msg_count >= 10 && cooldown_ok && pre_est >= trigger {
                     last_compaction_turn = Some(current_turns);
-                    self.compact_with_mode(CompactionMode::Soft, &seg, cancel.clone())
+                    self.compact_with_mode(CompactionMode::Soft, cancel.clone())
                         .await?;
-                    seg.reset();
+                    self.active_segment.lock().await.reset();
                 }
             }
 
@@ -1550,9 +1743,9 @@ impl Agent {
                 {
                     consecutive_emergency_compactions += 1;
                     last_compaction_turn = Some(turn_num);
-                    self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
+                    self.compact_with_mode(CompactionMode::EmergencyOverflow, cancel.clone())
                         .await?;
-                    seg.reset();
+                    self.active_segment.lock().await.reset();
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -1671,9 +1864,9 @@ impl Agent {
                 if self.config.modules.compaction && consecutive_emergency_compactions < 1 {
                     consecutive_emergency_compactions += 1;
                     last_compaction_turn = Some(turn_num);
-                    self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
+                    self.compact_with_mode(CompactionMode::EmergencyOverflow, cancel.clone())
                         .await?;
-                    seg.reset();
+                    self.active_segment.lock().await.reset();
                     continue;
                 }
                 return Err(CarnotError::ContextOverflow(ov_msg));
@@ -1716,9 +1909,9 @@ impl Agent {
                 consecutive_emergency_compactions += 1;
                 last_compaction_turn = Some(turn_num);
                 self.discard_eager_launches(eager_launches);
-                self.compact_with_mode(CompactionMode::EmergencyOverflow, &seg, cancel.clone())
+                self.compact_with_mode(CompactionMode::EmergencyOverflow, cancel.clone())
                     .await?;
-                seg.reset();
+                self.active_segment.lock().await.reset();
                 continue;
             }
             consecutive_emergency_compactions = 0;
@@ -1990,19 +2183,33 @@ impl Agent {
                         wave_handles.push((call.orig_idx, call.effective_input, jh));
                     }
 
-                    for (idx, eff_inp, jh) in wave_handles {
-                        let (out, dur) = jh.await.unwrap_or_else(|e| {
-                            (ToolOutput::err_text(format!("tool task panicked: {e}")), 0)
-                        });
+                    for (idx, eff_inp, mut jh) in wave_handles {
+                        let (out, dur) = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => {
+                                jh.abort();
+                                (ToolOutput::err_text("Cancelled"), 0)
+                            }
+                            res = &mut jh => res.unwrap_or_else(|e| {
+                                (ToolOutput::err_text(format!("tool task panicked: {e}")), 0)
+                            }),
+                        };
                         outputs[idx] = Some((eff_inp, out, dur));
                     }
                 }
 
                 // Collect any remaining non-conflicting eager tasks
-                for ae in active_eager {
-                    let (out, dur) = ae.handle.await.unwrap_or_else(|e| {
-                        (ToolOutput::err_text(format!("eager task panicked: {e}")), 0)
-                    });
+                for mut ae in active_eager {
+                    let (out, dur) = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            ae.handle.abort();
+                            (ToolOutput::err_text("Cancelled"), 0)
+                        }
+                        res = &mut ae.handle => res.unwrap_or_else(|e| {
+                            (ToolOutput::err_text(format!("eager task panicked: {e}")), 0)
+                        }),
+                    };
                     outputs[ae.orig_idx] = Some((ae.effective_input, out, dur));
                 }
 
@@ -2024,8 +2231,11 @@ impl Agent {
                             .await;
                     }
 
-                    self.record_segment_facts(&tool_name, &effective_input, &out, &mut seg)
-                        .await;
+                    {
+                        let mut seg = self.active_segment.lock().await;
+                        self.record_segment_facts(&tool_name, &effective_input, &out, &mut seg)
+                            .await;
+                    }
 
                     let output_preview = clip_utf8_preview(&out.text_only(), 8_192);
                     self.events.push(AgentEvent::ToolEnd {
@@ -2114,17 +2324,18 @@ impl Agent {
             let mut boundary_resume = false;
             if !should_halt && !self.modules.is_empty() {
                 let total_ctx_est = self.session.lock().await.effective_context_tokens();
+                let seg_snap = self.active_segment.lock().await.clone();
                 let snap = TurnBoundarySnapshot {
                     turn_index: turn_num,
                     stop_reason,
                     total_context_tokens: total_ctx_est,
-                    had_edit_in_segment: seg.had_edit,
+                    had_edit_in_segment: seg_snap.had_edit,
                     had_tool_call_in_turn: had_tools,
-                    files_read_in_segment: seg.files_read.clone(),
-                    files_edited_in_segment: seg.files_edited.clone(),
-                    handles_created_in_segment: seg.handles_created.clone(),
+                    files_read_in_segment: seg_snap.files_read,
+                    files_edited_in_segment: seg_snap.files_edited,
+                    handles_created_in_segment: seg_snap.handles_created,
                     last_assistant_text: last_text,
-                    failed_attempts_summary: seg.failed_attempts.clone(),
+                    failed_attempts_summary: seg_snap.failed_attempts,
                 };
 
                 for m in &self.modules {
@@ -2338,10 +2549,10 @@ impl Agent {
     async fn compact_with_mode(
         &self,
         mode: CompactionMode,
-        seg: &SegmentTracker,
         cancel: CancellationToken,
     ) -> Result<()> {
         let (eff_cfg, eff_provider) = self.effective_config_and_provider().await;
+        let seg_snap = self.active_segment.lock().await.clone();
         let _ = execute_compaction(
             mode,
             &eff_cfg,
@@ -2354,13 +2565,14 @@ impl Agent {
             &self.events,
             &self.raw_user_goal,
             &self.user_instructions,
-            seg,
+            &seg_snap,
             None,
             cancel,
         )
         .await?;
         *self.last_prefix_state.lock().await = None;
         *self.last_prompt_context_tokens.lock().await = None;
+        *self.last_emitted_date.lock().await = Some(current_utc_date_ymd());
         Ok(())
     }
 }
@@ -2683,7 +2895,7 @@ mod tests {
         .expect("agent");
 
         let today = current_utc_date_ymd();
-        let expected_tag = format!("[date: {today}]");
+        let expected_tag = format!("[date: {today} UTC]");
 
         agent.prompt("first question").await.expect("p1");
         agent.prompt("second question").await.expect("p2");
@@ -2694,7 +2906,7 @@ mod tests {
             !reqs[0].static_system_prompt.contains("[date:"),
             "static system prompt must stay date-free"
         );
-        // Turn 1 user message carries `[date: YYYY-MM-DD]`; Turn 2 on the same day does NOT repeat it.
+        // Turn 1 user message carries `[date: YYYY-MM-DD UTC]`; Turn 2 on the same day does NOT repeat it.
         let msgs_after_2 = agent.active_messages().await;
         assert!(
             msgs_after_2[0].text_concat().starts_with(&expected_tag),
@@ -2707,7 +2919,7 @@ mod tests {
             msgs_after_2[2].text_concat()
         );
 
-        // Compaction carries `[date: YYYY-MM-DD]` in its summary footer so post-compaction turns stay sparse.
+        // Compaction carries `[date: YYYY-MM-DD UTC]` in its summary footer so post-compaction turns stay sparse.
         agent.compact_now().await.expect("compact");
         let msgs_post_compact = agent.active_messages().await;
         assert_eq!(
@@ -2728,10 +2940,18 @@ mod tests {
             "turn after compaction on same day must not duplicate date tag"
         );
 
-        // Simulated prior day in message history triggers a fresh tag check.
-        let yesterday_msgs = vec![Arc::new(Message::user_text("[date: 2020-01-01]\n\nold"))];
+        // Assistant text containing `[date: ...]` MUST be ignored (cannot spoof session date!).
+        let spoofed_msgs = vec![
+            Arc::new(Message::user_text("[date: 2020-01-01 UTC]\n\nold")),
+            Arc::new(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "[date: 2099-12-31 UTC]".into(),
+                }],
+            }),
+        ];
         assert_eq!(
-            last_date_tag_in_messages(&yesterday_msgs).as_deref(),
+            last_date_tag_in_messages(&spoofed_msgs).as_deref(),
             Some("2020-01-01")
         );
 

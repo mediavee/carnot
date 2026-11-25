@@ -5,7 +5,7 @@ use super::path::{
     validate_regular_file_for_read,
 };
 use crate::syntax::syntax_regression_warning;
-use crate::tracker::ReadTracker;
+use crate::tracker::{PathLockPool, ReadTracker};
 use crate::{BoxFuture, Tool, UndoEntry, UndoKind};
 use carnot_cas::CasStore;
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
@@ -22,6 +22,7 @@ pub struct WriteTool {
     cas: Arc<CasStore>,
     undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
     tracker: Arc<Mutex<ReadTracker>>,
+    path_locks: Arc<PathLockPool>,
     syntax_check: bool,
 }
 
@@ -32,6 +33,7 @@ impl WriteTool {
         cas: Arc<CasStore>,
         undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
         tracker: Arc<Mutex<ReadTracker>>,
+        path_locks: Arc<PathLockPool>,
         syntax_check: bool,
     ) -> Self {
         Self {
@@ -40,6 +42,7 @@ impl WriteTool {
             cas,
             undo_stack,
             tracker,
+            path_locks,
             syntax_check,
         }
     }
@@ -71,6 +74,7 @@ impl Tool for WriteTool {
         let cas = Arc::clone(&self.cas);
         let undo_stack = Arc::clone(&self.undo_stack);
         let tracker = Arc::clone(&self.tracker);
+        let path_locks = Arc::clone(&self.path_locks);
 
         Box::pin(async move {
             let Some(raw_path) = input
@@ -86,6 +90,12 @@ impl Tool for WriteTool {
                 .map(str::to_string)
             else {
                 return Ok(ToolOutput::err_text("Write requires `content`"));
+            };
+
+            let path_lock = effect_key_path(&ws, &extra, &input).map(|p| path_locks.lock_for(&p));
+            let _path_guard = match path_lock {
+                Some(ref m) => Some(m.lock().await),
+                None => None,
             };
 
             tokio::task::spawn_blocking(move || -> Result<ToolOutput> {

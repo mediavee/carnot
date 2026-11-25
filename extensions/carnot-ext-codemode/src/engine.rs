@@ -52,7 +52,10 @@ const PRELUDE: &str = r#"
 
   globalThis.exit = (v) => {
     if (v !== undefined) __text(fmt(v));
-    throw new Error("__CARNOT_CODEMODE_EXIT__");
+    __exit();
+    // Backward branch triggers QuickJS's interrupt handler immediately, raising an uncatchable
+    // internal interruption that `try/catch` blocks cannot swallow.
+    while (true) {}
   };
 
   const call = async (name, args) => {
@@ -277,6 +280,9 @@ struct SharedState {
     child_cancel: CancellationToken,
     cancelled_flag: Arc<AtomicBool>,
     timed_out: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    timeout: Duration,
+    concurrency: Arc<tokio::sync::Semaphore>,
     specs: Vec<ToolSpec>,
     /// Lookup map from exact name AND sanitized JS identifier -> canonical tool name.
     name_map: HashMap<String, String>,
@@ -325,7 +331,7 @@ impl SharedState {
         if *truncated {
             return;
         }
-        // Allow up to 4x preview cap in memory so CAS spill receives full lossless data.
+        // Allow up to 64x preview cap in memory so CAS spill receives full lossless data.
         let hard_cap = self
             .config
             .max_output_bytes
@@ -384,9 +390,10 @@ fn run_on_worker_thread(
 
         let cancel_flag = Arc::clone(&shared.cancelled_flag);
         let timed_out_flag = Arc::clone(&shared.timed_out);
+        let exited_flag = Arc::clone(&shared.exited);
         js_rt
             .set_interrupt_handler(Some(Box::new(move || {
-                if cancel_flag.load(Ordering::Relaxed) {
+                if exited_flag.load(Ordering::Relaxed) || cancel_flag.load(Ordering::Relaxed) {
                     return true;
                 }
                 if Instant::now() >= deadline {
@@ -401,9 +408,29 @@ fn run_on_worker_thread(
             .await
             .map_err(|e| format!("failed to create QuickJS context: {e}"))?;
 
-        let eval_res: std::result::Result<(), String> = js_ctx
-            .async_with(async |ctx| {
+        let eval_res: std::result::Result<(), String> = tokio::select! {
+            biased;
+            () = shared.child_cancel.cancelled() => {
+                Err(if shared.timed_out.load(Ordering::Relaxed) {
+                    format!("CodeMode timed out after {}ms", shared.timeout.as_millis())
+                } else {
+                    "CodeMode cancelled".to_string()
+                })
+            }
+            res = js_ctx.async_with(async |ctx| {
             let globals = ctx.globals();
+
+            // __exit(): marks clean early termination so even `try { exit(); } catch {}` cannot swallow it.
+            let s_exit = Arc::clone(shared);
+            globals
+                .set(
+                    "__exit",
+                    Function::new(ctx.clone(), move || {
+                        s_exit.exited.store(true, Ordering::SeqCst);
+                    })
+                    .map_err(|e| format!("bind __exit: {e}"))?,
+                )
+                .map_err(|e| format!("set __exit: {e}"))?;
 
             // __log(level, msg)
             let s_log = Arc::clone(shared);
@@ -666,10 +693,22 @@ fn run_on_worker_thread(
                                     format!("{}:cm:{seq}", s.parent_call_id);
                                 let host = Arc::clone(&s.host);
                                 let cancel = s.child_cancel.clone();
+                                let sem = Arc::clone(&s.concurrency);
                                 let target_name = canon.clone();
-                                // Dispatch on the outer multi-threaded Tokio runtime so
-                                // `Promise.all([...])` runs tool calls truly in parallel!
+                                // Dispatch on the outer multi-threaded Tokio runtime with bounded
+                                // concurrency so `Promise.all([...])` runs tools in parallel
+                                // without flooding the host or permission broker.
                                 let jh = s.outer.spawn(async move {
+                                    let _permit = tokio::select! {
+                                        biased;
+                                        () = cancel.cancelled() => {
+                                            return Err(carnot_core::CarnotError::Cancelled);
+                                        }
+                                        p = sem.acquire_owned() => match p {
+                                            Ok(p) => p,
+                                            Err(_) => return Err(carnot_core::CarnotError::Cancelled),
+                                        }
+                                    };
                                     host.call_tool(inner_call_id, target_name, args, cancel)
                                         .await
                                 });
@@ -718,11 +757,17 @@ fn run_on_worker_thread(
                 .map_err(format_caught_error)?;
 
             Ok(())
-            })
-            .await;
+            }) => res,
+        };
 
-        js_rt.idle().await;
-        eval_res
+        if !shared.child_cancel.is_cancelled() && !shared.exited.load(Ordering::Relaxed) {
+            let _ = tokio::time::timeout(Duration::from_millis(50), js_rt.idle()).await;
+        }
+        if shared.exited.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            eval_res
+        }
     })
 }
 
@@ -756,6 +801,8 @@ pub(crate) async fn execute_script(
     let child_cancel = cancel.child_token();
     let cancelled_flag = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
+    let max_conc = config.max_concurrent_tool_calls.max(1);
 
     let shared = Arc::new(SharedState {
         host,
@@ -764,6 +811,9 @@ pub(crate) async fn execute_script(
         child_cancel: child_cancel.clone(),
         cancelled_flag: Arc::clone(&cancelled_flag),
         timed_out: Arc::clone(&timed_out),
+        exited: Arc::clone(&exited),
+        timeout,
+        concurrency: Arc::new(tokio::sync::Semaphore::new(max_conc)),
         specs,
         name_map,
         store: Mutex::new(initial_store),
@@ -775,7 +825,7 @@ pub(crate) async fn execute_script(
         config,
     });
 
-    // Watchdog cancels QuickJS interrupt handler + all in-flight inner tool calls on timeout or Ctrl+C.
+    // Watchdog cancels QuickJS interrupt handler + worker select! + in-flight inner tool calls.
     let wd_done = CancellationToken::new();
     let wd_done_clone = wd_done.clone();
     let wd_cancel = cancel.clone();
@@ -797,7 +847,7 @@ pub(crate) async fn execute_script(
         }
     });
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
     let worker_shared = Arc::clone(&shared);
     let spawn_res = std::thread::Builder::new()
         .name("carnot-codemode".into())
@@ -807,9 +857,21 @@ pub(crate) async fn execute_script(
         });
 
     let run_result = match spawn_res {
-        Ok(_handle) => rx
-            .await
-            .unwrap_or_else(|_| Err("CodeMode worker thread terminated unexpectedly".into())),
+        Ok(_handle) => tokio::select! {
+            res = &mut rx => res.unwrap_or_else(|_| {
+                Err("CodeMode worker thread terminated unexpectedly".into())
+            }),
+            () = child_cancel.cancelled() => {
+                // Give the worker thread a short grace window to drop QuickJS cleanly after wakeup.
+                if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_millis(250), rx).await {
+                    res
+                } else if timed_out.load(Ordering::Relaxed) {
+                    Err(format!("CodeMode timed out after {}ms", timeout.as_millis()))
+                } else {
+                    Err("CodeMode cancelled".into())
+                }
+            }
+        },
         Err(e) => Err(format!("failed to spawn CodeMode worker thread: {e}")),
     };
 

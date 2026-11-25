@@ -70,6 +70,7 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
     pub read_tracker: Arc<Mutex<tracker::ReadTracker>>,
+    pub path_locks: Arc<tracker::PathLockPool>,
     pub seen_cas_hashes: Arc<Mutex<HashSet<String>>>,
     pub job_registry: Arc<bash::JobRegistry>,
     pub undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
@@ -79,6 +80,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn with_canonical_lid_tools(config: &CarnotConfig, cas: Arc<CasStore>) -> Self {
         let read_tracker = Arc::new(Mutex::new(tracker::ReadTracker::new()));
+        let path_locks = Arc::new(tracker::PathLockPool::new());
         let seen_cas_hashes = Arc::new(Mutex::new(HashSet::new()));
         let job_registry = Arc::new(bash::JobRegistry::new());
         let undo_stack = Arc::new(Mutex::new(Vec::new()));
@@ -94,6 +96,7 @@ impl ToolRegistry {
             tools: HashMap::new(),
             order: Vec::new(),
             read_tracker: Arc::clone(&read_tracker),
+            path_locks: Arc::clone(&path_locks),
             seen_cas_hashes: Arc::clone(&seen_cas_hashes),
             job_registry: Arc::clone(&job_registry),
             undo_stack: Arc::clone(&undo_stack),
@@ -150,6 +153,7 @@ impl ToolRegistry {
             Arc::clone(&cas),
             Arc::clone(&undo_stack),
             Arc::clone(&read_tracker),
+            Arc::clone(&path_locks),
             config.modules.tx_edit_syntax,
         )));
 
@@ -159,6 +163,7 @@ impl ToolRegistry {
             cas,
             undo_stack,
             read_tracker,
+            path_locks,
             config.modules.tx_edit_syntax,
         )));
 

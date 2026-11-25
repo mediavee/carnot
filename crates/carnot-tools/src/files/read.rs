@@ -2,7 +2,7 @@
 
 use super::path::{detect_image_mime, effect_key_path, resolve_confined_path};
 use crate::syntax::{find_symbol_ranges, structural_outline};
-use crate::tracker::{ReadDelta, ReadTracker};
+use crate::tracker::{ReadDelta, ReadTracker, is_read_tracking_suppressed};
 use crate::{BoxFuture, Tool};
 use base64::Engine as _;
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolResultBlock, ToolSpec};
@@ -92,6 +92,7 @@ impl Tool for ReadTool {
                 .get("outline")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let suppress_tracking = is_read_tracking_suppressed();
 
             tokio::task::spawn_blocking(move || -> Result<ToolOutput> {
                 let path = match resolve_confined_path(&ws, &extra, &raw_path) {
@@ -144,10 +145,12 @@ impl Tool for ReadTool {
                         )));
                     }
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
-                    tracker
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record_disk_hash(&path, &raw_bytes);
+                    if !suppress_tracking {
+                        tracker
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .record_disk_hash(&path, &raw_bytes);
+                    }
                     return Ok(ToolOutput {
                         blocks: vec![
                             ToolResultBlock::text(format!(
@@ -201,10 +204,12 @@ impl Tool for ReadTool {
                 if do_outline
                     && let Some(outline) = structural_outline(&path, &content)
                 {
-                    tracker
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record_disk_hash(&path, content.as_bytes());
+                    if !suppress_tracking {
+                        tracker
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .record_disk_hash(&path, content.as_bytes());
+                    }
                     return Ok(ToolOutput::ok_text(outline).with_details(json!({
                         "file_path": raw_path,
                         "mode": "outline",
@@ -234,10 +239,12 @@ impl Tool for ReadTool {
                             let _ = writeln!(rendered, "{}\t{line}", s + i);
                         }
                     }
-                    tracker
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record_viewed_spans(&path, content.as_bytes(), &viewed_spans);
+                    if !suppress_tracking {
+                        tracker
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .record_viewed_spans(&path, content.as_bytes(), &viewed_spans);
+                    }
                     return Ok(ToolOutput::ok_text(rendered.trim_end_matches('\n')).with_details(
                         json!({
                             "file_path": raw_path,
@@ -249,10 +256,12 @@ impl Tool for ReadTool {
                 }
 
                 if total_lines == 0 {
-                    tracker
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record_disk_hash(&path, content.as_bytes());
+                    if !suppress_tracking {
+                        tracker
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .record_disk_hash(&path, content.as_bytes());
+                    }
                     return Ok(ToolOutput::ok_text(format!("[empty file: {raw_path}]"))
                         .with_details(json!({"file_path": raw_path, "mode": "full", "lines": [0, 0]})));
                 }
@@ -272,41 +281,44 @@ impl Tool for ReadTool {
                 let raw_slice = slice_lines.join("\n");
                 let is_full_file = start == 1 && end == total_lines;
 
-                // Check disk-coherent ReadTracker on raw unnumbered lines.
-                let delta = tracker
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .check_reread(&path, &raw_slice, (start, end), is_full_file);
-                match delta {
-                    ReadDelta::UnchangedStub(stub) => {
-                        return Ok(ToolOutput::ok_text(stub)
-                            .with_details(json!({"file_path": raw_path, "mode": "stub"})));
-                    }
-                    ReadDelta::UnifiedDiff(diff_txt) => {
-                        tracker
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .record_slice(
-                                &path,
-                                content.as_bytes(),
-                                &raw_slice,
-                                (start, end),
-                                is_full_file,
-                            );
-                        return Ok(ToolOutput::ok_text(diff_txt)
-                            .with_details(json!({"file_path": raw_path, "mode": "diff"})));
-                    }
-                    ReadDelta::FullNeeded => {
-                        tracker
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .record_slice(
-                                &path,
-                                content.as_bytes(),
-                                &raw_slice,
-                                (start, end),
-                                is_full_file,
-                            );
+                // Check disk-coherent ReadTracker on raw unnumbered lines (skipped when called
+                // internally by CodeMode so scripts always get real text and never poison model view).
+                if !suppress_tracking {
+                    let delta = tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .check_reread(&path, content.as_bytes(), &raw_slice, (start, end), is_full_file);
+                    match delta {
+                        ReadDelta::UnchangedStub(stub) => {
+                            return Ok(ToolOutput::ok_text(stub)
+                                .with_details(json!({"file_path": raw_path, "mode": "stub"})));
+                        }
+                        ReadDelta::UnifiedDiff(diff_txt) => {
+                            tracker
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .record_slice(
+                                    &path,
+                                    content.as_bytes(),
+                                    &raw_slice,
+                                    (start, end),
+                                    is_full_file,
+                                );
+                            return Ok(ToolOutput::ok_text(diff_txt)
+                                .with_details(json!({"file_path": raw_path, "mode": "diff"})));
+                        }
+                        ReadDelta::FullNeeded => {
+                            tracker
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .record_slice(
+                                    &path,
+                                    content.as_bytes(),
+                                    &raw_slice,
+                                    (start, end),
+                                    is_full_file,
+                                );
+                        }
                     }
                 }
 

@@ -3,7 +3,7 @@
 use carnot_core::{SessionMetrics, ToolOutput};
 use serde_json::Value;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SegmentTracker {
     pub(crate) had_edit: bool,
     pub(crate) files_read: Vec<String>,

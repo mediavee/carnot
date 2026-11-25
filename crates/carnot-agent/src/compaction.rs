@@ -698,7 +698,7 @@ pub(crate) async fn execute_compaction(
     }
     let _ = write!(
         summary,
-        "Continue immediately from [carnot:task-handoff] without redundantly re-reading already-summarized files.\n[date: {}]",
+        "Continue immediately from [carnot:task-handoff] without redundantly re-reading already-summarized files.\n[date: {} UTC]",
         crate::current_utc_date_ymd()
     );
 

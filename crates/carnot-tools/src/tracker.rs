@@ -1,18 +1,68 @@
-//! Disk-coherent read tracker using direct BLAKE3 hashing of file contents and per-line views.
+//! Disk-coherent read tracker using direct BLAKE3 hashing of file contents and per-line views,
+//! plus task-scoped tracking suppression for nested orchestration tools (`CodeMode`) and
+//! deadlock-free per-path async write locks.
 //!
 //! Tracks two distinct facts per file:
 //! - `disk_hash`: the last full-file BLAKE3 digest known to the harness (updated by `Read`, `Edit`,
 //!   and `Write`) — used by `Write` to prevent overwriting unread or externally modified files.
-//! - `view`: the 1-based line hashes last shown to the *model* by `Read` (never updated by `Edit`
-//!   or `Write`) — used by line-range `Edit` to verify or uniquely relocate edits without adding
-//!   any visible hash tokens to `Read` output.
+//! - `view`: the 1-based line hashes corresponding to the model's current view (populated by `Read`
+//!   and rebased in-place after model-initiated `Edit`s so current file line numbers are always the
+//!   single unambiguous coordinate system; never updated by external or `CodeMode` changes).
 
-use similar::{ChangeTag, TextDiff};
+use similar::{ChangeTag, DiffOp, TextDiff};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-/// Compact fingerprint of a single line as shown to the model by `Read`.
+tokio::task_local! {
+    static SUPPRESS_MODEL_READ_TRACKING: bool;
+}
+
+/// Runs `fut` with model-facing `ReadTracker` view updates and stub/diff short-circuits disabled.
+///
+/// Used by `Agent::invoke_tool_gated` (e.g. `CodeMode` scripts) so:
+/// - `tools.Read(...)` inside JS always returns actual file content (never an `[unchanged]` stub),
+/// - reads performed inside JS never trick the harness into thinking the LLM saw the file,
+/// - edits/writes performed inside JS invalidate the model's line view for that path.
+pub async fn with_suppressed_read_tracking<F: std::future::Future>(fut: F) -> F::Output {
+    SUPPRESS_MODEL_READ_TRACKING.scope(true, fut).await
+}
+
+/// Returns `true` when executing inside [`with_suppressed_read_tracking`].
+pub fn is_read_tracking_suppressed() -> bool {
+    SUPPRESS_MODEL_READ_TRACKING
+        .try_with(|&v| v)
+        .unwrap_or(false)
+}
+
+/// Per-path async mutex pool shared by `EditTool` and `WriteTool` so concurrent mutations to the
+/// same canonical file path (e.g. via `CodeMode` `Promise.all` or direct `ToolRegistry` calls)
+/// serialize cleanly without losing updates or corrupting `undo_stack`.
+#[derive(Debug, Default)]
+pub struct PathLockPool {
+    locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl PathLockPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let key = tracker_key(path);
+        let mut g = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            g.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+}
+
+/// Compact fingerprint of a single line as shown to the model by `Read` (or written by `Edit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewedLine {
     pub hash: u64,
@@ -36,6 +86,20 @@ pub fn viewed_line(line: &str) -> ViewedLine {
     }
 }
 
+/// Splits file text into logical lines identically to `EditTool::apply_line_range_hunks`.
+pub(crate) fn split_logical_lines(content: &str) -> Vec<&str> {
+    let has_trailing_nl = content.ends_with('\n');
+    let body = content
+        .strip_suffix("\r\n")
+        .or_else(|| content.strip_suffix('\n'))
+        .unwrap_or(content);
+    if body.is_empty() && !has_trailing_nl {
+        Vec::new()
+    } else {
+        body.split('\n').map(|l| l.trim_end_matches('\r')).collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LastSlice {
     range: (usize, usize),
@@ -51,7 +115,7 @@ pub struct TrackedFile {
     /// Full-file BLAKE3 digest corresponding to `view` (cleared whenever `Read` sees a new digest
     /// so `view` never mixes lines from two different file versions).
     pub view_disk_hash: Option<[u8; 32]>,
-    /// 1-based line number -> line fingerprint as last shown to the model by `Read`.
+    /// 1-based line number -> line fingerprint matching the model's current view.
     pub view: BTreeMap<usize, ViewedLine>,
     last_slice: Option<LastSlice>,
 }
@@ -68,7 +132,7 @@ pub enum ReadDelta {
     UnifiedDiff(String),
 }
 
-fn tracker_key(path: &Path) -> PathBuf {
+pub(crate) fn tracker_key(path: &Path) -> PathBuf {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
@@ -87,8 +151,6 @@ fn format_absolute_unified_diff(
     start_line: usize,
     end_line: usize,
 ) -> String {
-    // Normalize trailing newline so appending a line at the end of a slice does not fabricate
-    // a spurious delete/insert on the preceding unchanged line.
     let old_norm;
     let old_src = if !old_raw.is_empty() && !old_raw.ends_with('\n') {
         old_norm = format!("{old_raw}\n");
@@ -143,11 +205,10 @@ fn format_absolute_unified_diff(
         if hunk_delta != 0 {
             any_hunk_shifted = true;
             cum_delta += hunk_delta;
-            // Anchor the shift note on the last modified old line in this hunk.
             let non_eq_old_end = group
                 .iter()
                 .rev()
-                .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
+                .find(|op| !matches!(op, DiffOp::Equal { .. }))
                 .map_or(old_end, |op| op.old_range().end);
             last_shift_old_line = (base_offset + non_eq_old_end).max(start_line);
         }
@@ -198,11 +259,7 @@ impl ReadTracker {
     }
 
     /// Records only the full-file `disk_hash` without touching `view` or `last_slice`.
-    ///
-    /// Used by `Read` in `outline`/empty/image mode and by `Edit` after writing so:
-    /// - `Write` knows the latest harness-observed file digest (not stale),
-    /// - `Edit` never overwrites the model's `view` (stale line-range edits stay verifiable),
-    /// - a subsequent `Read` can still diff cleanly against `last_slice`.
+    /// Used by `Read` in `outline`/empty/image mode.
     pub fn record_disk_hash(&mut self, path: &Path, full_file_bytes: &[u8]) {
         let disk_hash = *blake3::hash(full_file_bytes).as_bytes();
         let entry = self
@@ -217,8 +274,83 @@ impl ReadTracker {
         entry.disk_hash = disk_hash;
     }
 
-    /// Records a full-file `Write`: updates `disk_hash` and clears any prior `view`/`last_slice`
-    /// so pre-write line numbers can never match post-write content by accident.
+    /// Rebases `view` and updates `disk_hash` after a model-initiated `Edit` transforms `before`
+    /// into `after`. Returns an optional line-shift note (`[lines after Lx shifted by ±n]`) when
+    /// the line count changed.
+    ///
+    /// Keeping `view` rebased to current file line numbers makes current numbering the single
+    /// unambiguous convention for follow-up `Edit`s while preserving `last_slice` so a subsequent
+    /// `Read` still produces a compact unified diff.
+    pub fn rebase_after_edit(&mut self, path: &Path, before: &str, after: &str) -> Option<String> {
+        let before_hash = *blake3::hash(before.as_bytes()).as_bytes();
+        let after_hash = *blake3::hash(after.as_bytes()).as_bytes();
+        let before_lines = split_logical_lines(before);
+        let after_lines = split_logical_lines(after);
+        let diff = TextDiff::from_slices(&before_lines, &after_lines);
+        let ops = diff.ops();
+
+        let entry = self
+            .files
+            .entry(tracker_key(path))
+            .or_insert_with(|| TrackedFile {
+                disk_hash: after_hash,
+                view_disk_hash: None,
+                view: BTreeMap::new(),
+                last_slice: None,
+            });
+        entry.disk_hash = after_hash;
+
+        if entry.view_disk_hash == Some(before_hash) && !entry.view.is_empty() {
+            let mut new_view = BTreeMap::new();
+            for op in ops {
+                match *op {
+                    DiffOp::Equal {
+                        old_index,
+                        new_index,
+                        len,
+                    } => {
+                        for k in 0..len {
+                            if entry.view.contains_key(&(old_index + k + 1)) {
+                                new_view.insert(
+                                    new_index + k + 1,
+                                    viewed_line(after_lines[new_index + k]),
+                                );
+                            }
+                        }
+                    }
+                    DiffOp::Replace {
+                        new_index, new_len, ..
+                    }
+                    | DiffOp::Insert {
+                        new_index, new_len, ..
+                    } => {
+                        for k in 0..new_len {
+                            new_view
+                                .insert(new_index + k + 1, viewed_line(after_lines[new_index + k]));
+                        }
+                    }
+                    DiffOp::Delete { .. } => {}
+                }
+            }
+            entry.view = new_view;
+            entry.view_disk_hash = Some(after_hash);
+        }
+
+        let net_delta = after_lines.len().cast_signed() - before_lines.len().cast_signed();
+        if net_delta != 0 {
+            let anchor = ops
+                .iter()
+                .rev()
+                .find(|op| !matches!(op, DiffOp::Equal { .. }))
+                .map_or(1, |op| op.old_range().end.max(1));
+            Some(format!("[lines after L{anchor} shifted by {net_delta:+}]"))
+        } else {
+            None
+        }
+    }
+
+    /// Records a full-file `Write` (or suppressed `CodeMode` mutation): updates `disk_hash` and
+    /// clears `view`/`last_slice` so stale pre-write line numbers can never match post-write text.
     pub fn record_write(&mut self, path: &Path, full_file_bytes: &[u8]) {
         let disk_hash = *blake3::hash(full_file_bytes).as_bytes();
         self.files.insert(
@@ -330,19 +462,22 @@ impl ReadTracker {
     }
 
     /// Checks whether a re-read of `path` over `range` can return a 1-line stub or compact diff.
-    /// `current_raw` MUST be raw unnumbered text for the exact `(start, end)` range actually shown.
+    ///
+    /// Only returns [`ReadDelta::UnchangedStub`] when BOTH the slice hash AND the full-file
+    /// `disk_hash` are unchanged, preventing a stale-`Write` / unchanged-`Read` deadlock when
+    /// only line endings, trailing newline, or lines outside a partial slice changed on disk.
     pub fn check_reread(
         &self,
         path: &Path,
+        full_file_bytes: &[u8],
         current_raw: &str,
         range: (usize, usize),
         is_full_file: bool,
     ) -> ReadDelta {
-        let Some(prev) = self
-            .files
-            .get(&tracker_key(path))
-            .and_then(|f| f.last_slice.as_ref())
-        else {
+        let Some(entry) = self.files.get(&tracker_key(path)) else {
+            return ReadDelta::FullNeeded;
+        };
+        let Some(ref prev) = entry.last_slice else {
             return ReadDelta::FullNeeded;
         };
         let same_window = prev.range == range;
@@ -350,17 +485,22 @@ impl ReadTracker {
         if !same_window && !both_full {
             return ReadDelta::FullNeeded;
         }
-        let cur_hash = *blake3::hash(current_raw.as_bytes()).as_bytes();
-        if same_window && cur_hash == prev.hash {
-            return ReadDelta::UnchangedStub(format!(
-                "[unchanged: {} lines {}-{} identical to previous read]",
-                path.display(),
-                range.0,
-                range.1
-            ));
+        let cur_slice_hash = *blake3::hash(current_raw.as_bytes()).as_bytes();
+        let cur_file_hash = *blake3::hash(full_file_bytes).as_bytes();
+        if same_window && cur_slice_hash == prev.hash {
+            if cur_file_hash == entry.disk_hash {
+                return ReadDelta::UnchangedStub(format!(
+                    "[unchanged: {} lines {}-{} identical to previous read]",
+                    path.display(),
+                    range.0,
+                    range.1
+                ));
+            }
+            // Full file bytes changed (e.g. CRLF/trailing newline or out-of-window edit):
+            // force a fresh read so `disk_hash` syncs and `Write` never loops on stale hash.
+            return ReadDelta::FullNeeded;
         }
 
-        // Compute compact unified diff with absolute file line numbers; use it only when strictly shorter.
         let unified =
             format_absolute_unified_diff(&prev.raw_content, current_raw, range.0, range.1);
         if !unified.is_empty() && unified.len() + 64 < current_raw.len() {
@@ -389,15 +529,24 @@ mod tests {
         tracker.record_slice(p, v1.as_bytes(), v1, (1, 8), true);
         assert!(
             matches!(
-                tracker.check_reread(p, v1, (1, 8), true),
+                tracker.check_reread(p, v1.as_bytes(), v1, (1, 8), true),
                 ReadDelta::UnchangedStub(_)
             ),
             "identical content should return UnchangedStub"
         );
+        // Trailing-newline-only change MUST NOT return UnchangedStub (avoids Write/Read deadlock!).
+        let v1_nl = format!("{v1}\n");
+        assert!(
+            matches!(
+                tracker.check_reread(p, v1_nl.as_bytes(), v1, (1, 8), true),
+                ReadDelta::FullNeeded
+            ),
+            "trailing-newline change must refresh disk_hash instead of stubbing"
+        );
         // Even with identical byte length and same mtime, BLAKE3 catches the edit!
         assert!(
             matches!(
-                tracker.check_reread(p, v2, (1, 8), true),
+                tracker.check_reread(p, v2.as_bytes(), v2, (1, 8), true),
                 ReadDelta::FullNeeded | ReadDelta::UnifiedDiff(_)
             ),
             "edited content must not return UnchangedStub"
@@ -419,7 +568,7 @@ mod tests {
         old_lines[2] = "    let line_102 = compute_value(999);".to_string();
         let new_raw = old_lines.join("\n");
 
-        match tracker.check_reread(p, &new_raw, (100, 140), false) {
+        match tracker.check_reread(p, new_raw.as_bytes(), &new_raw, (100, 140), false) {
             ReadDelta::UnifiedDiff(diff) => {
                 assert!(
                     diff.contains("@@ -100,5 +100,5 @@"),
@@ -451,7 +600,7 @@ mod tests {
             ],
         );
         let full_v2_raw = full_v2.join("\n");
-        match tracker.check_reread(p, &full_v2_raw, (1, 43), true) {
+        match tracker.check_reread(p, full_v2_raw.as_bytes(), &full_v2_raw, (1, 43), true) {
             ReadDelta::UnifiedDiff(diff) => {
                 assert!(
                     diff.contains("@@ -8,5 +8,8 @@"),

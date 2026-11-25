@@ -655,7 +655,12 @@ impl CarnotBuilder {
             if let Some(ref pm) = claude_plugins_mod {
                 inherited_for_child.push(Arc::clone(pm));
             }
-            inherited_for_child.extend(self.extra_modules.iter().cloned());
+            inherited_for_child.extend(
+                self.extra_modules
+                    .iter()
+                    .filter(|m| m.name() != "codemode")
+                    .cloned(),
+            );
             if let Some(ref pm) = policy_mod {
                 inherited_for_child.push(Arc::clone(pm));
             }

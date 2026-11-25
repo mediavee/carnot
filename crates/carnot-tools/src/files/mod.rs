@@ -337,7 +337,7 @@ mod tests {
             .expect("read");
         assert!(!r1.is_error, "initial read failed: {}", r1.text_only());
 
-        // 2. First Edit expands L3..=L4 by +3 lines
+        // 2. First Edit expands L3..=L4 by +3 lines -> rebases `view` AND emits `[lines after L4 shifted by +3]`
         let e1 = edit
             .execute(
                 json!({
@@ -351,14 +351,20 @@ mod tests {
             .await
             .expect("edit 1");
         assert!(!e1.is_error, "edit 1 failed: {}", e1.text_only());
+        assert!(
+            e1.text_only().contains("[lines after L4 shifted by +3]"),
+            "Edit must report line shift so model uses current numbering, got: {}",
+            e1.text_only()
+        );
 
-        // 3. Second Edit uses ORIGINAL line numbers L15..=L16 from first Read -> MUST relocate to L18..=L19!
+        // 3. Second Edit uses CURRENT line numbers L18..=L19 (where step_15..step_16 now live!) ->
+        //    must hit directly WITHOUT mis-relocating to L21..L22!
         let e2 = edit
             .execute(
                 json!({
                     "file_path": "app.rs",
-                    "start_line": 15,
-                    "end_line": 16,
+                    "start_line": 18,
+                    "end_line": 19,
                     "new_string": "pub fn step_15_updated() -> usize { 1500 }\npub fn step_16_updated() -> usize { 1600 }"
                 }),
                 CancellationToken::new(),
@@ -367,12 +373,11 @@ mod tests {
             .expect("edit 2");
         assert!(!e2.is_error, "edit 2 failed: {}", e2.text_only());
         assert!(
-            e2.text_only().contains("relocated L15-L16 -> L18-L19"),
-            "expected relocation note, got: {}",
+            !e2.text_only().contains("relocated"),
+            "current line numbers after rebased Edit must apply directly, got: {}",
             e2.text_only()
         );
         let after_e2 = fs::read_to_string(&file).expect("read after e2");
-        // Lines 12..14 must be untouched and lines 15..16 must be replaced at their real shifted position!
         assert!(
             after_e2.contains("pub fn step_12() -> usize { 12 }\npub fn step_13() -> usize { 13 }\npub fn step_14() -> usize { 14 }\npub fn step_15_updated()"),
             "surrounding lines corrupted:\n{after_e2}"
@@ -382,43 +387,186 @@ mod tests {
             "old step_15 should be replaced"
         );
 
-        // 4. Third Edit re-targeting already-mutated L3..=L4 with stale view MUST be rejected with current window
-        let e3 = edit
+        // 4. External file shift (e.g. Bash prepending 2 lines behind the model's back):
+        //    line-range Edit on unchanged block at old L25..=L26 relocates cleanly to L27..=L28,
+        //    while editing externally-modified lines L1..=L2 is rejected with diagnostic window!
+        let ext_shifted = format!("// external header 1\n// external header 2\n{after_e2}");
+        fs::write(&file, &ext_shifted).expect("external prepend");
+
+        let e3_reloc = edit
             .execute(
                 json!({
                     "file_path": "app.rs",
-                    "start_line": 3,
-                    "end_line": 4,
+                    "start_line": 25,
+                    "end_line": 26,
+                    "new_string": "pub fn step_22_relocated() -> usize { 2200 }\npub fn step_23_relocated() -> usize { 2300 }"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("edit 3 reloc");
+        assert!(
+            !e3_reloc.is_error,
+            "external shift relocation failed: {}",
+            e3_reloc.text_only()
+        );
+        assert!(
+            e3_reloc
+                .text_only()
+                .contains("relocated L25-L26 -> L27-L28"),
+            "expected relocation note on external shift, got: {}",
+            e3_reloc.text_only()
+        );
+
+        // External rewrite of step_01 (viewed L1..=L2 no longer exists on disk) MUST be rejected!
+        let cur_disk = fs::read_to_string(&file).expect("read cur");
+        fs::write(
+            &file,
+            cur_disk.replace("step_01() -> usize { 1 }", "step_01_ext() -> usize { 999 }"),
+        )
+        .expect("external rewrite");
+        let e4_stale = edit
+            .execute(
+                json!({
+                    "file_path": "app.rs",
+                    "start_line": 1,
+                    "end_line": 2,
                     "new_string": "corrupted"
                 }),
                 CancellationToken::new(),
             )
             .await
-            .expect("edit 3");
-        assert!(e3.is_error, "stale edit on modified zone must be rejected");
+            .expect("edit 4 stale");
         assert!(
-            e3.text_only().contains("Stale line-range Edit rejected")
-                && e3.text_only().contains("step_03_a"),
-            "expected diagnostic window, got: {}",
-            e3.text_only()
-        );
-        assert_eq!(
-            fs::read_to_string(&file).expect("read unchanged"),
-            after_e2,
-            "rejected edit must not touch disk"
+            e4_stale.is_error
+                && e4_stale
+                    .text_only()
+                    .contains("Stale line-range Edit rejected"),
+            "stale edit on externally modified zone must be rejected, got: {}",
+            e4_stale.text_only()
         );
 
-        // 5. Re-read returns compact unified diff with absolute headers + shift note
+        // 5. Re-read refreshes the model view with all surviving edits intact
         let r2 = read
             .execute(json!({"file_path": "app.rs"}), CancellationToken::new())
             .await
             .expect("reread");
         assert!(!r2.is_error, "reread failed: {}", r2.text_only());
-        let diff_txt = r2.text_only();
+        let reread_txt = r2.text_only();
         assert!(
-            diff_txt.contains("shifted by +3"),
-            "expected shift notice on reread, got:\n{diff_txt}"
+            reread_txt.contains("step_15_updated")
+                && reread_txt.contains("step_22_relocated")
+                && reread_txt.contains("step_01_ext"),
+            "expected all surviving edits on reread, got:\n{reread_txt}"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn write_after_trailing_newline_external_change_does_not_loop_with_read_stub() {
+        let tmp = std::env::temp_dir().join(format!("carnot-nl-loop-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("mkdir");
+        let file = tmp.join("cfg.txt");
+        fs::write(&file, "a=1\nb=2\n").expect("write");
+
+        let cfg = carnot_core::CarnotConfig::new(tmp.clone());
+        let cas = Arc::new(CasStore::open(&tmp).expect("cas"));
+        let reg = crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let read = reg.get("Read").expect("Read");
+        let write = reg.get("Write").expect("Write");
+
+        // 1. Model reads cfg.txt
+        let r1 = read
+            .execute(json!({"file_path": "cfg.txt"}), CancellationToken::new())
+            .await
+            .expect("r1");
+        assert!(!r1.is_error);
+
+        // 2. External formatter strips trailing newline (same lines(), different raw bytes!)
+        fs::write(&file, "a=1\nb=2").expect("strip trailing nl");
+
+        // 3. Write detects stale raw bytes and asks model to re-read
+        let w_stale = write
+            .execute(
+                json!({"file_path": "cfg.txt", "content": "a=10\nb=20\n"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("w_stale");
+        assert!(w_stale.is_error, "stale write must refuse");
+
+        // 4. Re-read MUST refresh disk_hash (not return stale UnchangedStub!) so next Write succeeds!
+        let r2 = read
+            .execute(json!({"file_path": "cfg.txt"}), CancellationToken::new())
+            .await
+            .expect("r2");
+        assert!(!r2.is_error);
+        assert!(
+            !r2.text_only().contains("[unchanged:"),
+            "re-read after byte-level disk change must not return unchanged stub: {}",
+            r2.text_only()
+        );
+        let w_ok = write
+            .execute(
+                json!({"file_path": "cfg.txt", "content": "a=10\nb=20\n"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("w_ok");
+        assert!(
+            !w_ok.is_error,
+            "write after re-read must succeed: {}",
+            w_ok.text_only()
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_edits_on_same_file_serialize_without_losing_updates() {
+        let tmp = std::env::temp_dir().join(format!("carnot-conc-edit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("mkdir");
+        let file = tmp.join("items.txt");
+        let mut init = String::new();
+        for i in 0..8 {
+            use std::fmt::Write as _;
+            let _ = writeln!(init, "item_{i}=old");
+        }
+        fs::write(&file, &init).expect("write");
+
+        let cfg = carnot_core::CarnotConfig::new(tmp.clone());
+        let cas = Arc::new(CasStore::open(&tmp).expect("cas"));
+        let reg = Arc::new(crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let edit = reg.get("Edit").expect("Edit");
+            handles.push(tokio::spawn(async move {
+                edit.execute(
+                    json!({
+                        "file_path": "items.txt",
+                        "old_string": format!("item_{i}=old"),
+                        "new_string": format!("item_{i}=new")
+                    }),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("edit exec")
+            }));
+        }
+        for h in handles {
+            let out = h.await.expect("join");
+            assert!(!out.is_error, "concurrent edit failed: {}", out.text_only());
+        }
+
+        let final_txt = fs::read_to_string(&file).expect("read final");
+        for i in 0..8 {
+            assert!(
+                final_txt.contains(&format!("item_{i}=new")),
+                "lost concurrent edit for item_{i}! disk:\n{final_txt}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&tmp);
     }

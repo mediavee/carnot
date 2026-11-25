@@ -5,7 +5,9 @@ use super::path::{
     validate_regular_file_for_read,
 };
 use crate::syntax::syntax_regression_warning;
-use crate::tracker::{ReadTracker, ViewedLine, hash_line};
+use crate::tracker::{
+    PathLockPool, ReadTracker, ViewedLine, hash_line, is_read_tracking_suppressed,
+};
 use crate::{BoxFuture, Tool, UndoEntry, UndoKind};
 use carnot_cas::CasStore;
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
@@ -23,6 +25,7 @@ pub struct EditTool {
     cas: Arc<CasStore>,
     undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
     tracker: Arc<Mutex<ReadTracker>>,
+    path_locks: Arc<PathLockPool>,
     syntax_check: bool,
 }
 
@@ -33,6 +36,7 @@ impl EditTool {
         cas: Arc<CasStore>,
         undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
         tracker: Arc<Mutex<ReadTracker>>,
+        path_locks: Arc<PathLockPool>,
         syntax_check: bool,
     ) -> Self {
         Self {
@@ -41,6 +45,7 @@ impl EditTool {
             cas,
             undo_stack,
             tracker,
+            path_locks,
             syntax_check,
         }
     }
@@ -399,6 +404,7 @@ impl Tool for EditTool {
         let cas = Arc::clone(&self.cas);
         let undo_stack = Arc::clone(&self.undo_stack);
         let tracker = Arc::clone(&self.tracker);
+        let path_locks = Arc::clone(&self.path_locks);
 
         Box::pin(async move {
             let Some(raw_path) = input
@@ -456,6 +462,13 @@ impl Tool for EditTool {
                     Err(msg) => return Ok(ToolOutput::err_text(msg)),
                 }
             }
+
+            let suppress_tracking = is_read_tracking_suppressed();
+            let path_lock = effect_key_path(&ws, &extra, &input).map(|p| path_locks.lock_for(&p));
+            let _path_guard = match path_lock {
+                Some(ref m) => Some(m.lock().await),
+                None => None,
+            };
 
             tokio::task::spawn_blocking(move || -> Result<ToolOutput> {
                 let path = match resolve_confined_path(&ws, &extra, &raw_path) {
@@ -597,13 +610,23 @@ impl Tool for EditTool {
                 if let Err(msg) = atomic_write_confined(&ws, &extra, &path, &current) {
                     return Ok(ToolOutput::err_text(msg));
                 }
-                // Update harness disk_hash ONLY (never touch the model's `view` or `last_slice`!)
-                // so a subsequent Write knows the file is fresh, a subsequent Read diffs cleanly,
-                // and a subsequent line-range Edit still verifies/relocates against what the model saw.
-                tracker
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .record_disk_hash(&path, current.as_bytes());
+                // Rebase model's line view in-place so current file line numbers stay the single
+                // unambiguous coordinate system (and report line shifts). When called inside
+                // CodeMode (`suppress_tracking`), clear the model's line view instead.
+                let shift_note = {
+                    let mut guard = tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if suppress_tracking {
+                        guard.record_write(&path, current.as_bytes());
+                        None
+                    } else {
+                        guard.rebase_after_edit(&path, &before, &current)
+                    }
+                };
+                if let Some(note) = shift_note {
+                    fuzzy_notes.push(note);
+                }
                 let post_hash = blake3::hash(current.as_bytes()).to_hex().to_string();
                 if let Ok(mut st) = undo_stack.lock() {
                     st.push(UndoEntry {
