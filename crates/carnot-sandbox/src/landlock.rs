@@ -131,7 +131,7 @@ fn probe_landlock_abi_uncached() -> Option<u32> {
         if abi >= ABI::V6 {
             r = r.and_then(|rs| rs.scope(Scope::from_all(abi)));
         }
-        if r.and_then(|rs| rs.create()).is_ok() {
+        if r.and_then(Ruleset::create).is_ok() {
             return Some(num);
         }
     }
