@@ -141,7 +141,7 @@ impl ToolRegistry {
         reg.register(Arc::new(files::ReadTool::new(
             config.workspace_root.clone(),
             extra_read_roots.clone(),
-            read_tracker,
+            Arc::clone(&read_tracker),
         )));
 
         reg.register(Arc::new(files::EditTool::new(
@@ -149,6 +149,7 @@ impl ToolRegistry {
             config.extra_writable_roots.clone(),
             Arc::clone(&cas),
             Arc::clone(&undo_stack),
+            Arc::clone(&read_tracker),
             config.modules.tx_edit_syntax,
         )));
 
@@ -157,6 +158,7 @@ impl ToolRegistry {
             config.extra_writable_roots.clone(),
             cas,
             undo_stack,
+            read_tracker,
             config.modules.tx_edit_syntax,
         )));
 

@@ -5,6 +5,7 @@ use super::path::{
     validate_regular_file_for_read,
 };
 use crate::syntax::syntax_regression_warning;
+use crate::tracker::ReadTracker;
 use crate::{BoxFuture, Tool, UndoEntry, UndoKind};
 use carnot_cas::CasStore;
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
@@ -20,6 +21,7 @@ pub struct WriteTool {
     extra_roots: Vec<PathBuf>,
     cas: Arc<CasStore>,
     undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
+    tracker: Arc<Mutex<ReadTracker>>,
     syntax_check: bool,
 }
 
@@ -29,6 +31,7 @@ impl WriteTool {
         extra_roots: Vec<PathBuf>,
         cas: Arc<CasStore>,
         undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
+        tracker: Arc<Mutex<ReadTracker>>,
         syntax_check: bool,
     ) -> Self {
         Self {
@@ -36,6 +39,7 @@ impl WriteTool {
             extra_roots,
             cas,
             undo_stack,
+            tracker,
             syntax_check,
         }
     }
@@ -66,6 +70,7 @@ impl Tool for WriteTool {
         let syntax_check = self.syntax_check;
         let cas = Arc::clone(&self.cas);
         let undo_stack = Arc::clone(&self.undo_stack);
+        let tracker = Arc::clone(&self.tracker);
 
         Box::pin(async move {
             let Some(raw_path) = input
@@ -96,14 +101,42 @@ impl Tool for WriteTool {
                     if let Err(msg) = validate_regular_file_for_read(&path) {
                         return Ok(ToolOutput::err_text(format!("Write aborted: {msg}")));
                     }
-                    match fs::read(&path) {
-                        Ok(b) => Some(b),
+                    let bytes = match fs::read(&path) {
+                        Ok(b) => b,
                         Err(e) => {
                             return Ok(ToolOutput::err_text(format!(
                                 "Write aborted: cannot snapshot existing {raw_path}: {e}"
                             )));
                         }
+                    };
+                    // Refuse blind overwrites of existing unread or externally modified files.
+                    let disk_digest = *blake3::hash(&bytes).as_bytes();
+                    let tracked_digest = tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .disk_hash(&path);
+                    match tracked_digest {
+                        None => {
+                            return Ok(ToolOutput::err_text(format!(
+                                "Write refused on existing file {raw_path}: file has not been read in this session (or tracker was cleared after compaction). Read {raw_path} first before overwriting it."
+                            ))
+                            .with_details(json!({
+                                "file_path": raw_path,
+                                "write_blocked": "unread",
+                            })));
+                        }
+                        Some(seen) if seen != disk_digest => {
+                            return Ok(ToolOutput::err_text(format!(
+                                "Write refused on {raw_path}: file changed on disk since your last Read/Edit. Re-read {raw_path} before overwriting it so external changes are not clobbered."
+                            ))
+                            .with_details(json!({
+                                "file_path": raw_path,
+                                "write_blocked": "stale",
+                            })));
+                        }
+                        Some(_) => {}
                     }
+                    Some(bytes)
                 } else {
                     None
                 };
@@ -126,6 +159,10 @@ impl Tool for WriteTool {
                 if let Err(msg) = atomic_write_confined(&ws, &extra, &path, &content) {
                     return Ok(ToolOutput::err_text(msg));
                 }
+                tracker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_write(&path, content.as_bytes());
                 let post_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
                 let kind = match undo_hash.clone() {
                     Some(prev_hash) => UndoKind::Restored {

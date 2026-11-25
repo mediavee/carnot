@@ -52,6 +52,58 @@ pub(crate) fn add_cost_micros(counter: &AtomicU64, cost_usd: f64) {
     }
 }
 
+/// Formats a Unix timestamp (seconds since 1970-01-01 UTC) as `YYYY-MM-DD` using Howard
+/// Hinnant's civil-from-days algorithm (zero external date crates, exact for all Gregorian dates).
+pub(crate) fn format_utc_date_ymd(unix_secs: u64) -> String {
+    let z = (unix_secs / 86_400).cast_signed() + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe.cast_signed() + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
+/// Returns today's UTC calendar date as `YYYY-MM-DD`.
+pub(crate) fn current_utc_date_ymd() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    format_utc_date_ymd(secs)
+}
+
+/// Extracts the most recent `[date: YYYY-MM-DD]` line recorded in `messages`, if any.
+pub(crate) fn last_date_tag_in_messages(messages: &[Arc<Message>]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        for block in msg.content.iter().rev() {
+            if let ContentBlock::Text { text } = block {
+                for line in text.lines().rev() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("[date: ")
+                        && let Some(date) = rest.strip_suffix(']')
+                    {
+                        let b = date.as_bytes();
+                        if b.len() == 10
+                            && b[4] == b'-'
+                            && b[7] == b'-'
+                            && b[0..4].iter().all(u8::is_ascii_digit)
+                            && b[5..7].iter().all(u8::is_ascii_digit)
+                            && b[8..10].iter().all(u8::is_ascii_digit)
+                        {
+                            return Some(date.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Snapshot captured from a parent `Agent` to construct a prompt-cache-warm forked child.
 #[derive(Debug, Clone)]
 pub struct ForkSnapshot {
@@ -1176,6 +1228,25 @@ impl Agent {
                     } else {
                         initial_text = format!("{}\n\n{initial_text}", turn1_blocks.join("\n\n"));
                     }
+                }
+            }
+        }
+
+        // Sparse calendar date note (NEVER in the static system prompt, so `audit-prefix` stays
+        // byte-identical): emitted once on the first user turn and again only if the UTC calendar
+        // date changed across a resumed session (or after compaction drops older messages).
+        if !continue_existing {
+            let today = current_utc_date_ymd();
+            let needs_date = {
+                let s = self.session.lock().await;
+                last_date_tag_in_messages(s.active_messages()).as_deref() != Some(today.as_str())
+            };
+            if needs_date {
+                let tag = format!("[date: {today}]");
+                if initial_text.is_empty() {
+                    initial_text = tag;
+                } else {
+                    initial_text = format!("{tag}\n\n{initial_text}");
                 }
             }
         }
@@ -2532,5 +2603,94 @@ mod tests {
         assert!(raw.memory > 0);
         assert!(raw.messages > 0);
         assert_eq!(raw.tool_results, 0);
+    }
+
+    #[test]
+    fn utc_date_formatting_matches_known_gregorian_dates() {
+        assert_eq!(format_utc_date_ymd(0), "1970-01-01");
+        assert_eq!(format_utc_date_ymd(11_016 * 86_400), "2000-02-29");
+        assert_eq!(format_utc_date_ymd(19_782 * 86_400), "2024-02-29");
+        assert_eq!(format_utc_date_ymd(19_783 * 86_400), "2024-03-01");
+        assert_eq!(format_utc_date_ymd(20_782 * 86_400), "2026-11-25");
+    }
+
+    #[tokio::test]
+    async fn sparse_date_note_emitted_once_preserved_across_compaction_and_absent_from_static_prefix()
+     {
+        let dir = std::env::temp_dir().join(format!("carnot-date-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut cfg = CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let tools = ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let faux = Arc::new(FauxProvider::new(vec![
+            ScriptedTurn::text("turn 1 ok"),
+            ScriptedTurn::text("turn 2 ok"),
+            ScriptedTurn::text("compacted summary"),
+            ScriptedTurn::text("turn 3 ok"),
+        ]));
+        let agent = Agent::new(
+            cfg,
+            Arc::clone(&faux) as Arc<dyn Provider>,
+            tools,
+            Vec::new(),
+            false,
+        )
+        .expect("agent");
+
+        let today = current_utc_date_ymd();
+        let expected_tag = format!("[date: {today}]");
+
+        agent.prompt("first question").await.expect("p1");
+        agent.prompt("second question").await.expect("p2");
+
+        let reqs = faux.recorded_requests();
+        // Static system prompt must NEVER carry the calendar date (preserves BLAKE3 prefix invariance).
+        assert!(
+            !reqs[0].static_system_prompt.contains("[date:"),
+            "static system prompt must stay date-free"
+        );
+        // Turn 1 user message carries `[date: YYYY-MM-DD]`; Turn 2 on the same day does NOT repeat it.
+        let msgs_after_2 = agent.active_messages().await;
+        assert!(
+            msgs_after_2[0].text_concat().starts_with(&expected_tag),
+            "turn 1 should start with {expected_tag}, got: {}",
+            msgs_after_2[0].text_concat()
+        );
+        assert!(
+            !msgs_after_2[2].text_concat().contains("[date:"),
+            "turn 2 on same day must not repeat date tag, got: {}",
+            msgs_after_2[2].text_concat()
+        );
+
+        // Compaction carries `[date: YYYY-MM-DD]` in its summary footer so post-compaction turns stay sparse.
+        agent.compact_now().await.expect("compact");
+        let msgs_post_compact = agent.active_messages().await;
+        assert_eq!(
+            last_date_tag_in_messages(&msgs_post_compact).as_deref(),
+            Some(today.as_str()),
+            "compaction summary must preserve today's date tag"
+        );
+
+        agent.prompt("third question").await.expect("p3");
+        let msgs_after_3 = agent.active_messages().await;
+        let last_user = msgs_after_3
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .expect("last user");
+        assert!(
+            !last_user.text_concat().contains("[date:"),
+            "turn after compaction on same day must not duplicate date tag"
+        );
+
+        // Simulated prior day in message history triggers a fresh tag check.
+        let yesterday_msgs = vec![Arc::new(Message::user_text("[date: 2020-01-01]\n\nold"))];
+        assert_eq!(
+            last_date_tag_in_messages(&yesterday_msgs).as_deref(),
+            Some("2020-01-01")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

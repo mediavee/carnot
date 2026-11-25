@@ -144,6 +144,10 @@ impl Tool for ReadTool {
                         )));
                     }
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
+                    tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_disk_hash(&path, &raw_bytes);
                     return Ok(ToolOutput {
                         blocks: vec![
                             ToolResultBlock::text(format!(
@@ -197,6 +201,10 @@ impl Tool for ReadTool {
                 if do_outline
                     && let Some(outline) = structural_outline(&path, &content)
                 {
+                    tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_disk_hash(&path, content.as_bytes());
                     return Ok(ToolOutput::ok_text(outline).with_details(json!({
                         "file_path": raw_path,
                         "mode": "outline",
@@ -213,16 +221,23 @@ impl Tool for ReadTool {
                         )));
                     }
                     let mut rendered = String::new();
+                    let mut viewed_spans: Vec<(usize, &[&str])> = Vec::with_capacity(4);
                     for (idx, (s_line, e_line)) in spans.iter().take(4).enumerate() {
                         if idx > 0 {
                             rendered.push_str("\n---\n");
                         }
                         let s = (*s_line).max(1).min(total_lines);
                         let e = (*e_line).max(s).min(total_lines);
-                        for (i, line) in all_lines[s - 1..e].iter().enumerate() {
+                        let span_lines = &all_lines[s - 1..e];
+                        viewed_spans.push((s, span_lines));
+                        for (i, line) in span_lines.iter().enumerate() {
                             let _ = writeln!(rendered, "{}\t{line}", s + i);
                         }
                     }
+                    tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_viewed_spans(&path, content.as_bytes(), &viewed_spans);
                     return Ok(ToolOutput::ok_text(rendered.trim_end_matches('\n')).with_details(
                         json!({
                             "file_path": raw_path,
@@ -234,6 +249,10 @@ impl Tool for ReadTool {
                 }
 
                 if total_lines == 0 {
+                    tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_disk_hash(&path, content.as_bytes());
                     return Ok(ToolOutput::ok_text(format!("[empty file: {raw_path}]"))
                         .with_details(json!({"file_path": raw_path, "mode": "full", "lines": [0, 0]})));
                 }
@@ -251,12 +270,13 @@ impl Tool for ReadTool {
 
                 let slice_lines = &all_lines[start.saturating_sub(1)..end];
                 let raw_slice = slice_lines.join("\n");
+                let is_full_file = start == 1 && end == total_lines;
 
                 // Check disk-coherent ReadTracker on raw unnumbered lines.
                 let delta = tracker
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .check_reread(&path, &raw_slice, (start, end));
+                    .check_reread(&path, &raw_slice, (start, end), is_full_file);
                 match delta {
                     ReadDelta::UnchangedStub(stub) => {
                         return Ok(ToolOutput::ok_text(stub)
@@ -266,7 +286,13 @@ impl Tool for ReadTool {
                         tracker
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .record(&path, &raw_slice, (start, end));
+                            .record_slice(
+                                &path,
+                                content.as_bytes(),
+                                &raw_slice,
+                                (start, end),
+                                is_full_file,
+                            );
                         return Ok(ToolOutput::ok_text(diff_txt)
                             .with_details(json!({"file_path": raw_path, "mode": "diff"})));
                     }
@@ -274,7 +300,13 @@ impl Tool for ReadTool {
                         tracker
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .record(&path, &raw_slice, (start, end));
+                            .record_slice(
+                                &path,
+                                content.as_bytes(),
+                                &raw_slice,
+                                (start, end),
+                                is_full_file,
+                            );
                     }
                 }
 

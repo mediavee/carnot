@@ -5,12 +5,14 @@ use super::path::{
     validate_regular_file_for_read,
 };
 use crate::syntax::syntax_regression_warning;
+use crate::tracker::{ReadTracker, ViewedLine, hash_line};
 use crate::{BoxFuture, Tool, UndoEntry, UndoKind};
 use carnot_cas::CasStore;
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +22,7 @@ pub struct EditTool {
     extra_roots: Vec<PathBuf>,
     cas: Arc<CasStore>,
     undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
+    tracker: Arc<Mutex<ReadTracker>>,
     syntax_check: bool,
 }
 
@@ -29,6 +32,7 @@ impl EditTool {
         extra_roots: Vec<PathBuf>,
         cas: Arc<CasStore>,
         undo_stack: Arc<Mutex<Vec<UndoEntry>>>,
+        tracker: Arc<Mutex<ReadTracker>>,
         syntax_check: bool,
     ) -> Self {
         Self {
@@ -36,6 +40,7 @@ impl EditTool {
             extra_roots,
             cas,
             undo_stack,
+            tracker,
             syntax_check,
         }
     }
@@ -120,6 +125,179 @@ fn parse_edit_hunk(item: &Value, label: &str) -> std::result::Result<EditHunk, S
         new_string: ns.to_string(),
         replace_all: ra,
     })
+}
+
+/// Formats a small numbered window of the current disk file around `target_s..=target_e` so
+/// the model can immediately recover from a stale line-range edit without an extra Read turn.
+fn format_current_window(disk_lines: &[&str], target_s: usize, target_e: usize) -> String {
+    if disk_lines.is_empty() {
+        return "[file is currently empty]".to_string();
+    }
+    let total = disk_lines.len();
+    let win_s = target_s.saturating_sub(5).max(1).min(total);
+    let win_e = target_e
+        .saturating_add(5)
+        .min(total)
+        .min(win_s.saturating_add(29));
+    let mut out = String::new();
+    for (idx, line) in disk_lines[win_s - 1..win_e].iter().enumerate() {
+        let _ = writeln!(out, "{}\t{line}", win_s + idx);
+    }
+    out.trim_end_matches('\n').to_string()
+}
+
+/// Implicitly anchors line-range edits against the model's last `Read` view stored in
+/// [`ReadTracker`]:
+///   1. Every requested line `s..=e` must have been read by the model in the current view.
+///   2. If the disk content at `s..=e` matches the viewed line hashes, the hunk applies directly.
+///   3. If the disk content shifted (e.g. an earlier `Edit` inserted/deleted lines), attempts a
+///      unique relocation of the non-trivial viewed block (`>= 2` lines with `>= 4` non-ws chars,
+///      or 1 line with `>= 12` non-ws chars) and emits a relocation note.
+///   4. Otherwise rejects atomically with the current numbered window around `s..=e`.
+type LineRangeRepl<'a> = (usize, usize, &'a str);
+
+fn resolve_anchored_line_ranges<'a>(
+    content: &str,
+    ranges: &[LineRangeRepl<'a>],
+    path: &Path,
+    raw_path: &str,
+    tracker: &Mutex<ReadTracker>,
+) -> std::result::Result<(Vec<LineRangeRepl<'a>>, Vec<String>), String> {
+    // 1. Validate requested ranges and reject overlaps before consulting disk/tracker.
+    let mut req_sorted: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(s, e, _) in ranges {
+        if s == 0 || e < s {
+            return Err(format!("invalid line range L{s}-L{e} in {raw_path}"));
+        }
+        req_sorted.push((s, e));
+    }
+    req_sorted.sort_unstable();
+    for w in req_sorted.windows(2) {
+        if w[1].0 <= w[0].1 {
+            return Err(format!(
+                "overlapping line ranges L{}-L{} and L{}-L{} in {raw_path}; merge them into one edit",
+                w[0].0, w[0].1, w[1].0, w[1].1
+            ));
+        }
+    }
+
+    // 2. Snapshot the model's viewed line hashes for every requested hunk under a brief lock.
+    let viewed_per_hunk: Vec<Option<Vec<ViewedLine>>> = {
+        let guard = tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ranges
+            .iter()
+            .map(|&(s, e, _)| guard.viewed_range(path, s, e))
+            .collect()
+    };
+
+    for (&(s, e, _), viewed) in ranges.iter().zip(&viewed_per_hunk) {
+        if viewed.is_none() {
+            return Err(format!(
+                "Cannot apply line-range Edit L{s}-L{e} on {raw_path}: lines were not previously read in this session (or tracker was cleared after compaction). Re-read the target range with Read or use `old_string`/`new_string`."
+            ));
+        }
+    }
+
+    // 3. Split current disk content identically to `apply_line_range_hunks`.
+    let has_trailing_nl = content.ends_with('\n');
+    let body = content
+        .strip_suffix("\r\n")
+        .or_else(|| content.strip_suffix('\n'))
+        .unwrap_or(content);
+    let disk_lines: Vec<&str> = if body.is_empty() && !has_trailing_nl {
+        Vec::new()
+    } else {
+        body.split('\n').map(|l| l.trim_end_matches('\r')).collect()
+    };
+    let disk_hashes: Vec<u64> = disk_lines.iter().map(|l| hash_line(l)).collect();
+
+    let mut resolved: Vec<(usize, usize, &'a str)> = Vec::with_capacity(ranges.len());
+    let mut notes: Vec<String> = Vec::new();
+
+    for (idx, (&(s, e, ns), viewed_opt)) in ranges.iter().zip(viewed_per_hunk).enumerate() {
+        let Some(expected) = viewed_opt else {
+            return Err(format!(
+                "Cannot apply line-range Edit L{s}-L{e} on {raw_path}: lines were not previously read in this session."
+            ));
+        };
+        let len = expected.len();
+
+        // Direct hit at original coordinates.
+        if e <= disk_hashes.len()
+            && disk_hashes[s - 1..e]
+                .iter()
+                .zip(&expected)
+                .all(|(&dh, vl)| dh == vl.hash)
+        {
+            resolved.push((s, e, ns));
+            continue;
+        }
+
+        // Attempt unique relocation if the viewed block is non-trivial.
+        let total_trimmed: usize = expected.iter().map(|v| v.trimmed_len as usize).sum();
+        let nontrivial = (len >= 2 && total_trimmed >= 4) || (len == 1 && total_trimmed >= 12);
+
+        let mut match_starts: Vec<usize> = Vec::new();
+        if nontrivial && len <= disk_hashes.len() {
+            for start_0 in 0..=disk_hashes.len() - len {
+                if disk_hashes[start_0..start_0 + len]
+                    .iter()
+                    .zip(&expected)
+                    .all(|(&dh, vl)| dh == vl.hash)
+                {
+                    match_starts.push(start_0);
+                    if match_starts.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if match_starts.len() == 1 {
+            let new_s = match_starts[0] + 1;
+            let new_e = new_s + len - 1;
+            resolved.push((new_s, new_e, ns));
+            notes.push(format!(
+                "[hunk #{}: relocated L{s}-L{e} -> L{new_s}-L{new_e}]",
+                idx + 1
+            ));
+        } else {
+            let reason = if match_starts.len() >= 2 {
+                format!(
+                    "lines at L{s}-L{e} in {raw_path} shifted since your last Read and match multiple locations (ambiguous)"
+                )
+            } else if !nontrivial {
+                format!(
+                    "lines at L{s}-L{e} in {raw_path} changed or shifted since your last Read (block too short/trivial to relocate safely)"
+                )
+            } else {
+                format!(
+                    "lines at L{s}-L{e} in {raw_path} changed since your last Read (no matching block found)"
+                )
+            };
+            let window = format_current_window(&disk_lines, s, e);
+            return Err(format!(
+                "Stale line-range Edit rejected: {reason}.\nCurrent lines around L{s}-L{e} ({} total lines):\n{window}\nRe-read the file or retry with updated line numbers / `old_string`.",
+                disk_lines.len()
+            ));
+        }
+    }
+
+    // 4. Verify resolved ranges still do not overlap after any relocation.
+    let mut res_sorted: Vec<(usize, usize)> = resolved.iter().map(|&(s, e, _)| (s, e)).collect();
+    res_sorted.sort_unstable();
+    for w in res_sorted.windows(2) {
+        if w[1].0 <= w[0].1 {
+            return Err(format!(
+                "relocated line ranges L{}-L{} and L{}-L{} overlap in {raw_path}; re-read and merge them",
+                w[0].0, w[0].1, w[1].0, w[1].1
+            ));
+        }
+    }
+
+    Ok((resolved, notes))
 }
 
 /// Applies one or more non-overlapping 1-based inclusive line-range replacements against the
@@ -220,6 +398,7 @@ impl Tool for EditTool {
         let syntax_check = self.syntax_check;
         let cas = Arc::clone(&self.cas);
         let undo_stack = Arc::clone(&self.undo_stack);
+        let tracker = Arc::clone(&self.tracker);
 
         Box::pin(async move {
             let Some(raw_path) = input
@@ -325,10 +504,22 @@ impl Tool for EditTool {
                             EditHunk::Text { .. } => unreachable!(),
                         })
                         .collect();
-                    match apply_line_range_hunks(&current, &ranges, &raw_path) {
+                    let (anchored_ranges, reloc_notes) = match resolve_anchored_line_ranges(
+                        &current, &ranges, &path, &raw_path, &tracker,
+                    ) {
+                        Ok(ok) => ok,
+                        Err(diag_err) => {
+                            return Ok(ToolOutput::err_text(diag_err).with_details(json!({
+                                "file_path": raw_path,
+                                "edit_failed": true,
+                            })));
+                        }
+                    };
+                    fuzzy_notes.extend(reloc_notes);
+                    match apply_line_range_hunks(&current, &anchored_ranges, &raw_path) {
                         Ok(next) => {
                             current = next;
-                            total_replacements = ranges.len();
+                            total_replacements = anchored_ranges.len();
                         }
                         Err(diag_err) => {
                             return Ok(ToolOutput::err_text(diag_err).with_details(json!({
@@ -406,6 +597,13 @@ impl Tool for EditTool {
                 if let Err(msg) = atomic_write_confined(&ws, &extra, &path, &current) {
                     return Ok(ToolOutput::err_text(msg));
                 }
+                // Update harness disk_hash ONLY (never touch the model's `view` or `last_slice`!)
+                // so a subsequent Write knows the file is fresh, a subsequent Read diffs cleanly,
+                // and a subsequent line-range Edit still verifies/relocates against what the model saw.
+                tracker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_disk_hash(&path, current.as_bytes());
                 let post_hash = blake3::hash(current.as_bytes()).to_hex().to_string();
                 if let Ok(mut st) = undo_stack.lock() {
                     st.push(UndoEntry {

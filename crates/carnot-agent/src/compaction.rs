@@ -696,8 +696,10 @@ pub(crate) async fn execute_compaction(
             let _ = writeln!(summary, "- {f}");
         }
     }
-    summary.push_str(
-        "Continue immediately from [carnot:task-handoff] without redundantly re-reading already-summarized files.",
+    let _ = write!(
+        summary,
+        "Continue immediately from [carnot:task-handoff] without redundantly re-reading already-summarized files.\n[date: {}]",
+        crate::current_utc_date_ymd()
     );
 
     let last_is_fresh_user_prompt = s
