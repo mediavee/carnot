@@ -3985,3 +3985,65 @@ async fn e2e_goal_deterministic_and_independent_verifier_loop_preserves_prefix_i
     let _ = fs::remove_dir_all(&dir1);
     let _ = fs::remove_dir_all(&dir2);
 }
+
+#[tokio::test]
+async fn e2e_bash_streams_live_tool_update_events_and_pty_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("carnot-bash-live-pty-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).expect("mkdir");
+    let faux = Arc::new(FauxProvider::new(vec![
+        ScriptedTurn::tool_calls(vec![(
+            "call-stream",
+            "Bash",
+            json!({"command": "echo alpha-stream; sleep 0.2; echo beta-stream"}),
+        )]),
+        ScriptedTurn::tool_calls(vec![(
+            "call-pty",
+            "Bash",
+            json!({"command": "test -t 1 && echo REAL_TTY_OK", "pty": true}),
+        )]),
+        ScriptedTurn::text("Streamed and PTY verified."),
+    ]));
+
+    let agent = CarnotBuilder::new(dir.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
+        .sandbox(false)
+        .persist_session(false)
+        .build()
+        .expect("build");
+
+    let mut events = agent.subscribe();
+    let seen_updates: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_bg = Arc::clone(&seen_updates);
+    let collector = tokio::spawn(async move {
+        loop {
+            let env = events.next().await;
+            if let carnot::AgentEvent::ToolUpdate { call_id, message } = env.event {
+                seen_bg.lock().expect("lock").push((call_id, message));
+            }
+        }
+    });
+
+    let outcome = agent
+        .prompt("Run streaming command then PTY check")
+        .await
+        .expect("prompt");
+    assert_eq!(outcome.final_text, "Streamed and PTY verified.");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    collector.abort();
+
+    let updates = seen_updates.lock().expect("lock").clone();
+    assert!(
+        updates
+            .iter()
+            .any(|(cid, msg)| cid == "call-stream" && msg.contains("alpha-stream")),
+        "expected live ToolUpdate for call-stream, got: {updates:?}"
+    );
+    let reqs = faux.recorded_requests();
+    assert!(
+        msgs_json(&reqs[2].messages).contains("REAL_TTY_OK"),
+        "expected PTY stdout in tool result"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

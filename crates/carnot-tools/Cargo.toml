@@ -26,6 +26,9 @@ blake3.workspace = true
 carnot-cas.workspace = true
 carnot-core.workspace = true
 carnot-sandbox.workspace = true
+globset.workspace = true
+ignore.workspace = true
+portable-pty.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -38,3 +41,6 @@ tree-sitter-python = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

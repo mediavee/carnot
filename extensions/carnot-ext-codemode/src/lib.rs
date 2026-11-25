@@ -268,7 +268,7 @@ impl Tool for CodeModeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "CodeMode".into(),
-            description: "Run an async JS script in QuickJS with all session tools on `tools.<ExactToolName>(args)` (`Promise.all`, `return`, `text()`, `console.log`, `exit()`, `store`/`load`, `searchTools(q)`, `describeTool(name)`). Prefer CodeMode whenever you need 4+ parallel/chained tool or MCP calls (e.g. Grep->Read->Edit across many files, or filtering/aggregating large payloads in JS before returning a compact result to context). Example: `const xs = await Promise.all(files.map(f => tools.Read({file_path: f}))); return ...;`. For 1-3 simple Read/Edit/Grep/Bash calls, call those tools directly. MCP/extension JSON auto-parses; core text tools return strings; errors reject.".into(),
+            description: "Run an async JS script in QuickJS with all session tools on `tools.<ExactToolName>(args)` plus built-ins (`Promise.all`, `text()`, `exit()`, `store`/`load`, `searchTools`, `describeTool`, `path`, `base64Encode`/`base64Decode`, `blake3`, `parseCsv`/`parseTsv`, `globMatch`, `readJson`, `readLines`). Prefer CodeMode for 4+ parallel/chained tool or MCP calls or filtering large payloads in JS before returning a compact result. For 1-3 simple Read/Edit/Grep/Bash calls, call those tools directly.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -786,6 +786,61 @@ mod tests {
             "try/catch must not swallow exit(): {}",
             ex.text_only()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn builtin_stdlib_path_base64_blake3_csv_glob_and_read_helpers_work() {
+        let (tool, dir) = make_tool(CodeModeConfig::default());
+        let out = tool
+            .execute(
+                json!({
+                    "code": r#"
+                        const cfg = await readJson("cfg.json");
+                        const lines = await readLines("cfg.json");
+                        const b64 = base64Encode("héllo");
+                        const dec = base64Decode(b64);
+                        const h = blake3("abc");
+                        const csv = parseCsv('a,b\n"x,1","y""2"\n');
+                        return {
+                            cfg,
+                            lineCount: lines.length,
+                            dec,
+                            hashLen: h.length,
+                            csv,
+                            joined: path.join("src", "nested/../app.rs"),
+                            dir: path.dirname("src/app.rs"),
+                            base: path.basename("src/app.rs", ".rs"),
+                            ext: path.extname("src/app.rs"),
+                            globOk: globMatch("src/**/*.{rs,toml}", "src/a/b/main.rs"),
+                            globNo: globMatch("src/**/*.{rs,toml}", "src/a/b/main.py"),
+                        };
+                    "#
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("stdlib run");
+        assert!(!out.is_error, "stdlib failed: {}", out.text_only());
+        let txt = out.text_only();
+        let json_line = txt
+            .lines()
+            .find(|l| l.trim_start().starts_with('{'))
+            .unwrap_or(&txt);
+        let parsed: Value = serde_json::from_str(json_line).expect("json");
+        assert_eq!(parsed["cfg"]["file"], "cfg.json", "readJson");
+        assert_eq!(parsed["lineCount"], 1, "readLines");
+        assert_eq!(parsed["dec"], "héllo", "base64 UTF-8 roundtrip");
+        assert_eq!(parsed["hashLen"], 64, "blake3 hex len");
+        assert_eq!(parsed["csv"][1][0], "x,1", "csv quoted comma");
+        assert_eq!(parsed["csv"][1][1], "y\"2", "csv escaped quote");
+        assert_eq!(parsed["joined"], "src/app.rs", "path.join normalize");
+        assert_eq!(parsed["dir"], "src", "path.dirname");
+        assert_eq!(parsed["base"], "app", "path.basename");
+        assert_eq!(parsed["ext"], ".rs", "path.extname");
+        assert_eq!(parsed["globOk"], true, "globMatch positive");
+        assert_eq!(parsed["globNo"], false, "globMatch negative");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

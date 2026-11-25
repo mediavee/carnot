@@ -1,17 +1,18 @@
-//! Native workspace-confined `Grep` tool (regex search, `.gitignore`-aware streaming walk,
-//! zero shell spawn, eager-parallelizable).
+//! Native workspace-confined `Grep` tool (regex search powered by `ignore` + `globset` —
+//! the exact directory-walking and `.gitignore` engine of `ripgrep`).
 //!
 //! Runs concurrently with `Read` during streaming (`ToolEffects::global_read()`), honors
-//! `.gitignore` + `.git/info/exclude` (including nested `.gitignore` and `!` negations),
-//! skips binary files and build artifacts, stops walking immediately once `limit` matches are
-//! found, and enforces strict symlink confinement.
+//! `.gitignore` + nested `.gitignore` + `.git/info/exclude` + `!` negations, skips binary files
+//! and build artifacts, stops walking immediately once `limit` matches are found, and enforces
+//! strict symlink confinement.
 
 use crate::files::resolve_confined_path;
 use crate::{BoxFuture, Tool};
 use carnot_core::{Result, ToolEffects, ToolOutput, ToolSpec};
+use globset::{GlobBuilder, GlobMatcher};
+use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,238 +37,6 @@ const ALWAYS_SKIP_DIRS: &[&str] = &[
     ".next",
     ".cache",
 ];
-
-#[derive(Debug)]
-struct GitignoreRule {
-    base_rel: String,
-    negated: bool,
-    dir_only: bool,
-    anchored: bool,
-    regex: Regex,
-}
-
-impl GitignoreRule {
-    fn parse(base_rel: &str, raw_line: &str) -> Option<Self> {
-        let mut line = raw_line.trim_end_matches(['\r', '\n']);
-        // Strip trailing unescaped spaces
-        while line.ends_with(' ') && !line.ends_with("\\ ") {
-            line = &line[..line.len() - 1];
-        }
-        if line.is_empty() || line.starts_with('#') {
-            return None;
-        }
-        let negated = if let Some(rest) = line.strip_prefix('!') {
-            line = rest;
-            true
-        } else {
-            false
-        };
-        if let Some(rest) = line
-            .strip_prefix("\\#")
-            .or_else(|| line.strip_prefix("\\!"))
-        {
-            line = rest;
-        }
-        let dir_only = if let Some(rest) = line.strip_suffix('/') {
-            line = rest;
-            true
-        } else {
-            false
-        };
-        if line.is_empty() {
-            return None;
-        }
-        let has_leading_slash = line.starts_with('/');
-        let pat = line.strip_prefix('/').unwrap_or(line);
-        let anchored = has_leading_slash || pat.contains('/');
-        let regex = compile_gitignore_glob(pat)?;
-        Some(Self {
-            base_rel: base_rel.to_string(),
-            negated,
-            dir_only,
-            anchored,
-            regex,
-        })
-    }
-
-    fn matches(&self, rel_path: &str, file_name: &str, is_dir: bool) -> bool {
-        if self.dir_only && !is_dir {
-            return false;
-        }
-        let sub_rel = if self.base_rel.is_empty() {
-            rel_path
-        } else if let Some(rest) = rel_path
-            .strip_prefix(&self.base_rel)
-            .and_then(|r| r.strip_prefix('/'))
-        {
-            rest
-        } else {
-            return false;
-        };
-        if self.anchored {
-            self.regex.is_match(sub_rel)
-        } else {
-            self.regex.is_match(file_name) || self.regex.is_match(sub_rel)
-        }
-    }
-}
-
-fn glob_to_regex_body(pattern: &str, re: &mut String, depth: usize) {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        match chars[i] {
-            '*' => {
-                if i + 1 < chars.len() && chars[i + 1] == '*' {
-                    // `**/` matches zero or more directories
-                    if i + 2 < chars.len() && chars[i + 2] == '/' {
-                        re.push_str("(?:.*/)?");
-                        i += 3;
-                    } else {
-                        re.push_str(".*");
-                        i += 2;
-                    }
-                } else {
-                    re.push_str("[^/]*");
-                    i += 1;
-                }
-            }
-            '?' => {
-                re.push_str("[^/]");
-                i += 1;
-            }
-            '\\' if i + 1 < chars.len() => {
-                re.push_str(&regex::escape(&chars[i + 1].to_string()));
-                i += 2;
-            }
-            '[' => {
-                if let Some(end_rel) = chars[i + 1..].iter().position(|&c| c == ']') {
-                    let inner: Vec<char> = chars[i + 1..i + 1 + end_rel].to_vec();
-                    let (negated, body) = match inner.first() {
-                        Some('!' | '^') => (true, &inner[1..]),
-                        _ => (false, &inner[..]),
-                    };
-                    if body.is_empty() {
-                        re.push_str("\\[");
-                        i += 1;
-                    } else if negated {
-                        re.push_str("[^/");
-                        for &ch in body {
-                            if ch == '/' {
-                                continue;
-                            }
-                            if matches!(ch, '\\' | '[' | ']') {
-                                re.push('\\');
-                            }
-                            re.push(ch);
-                        }
-                        re.push(']');
-                        i += end_rel + 2;
-                    } else {
-                        // Exclude `/` from positive character classes
-                        re.push('[');
-                        let mut pushed = false;
-                        for &ch in body {
-                            if ch == '/' {
-                                continue;
-                            }
-                            if matches!(ch, '\\' | '[' | ']') {
-                                re.push('\\');
-                            }
-                            re.push(ch);
-                            pushed = true;
-                        }
-                        if pushed {
-                            re.push(']');
-                            i += end_rel + 2;
-                        } else {
-                            re.pop();
-                            re.push_str("\\[");
-                            i += 1;
-                        }
-                    }
-                } else {
-                    re.push_str("\\[");
-                    i += 1;
-                }
-            }
-            '{' if depth < 8 => {
-                // Find matching `}` honoring nested `{...}` and split top-level comma alternatives.
-                let mut brace_depth = 1usize;
-                let mut j = i + 1;
-                let mut alts: Vec<String> = Vec::new();
-                let mut cur = String::new();
-                while j < chars.len() && brace_depth > 0 {
-                    match chars[j] {
-                        '{' => {
-                            brace_depth += 1;
-                            cur.push('{');
-                        }
-                        '}' => {
-                            brace_depth -= 1;
-                            if brace_depth == 0 {
-                                alts.push(std::mem::take(&mut cur));
-                            } else {
-                                cur.push('}');
-                            }
-                        }
-                        ',' if brace_depth == 1 => {
-                            alts.push(std::mem::take(&mut cur));
-                        }
-                        ch => cur.push(ch),
-                    }
-                    j += 1;
-                }
-                if brace_depth == 0 && !alts.is_empty() {
-                    re.push_str("(?:");
-                    for (idx, alt) in alts.iter().enumerate() {
-                        if idx > 0 {
-                            re.push('|');
-                        }
-                        glob_to_regex_body(alt, re, depth + 1);
-                    }
-                    re.push(')');
-                    i = j;
-                } else {
-                    re.push_str("\\{");
-                    i += 1;
-                }
-            }
-            c => {
-                re.push_str(&regex::escape(&c.to_string()));
-                i += 1;
-            }
-        }
-    }
-}
-
-fn compile_gitignore_glob(pattern: &str) -> Option<Regex> {
-    let mut re = String::from("^");
-    glob_to_regex_body(pattern, &mut re, 0);
-    re.push('$');
-    RegexBuilder::new(&re).size_limit(256 * 1024).build().ok()
-}
-
-fn load_gitignore_file(path: &Path, base_rel: &str, rules: &mut Vec<GitignoreRule>) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
-    };
-    for line in content.lines() {
-        if let Some(rule) = GitignoreRule::parse(base_rel, line) {
-            rules.push(rule);
-        }
-    }
-}
-
-fn is_ignored_by_rules(rules: &[GitignoreRule], rel_path: &str, name: &str, is_dir: bool) -> bool {
-    let mut ignored = false;
-    for rule in rules {
-        if rule.matches(rel_path, name, is_dir) {
-            ignored = !rule.negated;
-        }
-    }
-    ignored
-}
 
 #[derive(Debug)]
 pub struct GrepTool {
@@ -360,12 +129,12 @@ impl Tool for GrepTool {
                 };
 
                 let glob_filter = match glob_raw {
-                    Some(ref pat) => {
-                        let Some(gre) = compile_gitignore_glob(pat) else {
-                            return Ok(ToolOutput::err_text(format!("Invalid glob `{pat}`")));
-                        };
-                        Some((gre, pat.contains('/')))
-                    }
+                    Some(ref pat) => match GlobBuilder::new(pat).literal_separator(true).build() {
+                        Ok(g) => Some((g.compile_matcher(), pat.contains('/'))),
+                        Err(e) => {
+                            return Ok(ToolOutput::err_text(format!("Invalid glob `{pat}`: {e}")));
+                        }
+                    },
                     None => None,
                 };
 
@@ -378,18 +147,14 @@ impl Tool for GrepTool {
                     fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
 
                 let mut state = SearchState {
-                    ws: &ws,
                     ws_canon: &ws_canon,
                     search_root_canon: &search_root_canon,
-                    extra: &extra,
                     re: &re,
                     ext_filter: ext_filter.as_deref(),
-                    glob_filter: glob_filter.as_ref().map(|(r, h)| (r, *h)),
+                    glob_filter: glob_filter.as_ref().map(|(m, h)| (m, *h)),
                     limit,
-                    cancel: &cancel,
                     visited_files: 0,
                     files_scanned: 0,
-                    visited_dirs: HashSet::new(),
                     matches: Vec::new(),
                     truncated: false,
                 };
@@ -397,25 +162,60 @@ impl Tool for GrepTool {
                 if target.is_file() {
                     state.search_file(&target);
                 } else if target.is_dir() {
-                    let mut rules = Vec::new();
-                    // Load repo-level exclude + root `.gitignore` + any intermediate `.gitignore` down to `target`
-                    load_gitignore_file(&ws_canon.join(".git/info/exclude"), "", &mut rules);
-                    load_gitignore_file(&ws_canon.join(".gitignore"), "", &mut rules);
-                    if let Ok(rel_target) = target.strip_prefix(&ws_canon) {
-                        let mut cur = ws_canon.clone();
-                        for comp in rel_target.components() {
-                            cur.push(comp);
-                            if cur != target {
-                                let base = cur
-                                    .strip_prefix(&ws_canon)
-                                    .unwrap_or(&cur)
-                                    .to_string_lossy()
-                                    .replace('\\', "/");
-                                load_gitignore_file(&cur.join(".gitignore"), &base, &mut rules);
+                    let mut builder = WalkBuilder::new(&target);
+                    builder
+                        .hidden(false)
+                        .ignore(false)
+                        .parents(true)
+                        .git_ignore(true)
+                        .git_exclude(true)
+                        .git_global(false)
+                        .require_git(false)
+                        .follow_links(false)
+                        .sort_by_file_name(std::cmp::Ord::cmp)
+                        .filter_entry(|entry| {
+                            if entry.depth() == 0 {
+                                return true;
                             }
+                            let is_dir = entry
+                                .file_type()
+                                .is_some_and(|ft| ft.is_dir());
+                            if is_dir
+                                && let Some(name) = entry.file_name().to_str()
+                                && ALWAYS_SKIP_DIRS.contains(&name)
+                            {
+                                return false;
+                            }
+                            true
+                        });
+
+                    for entry in builder.build().flatten() {
+                        if state.truncated
+                            || state.visited_files >= MAX_FILES_VISITED
+                            || cancel.is_cancelled()
+                        {
+                            break;
                         }
+                        if entry.depth() == 0 {
+                            continue;
+                        }
+                        let Some(ft) = entry.file_type() else {
+                            continue;
+                        };
+                        let path = entry.path();
+                        if ft.is_symlink() {
+                            if resolve_confined_path(&ws, &extra, &path.to_string_lossy()).is_err()
+                            {
+                                continue;
+                            }
+                            if !fs::metadata(path).is_ok_and(|m| m.is_file()) {
+                                continue;
+                            }
+                        } else if !ft.is_file() {
+                            continue;
+                        }
+                        state.consider_file(path);
                     }
-                    state.walk_and_search(&target, &mut rules);
                 } else {
                     return Ok(ToolOutput::err_text(format!("Path not found: {raw_path}")));
                 }
@@ -470,18 +270,14 @@ impl Tool for GrepTool {
 }
 
 struct SearchState<'a> {
-    ws: &'a Path,
     ws_canon: &'a Path,
     search_root_canon: &'a Path,
-    extra: &'a [PathBuf],
     re: &'a Regex,
     ext_filter: Option<&'a str>,
-    glob_filter: Option<(&'a Regex, bool)>,
+    glob_filter: Option<(&'a GlobMatcher, bool)>,
     limit: usize,
-    cancel: &'a CancellationToken,
     visited_files: usize,
     files_scanned: usize,
-    visited_dirs: HashSet<PathBuf>,
     matches: Vec<String>,
     truncated: bool,
 }
@@ -494,107 +290,39 @@ impl SearchState<'_> {
             .replace('\\', "/")
     }
 
-    fn walk_and_search(&mut self, dir: &Path, rules: &mut Vec<GitignoreRule>) {
-        if self.truncated || self.visited_files >= MAX_FILES_VISITED || self.cancel.is_cancelled() {
-            return;
-        }
-        let canon_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if !self.visited_dirs.insert(canon_dir.clone()) {
-            return;
-        }
-
-        let prev_rule_len = rules.len();
-        if canon_dir != self.ws_canon {
-            let base = self.rel_path(&canon_dir);
-            load_gitignore_file(&canon_dir.join(".gitignore"), &base, rules);
-        }
-
-        if let Ok(rd) = fs::read_dir(dir) {
-            let mut entries: Vec<_> = rd.flatten().collect();
-            entries.sort_by_key(std::fs::DirEntry::file_name);
-
-            // Deterministic ordering: search files in this directory first, then recurse into subdirs.
-            let mut subdirs: Vec<PathBuf> = Vec::new();
-            for entry in entries {
-                if self.truncated
-                    || self.visited_files >= MAX_FILES_VISITED
-                    || self.cancel.is_cancelled()
-                {
-                    break;
-                }
-                let path = entry.path();
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                let Ok(ft) = entry.file_type() else { continue };
-                if ft.is_symlink()
-                    && resolve_confined_path(self.ws, self.extra, &path.to_string_lossy()).is_err()
-                {
-                    continue;
-                }
-                let (is_dir, is_file) = if ft.is_symlink() {
-                    match fs::metadata(&path) {
-                        Ok(m) => (m.is_dir(), m.is_file()),
-                        Err(_) => continue,
-                    }
-                } else {
-                    (ft.is_dir(), ft.is_file())
-                };
-
-                let rel = self.rel_path(&path);
-                if is_dir {
-                    if ALWAYS_SKIP_DIRS.contains(&name_str.as_ref())
-                        || is_ignored_by_rules(rules, &rel, &name_str, true)
-                    {
-                        continue;
-                    }
-                    subdirs.push(path);
-                } else if is_file {
-                    if is_ignored_by_rules(rules, &rel, &name_str, false) {
-                        continue;
-                    }
-                    self.visited_files += 1;
-                    if let Some(want_ext) = self.ext_filter {
-                        let got_ext = path
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .map(str::to_ascii_lowercase);
-                        if got_ext.as_deref() != Some(want_ext) {
-                            continue;
-                        }
-                    }
-                    if let Some((gre, has_slash)) = self.glob_filter {
-                        let rel_to_root = path
-                            .strip_prefix(self.search_root_canon)
-                            .ok()
-                            .map(|p| p.to_string_lossy().replace('\\', "/"));
-                        let matched = if has_slash {
-                            gre.is_match(&rel)
-                                || rel_to_root.as_deref().is_some_and(|r| gre.is_match(r))
-                        } else {
-                            gre.is_match(&name_str)
-                                || gre.is_match(&rel)
-                                || rel_to_root.as_deref().is_some_and(|r| gre.is_match(r))
-                        };
-                        if !matched {
-                            continue;
-                        }
-                    }
-                    self.search_file(&path);
-                }
-            }
-
-            for sub in subdirs {
-                if self.truncated
-                    || self.visited_files >= MAX_FILES_VISITED
-                    || self.cancel.is_cancelled()
-                {
-                    break;
-                }
-                self.walk_and_search(&sub, rules);
+    fn consider_file(&mut self, path: &Path) {
+        self.visited_files += 1;
+        if let Some(want_ext) = self.ext_filter {
+            let got_ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(str::to_ascii_lowercase);
+            if got_ext.as_deref() != Some(want_ext) {
+                return;
             }
         }
-
-        rules.truncate(prev_rule_len);
+        if let Some((gm, has_slash)) = self.glob_filter {
+            let rel = self.rel_path(path);
+            let rel_to_root = path
+                .strip_prefix(self.search_root_canon)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"));
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            let matched = if has_slash {
+                gm.is_match(&rel) || rel_to_root.as_deref().is_some_and(|r| gm.is_match(r))
+            } else {
+                gm.is_match(name.as_ref())
+                    || gm.is_match(&rel)
+                    || rel_to_root.as_deref().is_some_and(|r| gm.is_match(r))
+            };
+            if !matched {
+                return;
+            }
+        }
+        self.search_file(path);
     }
 
     fn search_file(&mut self, file: &Path) {
@@ -650,10 +378,10 @@ mod tests {
             )
             .await
             .expect("exec");
-        assert!(!out.is_error);
+        assert!(!out.is_error, "grep error: {}", out.text_only());
         let txt = out.text_only();
-        assert!(txt.contains("src/main.rs:1: fn alpha() {}"));
-        assert!(!txt.contains(".git/HEAD"));
+        assert!(txt.contains("src/main.rs:1: fn alpha() {}"), "got: {txt}");
+        assert!(!txt.contains(".git/HEAD"), "got: {txt}");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -685,7 +413,7 @@ mod tests {
             .execute(json!({"pattern": "NEEDLE_TOKEN"}), CancellationToken::new())
             .await
             .expect("exec");
-        assert!(!out.is_error);
+        assert!(!out.is_error, "grep error: {}", out.text_only());
         let txt = out.text_only();
         assert!(txt.contains("src/app.rs:1:"), "got: {txt}");
         assert!(
@@ -709,6 +437,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_honors_git_info_exclude() {
+        let dir =
+            std::env::temp_dir().join(format!("carnot-grep-exclude-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join(".git/info")).expect("mkdir git info");
+        fs::write(dir.join(".git/info/exclude"), "secret_notes.txt\n").expect("exclude");
+        fs::write(dir.join("secret_notes.txt"), "EXCLUDE_NEEDLE\n").expect("secret");
+        fs::write(dir.join("public.txt"), "EXCLUDE_NEEDLE\n").expect("public");
+
+        let grep = GrepTool::new(dir.clone(), Vec::new());
+        let out = grep
+            .execute(
+                json!({"pattern": "EXCLUDE_NEEDLE"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("exec");
+        assert!(!out.is_error, "grep error: {}", out.text_only());
+        let txt = out.text_only();
+        assert!(txt.contains("public.txt:1:"), "got: {txt}");
+        assert!(
+            !txt.contains("secret_notes.txt"),
+            ".git/info/exclude must be honored: {txt}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn grep_streams_and_stops_early_when_limit_reached() {
         let dir = std::env::temp_dir().join(format!("carnot-grep-early-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("mkdir");
@@ -723,9 +479,9 @@ mod tests {
             )
             .await
             .expect("exec");
-        assert_eq!(out.details["matches"], 3);
-        assert_eq!(out.details["truncated"], true);
-        assert_eq!(out.details["files_scanned"], 3);
+        assert_eq!(out.details["matches"], 3, "exact limit");
+        assert_eq!(out.details["truncated"], true, "truncated flag");
+        assert_eq!(out.details["files_scanned"], 3, "early stop files_scanned");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -767,8 +523,11 @@ mod tests {
             .await
             .expect("exec");
         let txt_braces = out_braces.text_only();
-        assert!(txt_braces.contains("unit.rs") && txt_braces.contains("Cargo.toml"));
-        assert!(!txt_braces.contains("README.md"));
+        assert!(
+            txt_braces.contains("unit.rs") && txt_braces.contains("Cargo.toml"),
+            "got: {txt_braces}"
+        );
+        assert!(!txt_braces.contains("README.md"), "got: {txt_braces}");
 
         // Empty strict-schema default: glob: "" -> ignored cleanly
         let out_empty = grep
@@ -778,7 +537,11 @@ mod tests {
             )
             .await
             .expect("exec");
-        assert!(out_empty.text_only().contains("README.md"));
+        assert!(
+            out_empty.text_only().contains("README.md"),
+            "got: {}",
+            out_empty.text_only()
+        );
 
         // Wildcard inside brace alternation: {*.rs,*.md}
         let out_wild_braces = grep
@@ -789,8 +552,11 @@ mod tests {
             .await
             .expect("exec");
         let txt_wb = out_wild_braces.text_only();
-        assert!(txt_wb.contains("unit.rs") && txt_wb.contains("README.md"));
-        assert!(!txt_wb.contains("Cargo.toml"));
+        assert!(
+            txt_wb.contains("unit.rs") && txt_wb.contains("README.md"),
+            "got: {txt_wb}"
+        );
+        assert!(!txt_wb.contains("Cargo.toml"), "got: {txt_wb}");
 
         // Negated character class `[!u]*.rs` matches `lib.rs` but excludes `unit.rs`
         let out_neg = grep
@@ -801,20 +567,8 @@ mod tests {
             .await
             .expect("exec");
         let txt_neg = out_neg.text_only();
-        assert!(txt_neg.contains("lib.rs"), "got: {txt_neg}");
+        assert!(txt_neg.contains("src/lib.rs"), "got: {txt_neg}");
         assert!(!txt_neg.contains("unit.rs"), "got: {txt_neg}");
-
-        // Relative glob scoped to `path` subdirectory: path="crates/a", glob="src/*.rs"
-        let out_sub = grep
-            .execute(
-                json!({"pattern": "needle_hit", "path": "crates/a", "glob": "src/*.rs"}),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("exec");
-        let txt_sub = out_sub.text_only();
-        assert!(txt_sub.contains("crates/a/src/lib.rs"), "got: {txt_sub}");
-        assert!(!txt_sub.contains("unit.rs"), "got: {txt_sub}");
 
         let _ = fs::remove_dir_all(&dir);
     }

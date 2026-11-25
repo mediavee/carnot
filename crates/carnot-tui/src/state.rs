@@ -478,8 +478,17 @@ impl TuiApp {
                     .rev()
                     .find(|it| matches!(it, TranscriptItem::Tool { call_id: id, .. } if id == &call_id))
                 {
-                    *progress = Some(clip_one_line(&message, 80));
-                    self.cache_dirty = true;
+                    let formatted: String = message
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(4)
+                        .map(|l| clip_one_line(l, 120))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !formatted.is_empty() {
+                        *progress = Some(formatted);
+                        self.cache_dirty = true;
+                    }
                 }
             }
             AgentEvent::ToolEnd {

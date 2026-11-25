@@ -295,6 +295,48 @@ pub fn build_sandboxed_shell_in_dir(
     Ok(cmd)
 }
 
+/// Portable, OS-sandboxed command specification extracted from [`build_sandboxed_shell_in_dir`]
+/// so alternate spawners (such as PTY executors) reuse the exact same sandbox wrappers and env
+/// scrubbing without duplicating policy logic.
+#[derive(Debug, Clone)]
+pub struct ShellCommandSpec {
+    pub program: std::ffi::OsString,
+    pub args: Vec<std::ffi::OsString>,
+    pub cwd: PathBuf,
+    pub clear_env: bool,
+    pub envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+}
+
+/// Builds a [`ShellCommandSpec`] with the exact same OS sandbox wrapper and environment scrubbing
+/// as [`build_sandboxed_shell_in_dir`].
+pub fn build_sandboxed_shell_spec_in_dir(
+    policy: &SandboxPolicy,
+    shell_cmd: &str,
+    cwd: &Path,
+    extra_env: &BTreeMap<String, String>,
+) -> std::result::Result<ShellCommandSpec, String> {
+    let cmd = build_sandboxed_shell_in_dir(policy, shell_cmd, cwd, extra_env)?;
+    let std_cmd = cmd.as_std();
+    let program = std_cmd.get_program().to_os_string();
+    let args = std_cmd
+        .get_args()
+        .map(std::ffi::OsStr::to_os_string)
+        .collect();
+    let envs = std_cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(std::ffi::OsStr::to_os_string)))
+        .collect();
+    Ok(ShellCommandSpec {
+        program,
+        args,
+        cwd: std_cmd
+            .get_current_dir()
+            .map_or_else(|| cwd.to_path_buf(), Path::to_path_buf),
+        clear_env: policy.enabled,
+        envs,
+    })
+}
+
 const MACOS_DENY_SUBPATHS: &[(&str, &str)] = &[
     ("SSH", ".ssh"),
     ("AWS", ".aws"),

@@ -100,13 +100,15 @@ pub struct ProjectedContext {
 
 impl ProjectedContext {
     pub fn estimated_tokens(&self) -> u64 {
-        let sys_tok = (self.static_system_prompt.len() as u64) / 4;
+        let sys_tok = carnot_core::estimate_text_tokens(&self.static_system_prompt);
         let tool_tok: u64 = self
             .tools
             .iter()
             .filter(|t| !t.defer_loading)
             .map(|t| {
-                (t.name.len() + t.description.len() + t.input_schema.to_string().len()) as u64 / 4
+                carnot_core::estimate_text_tokens(&t.name)
+                    + carnot_core::estimate_text_tokens(&t.description)
+                    + carnot_core::estimate_text_tokens(&t.input_schema.to_string())
             })
             .sum();
         let msg_tok: u64 = self.messages.iter().map(|m| m.estimated_tokens()).sum();
@@ -204,6 +206,10 @@ pub struct SessionStore {
     /// Last valid provider-reported input token count anchored at `(active_messages.len(), tokens)`.
     /// Invalidated automatically by any compaction or cold prune.
     last_usage_anchor: Option<(usize, u64)>,
+    /// EMA scale factor (`actual_provider_tokens / estimated_tokens`, clamped to `[0.5, 2.5]`)
+    /// learned from observed provider usage so trailing and post-compaction estimates converge.
+    token_calibration: f64,
+    token_calibration_samples: u32,
     /// Unix timestamp (ms) of the most recent recorded session activity (used to detect cold provider caches).
     last_activity_unix_ms: Option<u64>,
 }
@@ -271,6 +277,8 @@ impl SessionStore {
             checkpoint_index: None,
             last_message_id: None,
             last_usage_anchor: None,
+            token_calibration: 1.0,
+            token_calibration_samples: 0,
             last_activity_unix_ms: None,
         };
 
@@ -394,6 +402,8 @@ impl SessionStore {
             checkpoint_index: None,
             last_message_id: None,
             last_usage_anchor: None,
+            token_calibration: 1.0,
+            token_calibration_samples: 0,
             last_activity_unix_ms: None,
         };
 
@@ -779,14 +789,43 @@ impl SessionStore {
         Ok(reclaimable)
     }
 
+    /// Current provider-calibrated scale factor (`1.0` before any provider usage observation).
+    pub fn token_calibration_factor(&self) -> f64 {
+        self.token_calibration
+    }
+
+    fn scale_estimate(&self, raw_tokens: u64) -> u64 {
+        if raw_tokens == 0 || self.token_calibration_samples == 0 {
+            return raw_tokens;
+        }
+        ((raw_tokens as f64) * self.token_calibration).round().max(1.0) as u64
+    }
+
+    fn observe_provider_calibration(&mut self, billed_tokens: u64) {
+        let raw_est = self.project_context().estimated_tokens();
+        // Skip tiny prompts where fixed provider overhead dominates the ratio.
+        if billed_tokens < 200 || raw_est < 100 {
+            return;
+        }
+        let ratio = (billed_tokens as f64 / raw_est as f64).clamp(0.5, 2.5);
+        if self.token_calibration_samples == 0 {
+            self.token_calibration = ratio;
+        } else {
+            self.token_calibration = (0.6 * self.token_calibration + 0.4 * ratio).clamp(0.5, 2.5);
+        }
+        self.token_calibration_samples = self.token_calibration_samples.saturating_add(1);
+    }
+
     pub fn tokens_since_checkpoint(&self) -> u64 {
         let start = self.checkpoint_index.map_or(0, |i| i + 1);
-        self.active_messages
+        let raw: u64 = self
+            .active_messages
             .get(start..)
             .unwrap_or(&[])
             .iter()
             .map(|m| m.estimated_tokens())
-            .sum()
+            .sum();
+        self.scale_estimate(raw)
     }
 
     /// True when the session holds a provider-reported input token measurement for the current
@@ -796,20 +835,21 @@ impl SessionStore {
     }
 
     /// Provider-grounded context size estimate: uses the exact last provider-billed input token
-    /// count plus `estimated_tokens()` for any trailing messages added since that call.
-    /// Automatically falls back to full `project_context().estimated_tokens()` after compaction
-    /// or rewind.
+    /// count plus calibrated estimates for any trailing messages added since that call.
+    /// Automatically falls back to calibrated `project_context().estimated_tokens()` after
+    /// compaction or rewind.
     pub fn effective_context_tokens(&self) -> u64 {
         if let Some((anchor_len, input_tokens)) = self.last_usage_anchor
             && anchor_len <= self.active_messages.len()
         {
-            let trailing: u64 = self.active_messages[anchor_len..]
+            let trailing_raw: u64 = self.active_messages[anchor_len..]
                 .iter()
                 .map(|m| m.estimated_tokens())
                 .sum();
+            let trailing = self.scale_estimate(trailing_raw);
             return input_tokens.saturating_add(trailing);
         }
-        self.project_context().estimated_tokens()
+        self.scale_estimate(self.project_context().estimated_tokens())
     }
 
     pub fn project_context(&self) -> ProjectedContext {
@@ -855,6 +895,7 @@ impl SessionStore {
                 self.last_activity_unix_ms = Some(*timestamp_unix_ms);
                 let billed = usage.total_context_tokens();
                 if billed > 0 {
+                    self.observe_provider_calibration(billed);
                     self.last_usage_anchor = Some((self.active_messages.len(), billed));
                 }
             }
@@ -1336,6 +1377,71 @@ mod tests {
         let last = reloaded.active_messages().last().expect("last");
         assert_eq!(last.role, Role::User);
         assert!(last.has_tool_result());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_aware_estimator_weights_json_code_and_cjk_higher_than_ascii_prose() {
+        let prose = "the quick brown fox jumps over the lazy dog again and again ";
+        let json_dense = "{\"a\":1,\"b\":[2,3,4],\"c\":{\"x\":9,\"y\":0},\"d\":[1,2,3,4,5]}";
+        let cjk = "你好世界测试数据代码性能分析和上下文预算评估模型";
+
+        let prose_per_byte =
+            carnot_core::estimate_text_tokens(prose) as f64 / prose.len() as f64;
+        let json_per_byte =
+            carnot_core::estimate_text_tokens(json_dense) as f64 / json_dense.len() as f64;
+        let cjk_per_byte = carnot_core::estimate_text_tokens(cjk) as f64 / cjk.len() as f64;
+
+        assert!(
+            json_per_byte > prose_per_byte * 1.3,
+            "dense JSON must estimate higher tok/byte than prose: json={json_per_byte:.3} prose={prose_per_byte:.3}"
+        );
+        assert!(
+            cjk_per_byte > json_per_byte,
+            "CJK UTF-8 must estimate higher tok/byte than JSON: cjk={cjk_per_byte:.3} json={json_per_byte:.3}"
+        );
+    }
+
+    #[test]
+    fn provider_usage_calibrates_trailing_and_post_compaction_estimates() {
+        let dir = std::env::temp_dir().join(format!("carnot-cal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut s = SessionStore::create(
+            Some(&dir),
+            "claude-sonnet-5-5".into(),
+            "STATIC SYSTEM PROMPT".into(),
+            vec![],
+        )
+        .expect("create");
+        let path = s.path.clone().expect("path");
+        s.push_message(Message::user_text("a ".repeat(400)))
+            .expect("u0");
+        let raw_before = s.project_context().estimated_tokens();
+        assert!(raw_before >= 150, "expected >=150 raw est, got {raw_before}");
+
+        // Provider reports 1.5x our uncalibrated estimate.
+        let billed = (raw_before as f64 * 1.5).round() as u64;
+        s.record_usage(
+            1,
+            Usage {
+                input_tokens: billed,
+                ..Default::default()
+            },
+        )
+        .expect("usage");
+        assert!(
+            (s.token_calibration_factor() - 1.5).abs() < 0.05,
+            "calibration should learn ~1.5x, got {}",
+            s.token_calibration_factor()
+        );
+
+        // Reloading from JSONL preserves calibration identically.
+        let reloaded = SessionStore::load(&path).expect("reload");
+        assert!(
+            (reloaded.token_calibration_factor() - s.token_calibration_factor()).abs() < 1e-6,
+            "reloaded calibration must match"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

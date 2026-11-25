@@ -11,6 +11,8 @@ description = "Isolated QuickJS CodeMode orchestration extension for Carnot (asy
 workspace = true
 
 [dependencies]
+base64.workspace = true
+blake3.workspace = true
 carnot-agent.workspace = true
 carnot-cas.workspace = true
 carnot-core.workspace = true

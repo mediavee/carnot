@@ -146,10 +146,14 @@ impl TuiApp {
                     lines.push(Line::from(header_spans));
 
                     if let Some(prog) = progress {
-                        lines.push(Line::from(vec![
-                            Span::styled("    ↳ ", p.border()),
-                            Span::styled(prog.clone(), p.muted()),
-                        ]));
+                        let max_w = content_w.saturating_sub(8).max(20);
+                        for (idx, line) in prog.lines().take(4).enumerate() {
+                            let prefix = if idx == 0 { "    ↳ " } else { "    │ " };
+                            lines.push(Line::from(vec![
+                                Span::styled(prefix, p.border()),
+                                Span::styled(clip_one_line(line, max_w), p.muted()),
+                            ]));
+                        }
                     }
 
                     if *status == ToolStatus::Error && !output_preview.is_empty() {

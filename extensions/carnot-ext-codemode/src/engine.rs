@@ -132,6 +132,145 @@ const PRELUDE: &str = r#"
   };
 
   globalThis.storedKeys = () => JSON.parse(__storeKeys());
+
+  // Built-in pure-sandbox stdlib: path, base64, blake3, CSV/TSV, globMatch, Read helpers.
+  const normPath = (p) => {
+    const s = String(p ?? "").replace(/\\/g, "/");
+    if (!s) return ".";
+    const isAbs = s.startsWith("/");
+    const parts = s.split("/");
+    const out = [];
+    for (const seg of parts) {
+      if (!seg || seg === ".") continue;
+      if (seg === "..") {
+        if (out.length && out[out.length - 1] !== "..") out.pop();
+        else if (!isAbs) out.push("..");
+      } else {
+        out.push(seg);
+      }
+    }
+    const res = (isAbs ? "/" : "") + out.join("/");
+    return res || (isAbs ? "/" : ".");
+  };
+  globalThis.path = Object.freeze({
+    normalize: normPath,
+    isAbsolute: (p) => String(p ?? "").startsWith("/"),
+    join: (...parts) => normPath(parts.filter((x) => x != null && String(x) !== "").join("/")),
+    dirname: (p) => {
+      const n = normPath(p).replace(/\/+$/, "");
+      if (!n || n === "/") return n || ".";
+      const idx = n.lastIndexOf("/");
+      return idx < 0 ? "." : idx === 0 ? "/" : n.slice(0, idx);
+    },
+    basename: (p, ext) => {
+      const n = normPath(p).replace(/\/+$/, "");
+      const idx = n.lastIndexOf("/");
+      let b = idx < 0 ? n : n.slice(idx + 1);
+      if (ext && b.endsWith(ext)) b = b.slice(0, b.length - ext.length);
+      return b;
+    },
+    extname: (p) => {
+      const b = globalThis.path.basename(p);
+      const idx = b.lastIndexOf(".");
+      return idx <= 0 ? "" : b.slice(idx);
+    },
+  });
+
+  globalThis.base64Encode = (s) => __base64Encode(String(s ?? ""));
+  globalThis.base64Decode = (s) => {
+    const r = JSON.parse(__base64Decode(String(s ?? "")));
+    if (!r.ok) throw new Error(r.error);
+    return r.value;
+  };
+  globalThis.blake3 = (s) => __blake3(String(s ?? ""));
+
+  globalThis.parseCsv = (input, delimiter = ",") => {
+    const src = String(input ?? "");
+    const rows = [];
+    let row = [];
+    let field = "";
+    let inQuotes = false;
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      if (inQuotes) {
+        if (ch === '"') {
+          if (src[i + 1] === '"') { field += '"'; i++; }
+          else inQuotes = false;
+        } else {
+          field += ch;
+        }
+      } else if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === delimiter) {
+        row.push(field);
+        field = "";
+      } else if (ch === "\n" || ch === "\r") {
+        if (ch === "\r" && src[i + 1] === "\n") i++;
+        row.push(field);
+        if (row.length > 1 || row[0] !== "") rows.push(row);
+        row = [];
+        field = "";
+      } else {
+        field += ch;
+      }
+    }
+    if (field !== "" || row.length > 0) {
+      row.push(field);
+      rows.push(row);
+    }
+    return rows;
+  };
+  globalThis.parseTsv = (input) => globalThis.parseCsv(input, "\t");
+
+  globalThis.globMatch = (pattern, text) => {
+    const p = String(pattern ?? "");
+    const t = String(text ?? "");
+    const compile = (src) => {
+      let re = "";
+      for (let i = 0; i < src.length; i++) {
+        const c = src[i];
+        if (c === "*") {
+          if (src[i + 1] === "*") {
+            if (src[i + 2] === "/") { re += "(?:.*/)?"; i += 2; }
+            else { re += ".*"; i += 1; }
+          } else {
+            re += "[^/]*";
+          }
+        } else if (c === "?") {
+          re += "[^/]";
+        } else if (c === "{") {
+          const end = src.indexOf("}", i + 1);
+          if (end > i) {
+            const alts = src.slice(i + 1, end).split(",").map(compile);
+            re += "(?:" + alts.join("|") + ")";
+            i = end;
+          } else {
+            re += "\\{";
+          }
+        } else {
+          re += c.replace(/[.+^$|()[\]\\]/g, "\\$&");
+        }
+      }
+      return re;
+    };
+    return new RegExp("^" + compile(p) + "$").test(t);
+  };
+
+  globalThis.stripLineNumbers = (raw) =>
+    String(raw ?? "")
+      .split("\n")
+      .map((l) => l.replace(/^\d+\t/, ""))
+      .join("\n");
+
+  globalThis.readLines = async (filePath, opts) => {
+    const raw = await call("Read", Object.assign({ file_path: String(filePath) }, opts || {}));
+    return globalThis.stripLineNumbers(raw).split("\n");
+  };
+
+  globalThis.readJson = async (filePath) => {
+    const raw = await call("Read", { file_path: String(filePath) });
+    return JSON.parse(globalThis.stripLineNumbers(raw));
+  };
 })();
 "#;
 
@@ -626,6 +765,51 @@ fn run_on_worker_thread(
                     .map_err(|e| format!("bind __storeKeys: {e}"))?,
                 )
                 .map_err(|e| format!("set __storeKeys: {e}"))?;
+
+            // __base64Encode / __base64Decode / __blake3 (native safe stdlib helpers)
+            globals
+                .set(
+                    "__base64Encode",
+                    Function::new(ctx.clone(), |s: String| -> String {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+                    })
+                    .map_err(|e| format!("bind __base64Encode: {e}"))?,
+                )
+                .map_err(|e| format!("set __base64Encode: {e}"))?;
+
+            globals
+                .set(
+                    "__base64Decode",
+                    Function::new(ctx.clone(), |s: String| -> String {
+                        use base64::Engine as _;
+                        match base64::engine::general_purpose::STANDARD.decode(s.trim()) {
+                            Ok(bytes) => match String::from_utf8(bytes) {
+                                Ok(text) => json!({ "ok": true, "value": text }).to_string(),
+                                Err(e) => {
+                                    json!({ "ok": false, "error": format!("invalid UTF-8: {e}") })
+                                        .to_string()
+                                }
+                            },
+                            Err(e) => {
+                                json!({ "ok": false, "error": format!("invalid base64: {e}") })
+                                    .to_string()
+                            }
+                        }
+                    })
+                    .map_err(|e| format!("bind __base64Decode: {e}"))?,
+                )
+                .map_err(|e| format!("set __base64Decode: {e}"))?;
+
+            globals
+                .set(
+                    "__blake3",
+                    Function::new(ctx.clone(), |s: String| -> String {
+                        blake3::hash(s.as_bytes()).to_hex().to_string()
+                    })
+                    .map_err(|e| format!("bind __blake3: {e}"))?,
+                )
+                .map_err(|e| format!("set __blake3: {e}"))?;
 
             // async __callTool(name, args_json) -> json `{ ok, value | error }`
             let s_call = Arc::clone(shared);

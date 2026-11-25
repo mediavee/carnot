@@ -20,6 +20,10 @@ use tokio_util::sync::CancellationToken;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Callback receiving live incremental progress/output updates from long-running tools
+/// (forwarded to `AgentEvent::ToolUpdate` across TUI, REPL, RPC, HTTP SSE, and ACP).
+pub type ToolProgressSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Extensible runtime tool trait (implemented by built-ins, Rust modules, MCP, and extensions).
 pub trait Tool: Send + Sync + std::fmt::Debug {
     fn spec(&self) -> ToolSpec;
@@ -42,6 +46,18 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ToolOutput>> {
         self.execute(input, cancel)
+    }
+
+    /// Executes the tool with both `call_id` and an optional live [`ToolProgressSink`] for
+    /// streaming incremental status or command output. Defaults to [`Tool::execute_with_id`].
+    fn execute_with_progress<'a>(
+        &'a self,
+        call_id: &'a str,
+        input: Value,
+        cancel: CancellationToken,
+        _progress: Option<ToolProgressSink>,
+    ) -> BoxFuture<'a, Result<ToolOutput>> {
+        self.execute_with_id(call_id, input, cancel)
     }
 }
 
@@ -306,7 +322,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "Bash".into(),
-            description: "Run shell command in workspace sandbox (auto-yields long jobs).".into(),
+            description: "Run shell command in workspace sandbox (auto-yields long jobs; supports `pty: true` + `stdin`).".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -315,6 +331,8 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
                     "cwd": { "type": "string", "description": "Subdir in workspace" },
                     "job": { "type": "string", "description": "Collect yielded job ID" },
                     "kill": { "type": "boolean" },
+                    "pty": { "type": "boolean", "description": "Run in interactive PTY" },
+                    "stdin": { "type": "string", "description": "Send input to PTY job" },
                     "timeout": { "type": "integer", "description": "Seconds" }
                 }
             }),

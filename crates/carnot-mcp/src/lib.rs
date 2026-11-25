@@ -513,6 +513,27 @@ impl Tool for McpToolProxy {
         input: Value,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<ToolOutput>> {
+        self.execute_inner(input, cancel, None)
+    }
+
+    fn execute_with_progress<'a>(
+        &'a self,
+        _call_id: &'a str,
+        input: Value,
+        cancel: CancellationToken,
+        progress: Option<carnot_tools::ToolProgressSink>,
+    ) -> BoxFuture<'a, Result<ToolOutput>> {
+        self.execute_inner(input, cancel, progress)
+    }
+}
+
+impl McpToolProxy {
+    fn execute_inner(
+        &self,
+        input: Value,
+        cancel: CancellationToken,
+        progress: Option<carnot_tools::ToolProgressSink>,
+    ) -> BoxFuture<'_, Result<ToolOutput>> {
         Box::pin(async move {
             let client = self.server.get_or_connect().await?;
             // SEP-2243: mirror annotated `x-mcp-header` parameters (including nested paths!) into `Mcp-Param-*` headers
@@ -532,13 +553,27 @@ impl Tool for McpToolProxy {
                 }
             }
 
+            let on_progress: Option<transport::ProgressCallback> = progress.map(|sink| {
+                Arc::new(
+                    move |cur: f64, total: Option<f64>, msg: Option<String>| {
+                        let line = match (msg, total) {
+                            (Some(m), Some(t)) if t > 0.0 => format!("{m} ({cur:.0}/{t:.0})"),
+                            (Some(m), _) => m,
+                            (None, Some(t)) if t > 0.0 => format!("{cur:.0}/{t:.0}"),
+                            (None, _) => format!("progress {cur:.0}"),
+                        };
+                        sink(line);
+                    },
+                ) as transport::ProgressCallback
+            });
+
             let res = client
                 .request_with_headers(
                     "tools/call",
                     json!({ "name": self.entry.remote_name, "arguments": input }),
                     extra_headers,
                     cancel,
-                    None,
+                    on_progress,
                 )
                 .await?;
 

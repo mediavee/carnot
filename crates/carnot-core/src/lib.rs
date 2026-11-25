@@ -168,6 +168,34 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
 }
 
+/// Content-aware, single-pass token estimator (~2 GB/s, zero allocation).
+///
+/// Distinguishes ASCII prose (~4.0 B/tok), dense code/JSON/digits/punctuation (~2.4 B/tok),
+/// and multi-byte UTF-8 / CJK / accented text (~1.8 B/tok) so compaction and context budgets
+/// stay accurate on JSON logs, source code, and non-ASCII prompts before provider calibration.
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut prose_bytes: u64 = 0;
+    let mut dense_bytes: u64 = 0;
+    let mut non_ascii_bytes: u64 = 0;
+    for &b in text.as_bytes() {
+        if b >= 0x80 {
+            non_ascii_bytes += 1;
+        } else if b.is_ascii_alphabetic() || b == b' ' {
+            prose_bytes += 1;
+        } else {
+            dense_bytes += 1;
+        }
+    }
+    let weighted = prose_bytes
+        .saturating_mul(25)
+        .saturating_add(dense_bytes.saturating_mul(42))
+        .saturating_add(non_ascii_bytes.saturating_mul(55));
+    weighted.div_ceil(100).max(1)
+}
+
 impl Message {
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
@@ -275,21 +303,27 @@ impl Message {
         let mut tok = 8u64;
         for b in &self.content {
             match b {
-                ContentBlock::Text { text } => tok += (text.len() as u64) / 4 + 1,
-                ContentBlock::Thinking { thinking, .. } => tok += (thinking.len() as u64) / 4 + 1,
+                ContentBlock::Text { text } => tok += estimate_text_tokens(text) + 1,
+                ContentBlock::Thinking { thinking, .. } => tok += estimate_text_tokens(thinking) + 1,
                 ContentBlock::ToolUse { name, input, .. } => {
-                    tok += (name.len() as u64 + input.to_string().len() as u64) / 4 + 4;
+                    tok += estimate_text_tokens(name)
+                        + estimate_text_tokens(&input.to_string())
+                        + 4;
                 }
                 ContentBlock::ToolResult { content, .. } => {
                     for tb in content {
                         match tb {
-                            ToolResultBlock::Text { text } => tok += (text.len() as u64) / 4 + 1,
+                            ToolResultBlock::Text { text } => {
+                                tok += estimate_text_tokens(text) + 1;
+                            }
                             ToolResultBlock::Image { .. } => tok += 1_500,
                         }
                     }
                 }
                 ContentBlock::Image { .. } => tok += 1_500,
-                ContentBlock::Opaque { raw, .. } => tok += (raw.to_string().len() as u64) / 4 + 1,
+                ContentBlock::Opaque { raw, .. } => {
+                    tok += estimate_text_tokens(&raw.to_string()) + 1;
+                }
             }
         }
         tok

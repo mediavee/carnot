@@ -747,6 +747,12 @@ pub(crate) async fn run_repl(
                         let summary = summarize_tool_call(tool, input);
                         eprintln!("{}", theme.paint("2", &format!("  ▸ {summary}")));
                     }
+                    AgentEvent::ToolUpdate { message, .. } => {
+                        if let Some(last) = message.lines().rev().find(|l| !l.trim().is_empty()) {
+                            let preview = clip_one_line(last, 96);
+                            eprintln!("{}", theme.paint("2", &format!("    ↳ {preview}")));
+                        }
+                    }
                     AgentEvent::ToolEnd {
                         tool,
                         is_error,
