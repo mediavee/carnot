@@ -776,4 +776,156 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[cfg(feature = "syntax")]
+    #[tokio::test]
+    async fn symbol_edit_supports_rust_python_batch_autoindent_ambiguity_and_guards() {
+        let tmp = std::env::temp_dir().join(format!("carnot-sym-edit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("mkdir");
+
+        let rs_file = tmp.join("calc.rs");
+        fs::write(
+            &rs_file,
+            "pub struct Calc;\n\nimpl Calc {\n    pub fn add(&self, a: i32, b: i32) -> i32 {\n        a + b\n    }\n\n    pub fn sub(&self, a: i32, b: i32) -> i32 {\n        a - b\n    }\n}\n\npub struct Other;\n\nimpl Other {\n    pub fn add(&self, a: i32, b: i32) -> i32 {\n        a + b + 1\n    }\n}\n",
+        )
+        .expect("write calc.rs");
+
+        let py_file = tmp.join("service.py");
+        fs::write(
+            &py_file,
+            "class Service:\n    def greet(self, name: str) -> str:\n        return f\"hi {name}\"\n\n    def obsolete(self) -> None:\n        pass\n",
+        )
+        .expect("write service.py");
+
+        let cfg = carnot_core::CarnotConfig::new(tmp.clone());
+        let cas = Arc::new(CasStore::open(&tmp).expect("cas"));
+        let reg = crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let read = reg.get("Read").expect("Read");
+        let edit = reg.get("Edit").expect("Edit");
+
+        // 1. Unread guard refuses blind symbol edit before Read.
+        let unread = edit
+            .execute(
+                json!({
+                    "file_path": "calc.rs",
+                    "symbol": "Calc::add",
+                    "new_string": "pub fn add(&self, a: i32, b: i32) -> i32 { a * b }"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("unread edit");
+        assert!(unread.is_error, "unread symbol edit must be rejected");
+        assert!(
+            unread.text_only().contains("not been read"),
+            "got: {}",
+            unread.text_only()
+        );
+
+        // 2. Read(outline: true) anchors disk_hash and enables AST symbol edits!
+        let outline = read
+            .execute(
+                json!({"file_path": "calc.rs", "outline": true}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("outline");
+        assert!(!outline.is_error, "outline failed: {}", outline.text_only());
+
+        // 3. Ambiguous unqualified symbol `add` is rejected with candidate line ranges.
+        let ambig = edit
+            .execute(
+                json!({
+                    "file_path": "calc.rs",
+                    "symbol": "add",
+                    "new_string": "pub fn add(&self, a: i32, b: i32) -> i32 { 0 }"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("ambig edit");
+        assert!(ambig.is_error, "ambiguous symbol must be rejected");
+        assert!(
+            ambig.text_only().contains("ambiguous"),
+            "got: {}",
+            ambig.text_only()
+        );
+
+        // 4. Atomic batch of 2 qualified Rust symbols (`Calc::add` + `Calc::sub`) with auto-indent!
+        let batch = edit
+            .execute(
+                json!({
+                    "file_path": "calc.rs",
+                    "edits": [
+                        {
+                            "symbol": "Calc::add",
+                            "new_string": "pub fn add(&self, a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}"
+                        },
+                        {
+                            "symbol": "Calc::sub",
+                            "new_string": "pub fn sub(&self, a: i32, b: i32) -> i32 {\n    a.saturating_sub(b)\n}"
+                        }
+                    ]
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("batch edit");
+        assert!(!batch.is_error, "batch symbol edit failed: {}", batch.text_only());
+        assert!(batch.text_only().contains("[symbol `Calc::add`"));
+        assert!(batch.text_only().contains("[symbol `Calc::sub`"));
+        let rs_after = fs::read_to_string(&rs_file).expect("read calc.rs");
+        assert!(
+            rs_after.contains("    pub fn add(&self, a: i32, b: i32) -> i32 {\n        a.saturating_add(b)\n    }"),
+            "expected preserved 4-space indentation:\n{rs_after}"
+        );
+        assert!(
+            rs_after.contains("    pub fn sub(&self, a: i32, b: i32) -> i32 {\n        a.saturating_sub(b)\n    }"),
+            "expected preserved 4-space indentation for sub:\n{rs_after}"
+        );
+        assert!(
+            rs_after.contains("a + b + 1"),
+            "Other::add must remain untouched:\n{rs_after}"
+        );
+
+        // 5. Python `Service.greet` replacement + `Service.obsolete` deletion (`new_string: ""`).
+        let _ = read
+            .execute(
+                json!({"file_path": "service.py", "outline": true}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("py outline");
+        let py_edit = edit
+            .execute(
+                json!({
+                    "file_path": "service.py",
+                    "edits": [
+                        {
+                            "symbol": "Service.greet",
+                            "new_string": "def greet(self, name: str) -> str:\n    return f\"hello {name}\""
+                        },
+                        {
+                            "symbol": "Service.obsolete",
+                            "new_string": ""
+                        }
+                    ]
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("py edit");
+        assert!(!py_edit.is_error, "py symbol edit failed: {}", py_edit.text_only());
+        let py_after = fs::read_to_string(&py_file).expect("read py");
+        assert!(
+            py_after.contains("    def greet(self, name: str) -> str:\n        return f\"hello {name}\""),
+            "expected preserved Python class indentation:\n{py_after}"
+        );
+        assert!(
+            !py_after.contains("obsolete"),
+            "deleted symbol must be gone:\n{py_after}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

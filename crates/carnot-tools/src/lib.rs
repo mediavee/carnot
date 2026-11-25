@@ -357,13 +357,14 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Edit".into(),
-            description: "Atomically edit a file via `start_line`+`end_line` (1-based inclusive, avoids repeating old text) OR `old_string`, with `new_string` (empty deletes). Batch all hunks to a file in `edits` (non-overlapping ranges use original line numbers).".into(),
+            description: "Atomically edit a file via `symbol` (`Type::method`/`Class.method`), `start_line`+`end_line` (1-based inclusive), OR `old_string`, with `new_string` (empty deletes). Batch hunks in `edits`.".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["file_path"],
                 "properties": {
                     "file_path": { "type": "string" },
+                    "symbol": { "type": "string" },
                     "start_line": { "type": "integer" },
                     "end_line": { "type": "integer" },
                     "old_string": { "type": "string" },
@@ -376,6 +377,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
                             "additionalProperties": false,
                             "required": ["new_string"],
                             "properties": {
+                                "symbol": { "type": "string" },
                                 "start_line": { "type": "integer" },
                                 "end_line": { "type": "integer" },
                                 "old_string": { "type": "string" },

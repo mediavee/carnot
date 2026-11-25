@@ -4,9 +4,10 @@ use super::path::{
     atomic_write_confined, effect_key_path, reject_protected_git_write, resolve_confined_path,
     validate_regular_file_for_read,
 };
-use crate::syntax::syntax_regression_warning;
+use crate::syntax::{find_symbol_ranges, structural_outline, syntax_regression_warning};
 use crate::tracker::{
     PathLockPool, ReadTracker, ViewedLine, hash_line, is_read_tracking_suppressed,
+    split_logical_lines,
 };
 use crate::{BoxFuture, Tool, UndoEntry, UndoKind};
 use carnot_cas::CasStore;
@@ -63,9 +64,18 @@ enum EditHunk {
         end_line: usize,
         new_string: String,
     },
+    Symbol {
+        symbol: String,
+        new_string: String,
+    },
 }
 
 fn parse_edit_hunk(item: &Value, label: &str) -> std::result::Result<EditHunk, String> {
+    let sym = item
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let has_start = item
         .get("start_line")
         .and_then(Value::as_u64)
@@ -74,12 +84,30 @@ fn parse_edit_hunk(item: &Value, label: &str) -> std::result::Result<EditHunk, S
         .get("end_line")
         .and_then(Value::as_u64)
         .is_some_and(|v| v >= 1);
-    if has_start || has_end {
-        if item
-            .get("old_string")
+    let has_old = item
+        .get("old_string")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+
+    if let Some(symbol) = sym {
+        if has_start || has_end || has_old {
+            return Err(format!(
+                "{label} cannot combine `symbol` with `old_string` or `start_line`/`end_line`"
+            ));
+        }
+        let new_string = item
+            .get("new_string")
             .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-        {
+            .ok_or_else(|| format!("{label} missing `new_string`"))?
+            .to_string();
+        return Ok(EditHunk::Symbol {
+            symbol: symbol.to_string(),
+            new_string,
+        });
+    }
+
+    if has_start || has_end {
+        if has_old {
             return Err(format!(
                 "{label} cannot specify both `old_string` and `start_line`/`end_line`"
             ));
@@ -112,7 +140,7 @@ fn parse_edit_hunk(item: &Value, label: &str) -> std::result::Result<EditHunk, S
 
     let Some(os) = item.get("old_string").and_then(Value::as_str) else {
         return Err(format!(
-            "{label} requires `old_string` (or `start_line`+`end_line`)"
+            "{label} requires `symbol`, `start_line`+`end_line`, or `old_string`"
         ));
     };
     if os.is_empty() {
@@ -130,6 +158,117 @@ fn parse_edit_hunk(item: &Value, label: &str) -> std::result::Result<EditHunk, S
         new_string: ns.to_string(),
         replace_all: ra,
     })
+}
+
+/// Preserves original leading indentation for nested AST members (e.g. `impl` / `class` methods)
+/// when the caller supplies an unindented replacement block, while leaving already-indented or
+/// empty replacements untouched.
+fn preserve_symbol_indentation(disk_lines: &[&str], start_line: usize, new_string: &str) -> String {
+    if new_string.is_empty() || start_line == 0 || start_line > disk_lines.len() {
+        return new_string.to_string();
+    }
+    let orig_line = disk_lines[start_line - 1];
+    let orig_indent: String = orig_line
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    if orig_indent.is_empty() {
+        return new_string.to_string();
+    }
+    let first_nonempty = new_string.lines().find(|l| !l.trim().is_empty());
+    if let Some(first) = first_nonempty
+        && first.starts_with([' ', '\t'])
+    {
+        return new_string.to_string();
+    }
+    let trailing_nl = new_string.ends_with('\n');
+    let body = new_string
+        .strip_suffix("\r\n")
+        .or_else(|| new_string.strip_suffix('\n'))
+        .unwrap_or(new_string);
+    let mut out = String::with_capacity(new_string.len() + orig_indent.len() * 4);
+    for (idx, line) in body.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let clean = line.trim_end_matches('\r');
+        if !clean.trim().is_empty() {
+            out.push_str(&orig_indent);
+        }
+        out.push_str(clean);
+    }
+    if trailing_nl {
+        out.push('\n');
+    }
+    out
+}
+
+type OwnedLineRange = (usize, usize, String);
+
+/// Resolves one or more AST `symbol` hunks into concrete 1-based `(start_line, end_line, replacement)`
+/// ranges after verifying that `path` was read and has not changed externally on disk.
+fn resolve_symbol_hunks(
+    content: &str,
+    symbols: &[(&str, &str)],
+    path: &Path,
+    raw_path: &str,
+    tracker: &Mutex<ReadTracker>,
+) -> std::result::Result<(Vec<OwnedLineRange>, Vec<String>), String> {
+    // 1. Require disk-coherent Read (full file, symbol slice, or outline) before blind AST overwrite.
+    let disk_digest = *blake3::hash(content.as_bytes()).as_bytes();
+    let tracked_digest = tracker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .disk_hash(path);
+    match tracked_digest {
+        None => {
+            return Err(format!(
+                "Cannot apply symbol Edit on {raw_path}: file has not been read in this session (or tracker was cleared after compaction). Call Read (with `outline: true`, `symbol`, or full file) first."
+            ));
+        }
+        Some(seen) if seen != disk_digest => {
+            return Err(format!(
+                "Cannot apply symbol Edit on {raw_path}: file changed on disk since your last Read/Edit. Re-read {raw_path} first so external changes are not clobbered."
+            ));
+        }
+        Some(_) => {}
+    }
+
+    let disk_lines = split_logical_lines(content);
+    let mut resolved = Vec::with_capacity(symbols.len());
+    let mut notes = Vec::with_capacity(symbols.len());
+
+    for &(sym, new_str) in symbols {
+        let matches = find_symbol_ranges(path, content, sym);
+        match matches.as_slice() {
+            [] => {
+                if let Some(outline) = structural_outline(path, content) {
+                    let preview: String = outline.lines().take(25).collect::<Vec<_>>().join("\n");
+                    return Err(format!(
+                        "Symbol `{sym}` not found in {raw_path}.\nAvailable symbols:\n{preview}"
+                    ));
+                }
+                return Err(format!(
+                    "Symbol `{sym}` cannot be resolved in {raw_path} (AST symbol edits support Rust, Python, TypeScript/JavaScript, and Go). Use `start_line`/`end_line` or `old_string` instead."
+                ));
+            }
+            &[(s, e)] => {
+                let adjusted = preserve_symbol_indentation(&disk_lines, s, new_str);
+                resolved.push((s, e, adjusted));
+                notes.push(format!("[symbol `{sym}` -> L{s}-L{e}]"));
+            }
+            many => {
+                let spans: Vec<String> = many.iter().map(|(s, e)| format!("L{s}-L{e}")).collect();
+                return Err(format!(
+                    "Symbol `{sym}` is ambiguous in {raw_path} (matched {} locations: {}). Qualify with `Type::method` / `Class.method` or use `start_line`/`end_line`.",
+                    many.len(),
+                    spans.join(", ")
+                ));
+            }
+        }
+    }
+
+    Ok((resolved, notes))
 }
 
 /// Formats a small numbered window of the current disk file around `target_s..=target_e` so
@@ -420,11 +559,15 @@ impl Tool for EditTool {
                 Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
                 Some(Value::Null) | None => None,
                 Some(Value::Array(arr)) if arr.is_empty() => {
-                    // Strict-schema models often emit `"edits": []` alongside top-level `old_string` / `start_line`.
+                    // Strict-schema models often emit `"edits": []` alongside top-level `old_string` / `start_line` / `symbol`.
                     let has_top_level = input
                         .get("old_string")
                         .and_then(Value::as_str)
                         .is_some_and(|s| !s.is_empty())
+                        || input
+                            .get("symbol")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.trim().is_empty())
                         || input
                             .get("start_line")
                             .and_then(Value::as_u64)
@@ -495,44 +638,82 @@ impl Tool for EditTool {
                 let has_line_range = hunks
                     .iter()
                     .any(|h| matches!(h, EditHunk::LineRange { .. }));
+                let has_symbol = hunks.iter().any(|h| matches!(h, EditHunk::Symbol { .. }));
                 let has_text = hunks.iter().any(|h| matches!(h, EditHunk::Text { .. }));
-                if has_line_range && has_text {
+                if (has_line_range || has_symbol) && has_text {
                     return Ok(ToolOutput::err_text(
-                        "Edit cannot mix `start_line`/`end_line` hunks with `old_string` hunks in the same `edits` array (line numbers would shift). Use either all line-range hunks or all `old_string` hunks.",
+                        "Edit cannot mix `symbol` or `start_line`/`end_line` hunks with `old_string` hunks in the same `edits` array (line numbers would shift). Use either all structural/line-range hunks or all `old_string` hunks.",
                     )
                     .with_details(json!({
                         "file_path": raw_path,
                         "edit_failed": true,
                     })));
                 }
-                if has_line_range {
-                    let ranges: Vec<(usize, usize, &str)> = hunks
-                        .iter()
-                        .map(|h| match h {
-                            EditHunk::LineRange {
-                                start_line,
-                                end_line,
-                                new_string,
-                            } => (*start_line, *end_line, new_string.as_str()),
-                            EditHunk::Text { .. } => unreachable!(),
-                        })
-                        .collect();
-                    let (anchored_ranges, reloc_notes) = match resolve_anchored_line_ranges(
-                        &current, &ranges, &path, &raw_path, &tracker,
-                    ) {
-                        Ok(ok) => ok,
-                        Err(diag_err) => {
-                            return Ok(ToolOutput::err_text(diag_err).with_details(json!({
-                                "file_path": raw_path,
-                                "edit_failed": true,
-                            })));
+                if has_line_range || has_symbol {
+                    let mut owned_ranges: Vec<(usize, usize, String)> = Vec::new();
+
+                    if has_line_range {
+                        let ranges: Vec<(usize, usize, &str)> = hunks
+                            .iter()
+                            .filter_map(|h| match h {
+                                EditHunk::LineRange {
+                                    start_line,
+                                    end_line,
+                                    new_string,
+                                } => Some((*start_line, *end_line, new_string.as_str())),
+                                EditHunk::Symbol { .. } | EditHunk::Text { .. } => None,
+                            })
+                            .collect();
+                        let (anchored_ranges, reloc_notes) = match resolve_anchored_line_ranges(
+                            &current, &ranges, &path, &raw_path, &tracker,
+                        ) {
+                            Ok(ok) => ok,
+                            Err(diag_err) => {
+                                return Ok(ToolOutput::err_text(diag_err).with_details(json!({
+                                    "file_path": raw_path,
+                                    "edit_failed": true,
+                                })));
+                            }
+                        };
+                        fuzzy_notes.extend(reloc_notes);
+                        for (s, e, ns) in anchored_ranges {
+                            owned_ranges.push((s, e, ns.to_string()));
                         }
-                    };
-                    fuzzy_notes.extend(reloc_notes);
-                    match apply_line_range_hunks(&current, &anchored_ranges, &raw_path) {
+                    }
+
+                    if has_symbol {
+                        let symbols: Vec<(&str, &str)> = hunks
+                            .iter()
+                            .filter_map(|h| match h {
+                                EditHunk::Symbol { symbol, new_string } => {
+                                    Some((symbol.as_str(), new_string.as_str()))
+                                }
+                                EditHunk::LineRange { .. } | EditHunk::Text { .. } => None,
+                            })
+                            .collect();
+                        let (sym_ranges, sym_notes) = match resolve_symbol_hunks(
+                            &current, &symbols, &path, &raw_path, &tracker,
+                        ) {
+                            Ok(ok) => ok,
+                            Err(diag_err) => {
+                                return Ok(ToolOutput::err_text(diag_err).with_details(json!({
+                                    "file_path": raw_path,
+                                    "edit_failed": true,
+                                })));
+                            }
+                        };
+                        fuzzy_notes.extend(sym_notes);
+                        owned_ranges.extend(sym_ranges);
+                    }
+
+                    let borrowed_ranges: Vec<(usize, usize, &str)> = owned_ranges
+                        .iter()
+                        .map(|(s, e, ns)| (*s, *e, ns.as_str()))
+                        .collect();
+                    match apply_line_range_hunks(&current, &borrowed_ranges, &raw_path) {
                         Ok(next) => {
                             current = next;
-                            total_replacements = anchored_ranges.len();
+                            total_replacements = borrowed_ranges.len();
                         }
                         Err(diag_err) => {
                             return Ok(ToolOutput::err_text(diag_err).with_details(json!({
@@ -544,7 +725,7 @@ impl Tool for EditTool {
                 } else {
                     for (h_idx, hunk) in hunks.iter().enumerate() {
                         match hunk {
-                            EditHunk::LineRange { .. } => unreachable!(),
+                            EditHunk::LineRange { .. } | EditHunk::Symbol { .. } => unreachable!(),
                             EditHunk::Text {
                                 old_string,
                                 new_string,

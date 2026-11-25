@@ -3452,7 +3452,7 @@ async fn e2e_adversarial_strict_schema_empty_defaults_on_all_core_tools() {
             (
                 "e1",
                 "Edit",
-                json!({"file_path": "app.rs", "edits": [], "old_string": "1", "new_string": "42", "start_line": 0, "end_line": 0, "replace_all": false}),
+                json!({"file_path": "app.rs", "edits": [], "symbol": "", "old_string": "1", "new_string": "42", "start_line": 0, "end_line": 0, "replace_all": false}),
             ),
             (
                 "b1",
@@ -4043,6 +4043,76 @@ async fn e2e_bash_streams_live_tool_update_events_and_pty_roundtrip() {
     assert!(
         msgs_json(&reqs[2].messages).contains("REAL_TTY_OK"),
         "expected PTY stdout in tool result"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn e2e_ast_symbol_edit_after_outline_and_batch_refactor() {
+    let dir = std::env::temp_dir().join(format!("carnot-e2e-sym-edit-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(dir.join("src")).expect("mkdir");
+    let lib = dir.join("src/math.rs");
+    fs::write(
+        &lib,
+        "pub struct Math;\n\nimpl Math {\n    pub fn double(x: i32) -> i32 {\n        x + x\n    }\n\n    pub fn triple(x: i32) -> i32 {\n        x + x + x\n    }\n}\n",
+    )
+    .expect("write");
+
+    let faux = Arc::new(FauxProvider::new(vec![
+        // Turn 1: Read structural outline ONLY (tiny token footprint, no full file read!).
+        ScriptedTurn::tool_calls(vec![(
+            "c1",
+            "Read",
+            json!({"file_path": "src/math.rs", "outline": true}),
+        )]),
+        // Turn 2: Refactor Math::double and Math::triple atomically by AST symbol name!
+        ScriptedTurn::tool_calls(vec![(
+            "c2",
+            "Edit",
+            json!({
+                "file_path": "src/math.rs",
+                "edits": [
+                    {
+                        "symbol": "Math::double",
+                        "new_string": "pub fn double(x: i32) -> i32 {\n    x.saturating_mul(2)\n}"
+                    },
+                    {
+                        "symbol": "Math::triple",
+                        "new_string": "pub fn triple(x: i32) -> i32 {\n    x.saturating_mul(3)\n}"
+                    }
+                ]
+            }),
+        )]),
+        ScriptedTurn::text("Refactored Math::double and Math::triple via AST symbol edits."),
+    ]));
+
+    let agent = CarnotBuilder::new(dir.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
+        .sandbox(false)
+        .persist_session(false)
+        .build()
+        .expect("build");
+
+    let outcome = agent
+        .prompt("Make Math::double and Math::triple overflow-safe")
+        .await
+        .expect("prompt");
+    assert_eq!(
+        outcome.final_text,
+        "Refactored Math::double and Math::triple via AST symbol edits."
+    );
+    assert_eq!(outcome.metrics.turns, 3);
+    assert_eq!(outcome.metrics.cache_breaks, 0);
+
+    let after = fs::read_to_string(&lib).expect("read math.rs");
+    assert!(
+        after.contains("    pub fn double(x: i32) -> i32 {\n        x.saturating_mul(2)\n    }"),
+        "got:\n{after}"
+    );
+    assert!(
+        after.contains("    pub fn triple(x: i32) -> i32 {\n        x.saturating_mul(3)\n    }"),
+        "got:\n{after}"
     );
 
     let _ = fs::remove_dir_all(&dir);
