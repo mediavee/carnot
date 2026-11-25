@@ -512,10 +512,9 @@ pub(crate) async fn run_repl(
                         match ProviderRegistry::load_default(&provider_configs) {
                             Ok(reg) => {
                                 let (prov_id, model_id) =
-                                    crate::resolve_model_spec_in_registry(&reg, rest, None)
-                                        .unwrap_or_else(|| {
-                                            (default_provider.clone(), rest.trim().to_string())
-                                        });
+                                    reg.resolve_model_spec(rest, None).unwrap_or_else(|| {
+                                        (default_provider.clone(), rest.trim().to_string())
+                                    });
                                 match reg.build_provider(&prov_id, Some(&model_id)) {
                                     Ok(provider) => {
                                         let cw = reg.context_window_for_model(&model_id);

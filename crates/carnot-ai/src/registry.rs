@@ -201,6 +201,81 @@ impl ProviderRegistry {
         items.into_iter().map(|(_, m)| m).collect()
     }
 
+    /// Resolves a user-supplied model reference (bare model ID, `provider/model`, or family alias
+    /// like `sonnet` / `anthropic/opus`) against the layered catalog, preferring configured
+    /// providers over unconfigured ones.
+    pub fn resolve_model_spec(
+        &self,
+        reference: &str,
+        provider_override: Option<&str>,
+    ) -> Option<(String, String)> {
+        let trimmed = reference.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let cat = &self.catalog;
+        let (wanted_prov, raw_model) = if let Some(ov) = provider_override {
+            let canon = cat
+                .find_provider(ov)
+                .map_or_else(|| ov.to_string(), |(id, _)| id.to_string());
+            (Some(canon), trimmed)
+        } else if let Some((lhs, rhs)) = trimmed.split_once('/')
+            && let Some((canon, _)) = cat.find_provider(lhs)
+        {
+            (Some(canon.to_string()), rhs)
+        } else {
+            (None, trimmed)
+        };
+
+        let all_models = self.available_models(false);
+        // 1. Exact (provider, id) match
+        if let Some(ref wp) = wanted_prov
+            && let Some(found) = all_models
+                .iter()
+                .find(|m| m.provider == *wp && m.id == raw_model)
+        {
+            return Some((found.provider.clone(), found.id.clone()));
+        }
+        // 2. Bare exact id match (prefer configured providers over unconfigured ones)
+        if wanted_prov.is_none() {
+            if let Some(found) = all_models
+                .iter()
+                .find(|m| m.configured && m.id == raw_model)
+            {
+                return Some((found.provider.clone(), found.id.clone()));
+            }
+            if let Some(found) = all_models.iter().find(|m| m.id == raw_model) {
+                return Some((found.provider.clone(), found.id.clone()));
+            }
+        }
+        // 3. Family alias resolution (e.g. `anthropic/sonnet` or `opus` -> newest version; prefer configured)
+        let mut best: Option<(bool, Vec<u64>, String, String)> = None;
+        for m in &all_models {
+            if let Some(ref wp) = wanted_prov
+                && m.provider != *wp
+            {
+                continue;
+            }
+            if let Some(ver) = family_version_tuple(&m.id, raw_model) {
+                let better = best
+                    .as_ref()
+                    .is_none_or(|(bcfg, bv, _, _)| (m.configured, &ver) > (*bcfg, bv));
+                if better {
+                    best = Some((m.configured, ver, m.provider.clone(), m.id.clone()));
+                }
+            }
+        }
+        if let Some((_, _, prov, id)) = best {
+            return Some((prov, id));
+        }
+        // 4. Fallback: explicit provider + literal model id (for arbitrary/new models not in catalog)
+        if let Some(wp) = wanted_prov {
+            return Some((wp, raw_model.to_string()));
+        }
+        cat.provider_for_model(raw_model)
+            .map(|p| (p.to_string(), raw_model.to_string()))
+    }
+
     /// Resolves `(provider_hint, model_hint)` against the layered catalog and builds a ready-to-use
     /// `Provider` target. Supports:
     ///   - `model` only -> auto-routes provider via `catalog.provider_for_model(model)` (fallback: `fallback_provider`)
@@ -316,4 +391,24 @@ impl ProviderRegistry {
             })?;
         adapter.build(spec)
     }
+}
+
+fn family_version_tuple(model_id: &str, family: &str) -> Option<Vec<u64>> {
+    let parts: Vec<&str> = model_id.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let maker = parts[0];
+    let name = parts[1];
+    if name != family || !maker.is_ascii() || !maker.bytes().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+    let mut ver = Vec::new();
+    for p in &parts[2..] {
+        if p.len() >= 8 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        ver.push(p.parse::<u64>().ok()?);
+    }
+    (!ver.is_empty()).then_some(ver)
 }

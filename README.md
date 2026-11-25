@@ -147,11 +147,12 @@ Useful CLI utilities: `carnot providers`, `carnot models --all`, `carnot models 
 </picture>
 
 <details>
-<summary>Workspace crate map (12 core crates + 6 extensions)</summary>
+<summary>Workspace crate map (13 workspace crates + 6 extensions)</summary>
 
 | Crate | Role |
 | :--- | :--- |
-| `carnot-cli` | CLI, Ratatui TUI, plain REPL, `doctor`, `audit-prefix`, `models`, `providers`, `auth`, `mcp`, `modules` |
+| `carnot-cli` | Thin CLI binary, plain REPL, `doctor`, `audit-prefix`, `models`, `providers`, `auth`, `mcp`, `modules` (optional `tui` feature) |
+| `carnot-tui` | Optional interactive full-screen Ratatui TUI (`state`, `commands`, `input`, `render`, `markdown`, `editor`, `theme`) |
 | `carnot` | Ergonomic Rust SDK facade (`CarnotBuilder`) |
 | `carnot-protocol` | ACP stdio, Host RPC stdio, HTTP/SSE server, interaction brokers |
 | `carnot-agent` | Async turn loop, effect-parallel scheduler, lossless `EventLog`, compaction |

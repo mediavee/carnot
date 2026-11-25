@@ -40,6 +40,8 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps --all-features --lib
+      - name: TypeScript SDK typecheck
+        run: npx --yes -p typescript tsc --noEmit -p sdk/ts/tsconfig.json
 
   msrv:
     name: MSRV (Rust 1.90)
@@ -49,6 +51,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.90.0
       - uses: Swatinem/rust-cache@v2
       - name: Check workspace under declared MSRV
+        run: cargo check --workspace --all-features --locked
+
+  windows:
+    name: Windows compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace on Windows
         run: cargo check --workspace --all-features --locked
 
   test:

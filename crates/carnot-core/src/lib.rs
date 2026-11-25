@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// Unified error type across the Carnot workspace.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum CarnotError {
     #[error("provider error ({provider}): {message}")]
@@ -1019,6 +1020,7 @@ pub struct EventEnvelope {
 }
 
 /// Structured event stream emitted by `carnot-agent`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {

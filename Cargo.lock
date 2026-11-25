@@ -309,16 +309,13 @@ dependencies = [
  "carnot",
  "carnot-ext",
  "carnot-tools",
+ "carnot-tui",
  "clap",
- "crossterm",
- "ratatui",
  "serde",
  "serde_json",
- "similar",
  "tokio",
  "toml",
  "tracing-subscriber",
- "unicode-width",
 ]
 
 [[package]]
@@ -533,6 +530,20 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "uuid",
+]
+
+[[package]]
+name = "carnot-tui"
+version = "0.1.0"
+dependencies = [
+ "carnot",
+ "carnot-ext",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "similar",
+ "tokio",
+ "unicode-width",
 ]
 
 [[package]]
