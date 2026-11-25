@@ -3724,3 +3724,98 @@ async fn e2e_adversarial_resume_with_different_tools_emits_unstable_prefix_audit
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[cfg(feature = "ext-codemode")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_codemode_batches_tools_enforces_policy_guard_and_preserves_prefix_invariance() {
+    let dir1 = std::env::temp_dir().join(format!("carnot-cm-e2e-1-{}", uuid::Uuid::new_v4()));
+    let dir2 = std::env::temp_dir().join(format!("carnot-cm-e2e-2-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir1).expect("mkdir 1");
+    fs::create_dir_all(&dir2).expect("mkdir 2");
+    fs::write(dir1.join("a.txt"), "alpha=10\n").expect("write a");
+    fs::write(dir1.join("b.txt"), "beta=20\n").expect("write b");
+    fs::write(dir1.join(".env"), "TOP_SECRET=never_expose_me\n").expect("write env");
+
+    let faux1 = Arc::new(FauxProvider::new(vec![
+        ScriptedTurn::tool_calls(vec![(
+            "cm1",
+            "CodeMode",
+            json!({
+                "code": r#"
+                    const [a, b] = await Promise.all([
+                        tools.Read({ file_path: "a.txt" }),
+                        tools.Read({ file_path: "b.txt" }),
+                    ]);
+                    let blocked = false;
+                    try {
+                        await tools.Read({ file_path: ".env" });
+                    } catch (e) {
+                        blocked = String(e.message).includes("denied");
+                    }
+                    store("done", true);
+                    return { a_ok: a.includes("alpha=10"), b_ok: b.includes("beta=20"), env_blocked: blocked };
+                "#
+            }),
+        )]),
+        ScriptedTurn::text("Batched safely via CodeMode."),
+    ]));
+
+    let mut cfg1 = CarnotConfig::new(dir1.clone());
+    cfg1.modules.sandbox = false;
+    let agent1 = CarnotBuilder::new(dir1.clone())
+        .config(cfg1)
+        .provider(Arc::clone(&faux1) as Arc<dyn carnot::Provider>)
+        .persist_session(false)
+        .policy_guard(true)
+        .codemode(true)
+        .build()
+        .expect("build agent1");
+
+    let out = agent1
+        .prompt("Inspect a.txt, b.txt, and check .env policy via CodeMode")
+        .await
+        .expect("prompt");
+    assert_eq!(out.final_text, "Batched safely via CodeMode.");
+
+    let reqs = faux1.recorded_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 provider turns");
+    let turn2_json = msgs_json(&reqs[1].messages);
+    assert!(
+        turn2_json.contains("\\\"a_ok\\\":true")
+            && turn2_json.contains("\\\"b_ok\\\":true")
+            && turn2_json.contains("\\\"env_blocked\\\":true"),
+        "CodeMode should batch reads and enforce PolicyGuard on .env, got:\n{turn2_json}"
+    );
+    assert!(
+        !turn2_json.contains("never_expose_me"),
+        "secret from .env must NEVER leak through CodeMode"
+    );
+
+    // Cross-CWD prefix invariance with `codemode(true)` must hold byte-for-byte.
+    let mut cfg2 = CarnotConfig::new(dir2.clone());
+    cfg2.modules.sandbox = false;
+    let agent2 = CarnotBuilder::new(dir2.clone())
+        .config(cfg2)
+        .provider(Arc::new(FauxProvider::new(vec![ScriptedTurn::text("ok")])))
+        .persist_session(false)
+        .policy_guard(true)
+        .codemode(true)
+        .build()
+        .expect("build agent2");
+    assert_eq!(
+        agent1.prefix_hash().await,
+        agent2.prefix_hash().await,
+        "CodeMode must keep static prefix BLAKE3 hash identical across workspaces"
+    );
+
+    // Dropping Agent must be completely acyclic (no Arc leak via CodeModeModule).
+    let weak = Arc::downgrade(&agent1);
+    drop(agent1);
+    assert!(
+        weak.upgrade().is_none(),
+        "Agent must drop cleanly with zero Arc reference cycles"
+    );
+
+    let _ = fs::remove_dir_all(&dir1);
+    let _ = fs::remove_dir_all(&dir2);
+}

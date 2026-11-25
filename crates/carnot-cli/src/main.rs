@@ -249,6 +249,16 @@ struct Cli {
     #[arg(long = "memory-dir")]
     memory_dir: Option<PathBuf>,
 
+    /// Enable isolated `QuickJS` `CodeMode` tool-orchestration extension (enabled by default in standalone `carnot` profile)
+    #[cfg(feature = "ext-codemode")]
+    #[arg(long)]
+    codemode: bool,
+
+    /// Disable isolated `QuickJS` `CodeMode` extension
+    #[cfg(feature = "ext-codemode")]
+    #[arg(long = "no-codemode")]
+    no_codemode: bool,
+
     /// Enable enterprise `PolicyGuard` (command/path guardrails + secret redaction)
     #[arg(long)]
     policy_guard: bool,
@@ -904,6 +914,10 @@ fn active_extension_badges(cli: &Cli) -> Vec<String> {
     if cli.lsp_enabled() {
         out.push("lsp".to_string());
     }
+    #[cfg(feature = "ext-codemode")]
+    if cli.codemode_enabled() {
+        out.push("codemode".to_string());
+    }
     #[cfg(feature = "ext-hooks")]
     if !cli.hooks_files.is_empty() || cli.claude_hooks || cli.trust_workspace_hooks {
         out.push("hooks".to_string());
@@ -1030,6 +1044,12 @@ impl Cli {
                 self.memory_dir.clone_from(&cfg.extensions.memory_dir);
             }
         }
+        #[cfg(feature = "ext-codemode")]
+        match cfg.extensions.codemode {
+            Some(false) if !self.codemode => self.no_codemode = true,
+            Some(true) if !self.no_codemode => self.codemode = true,
+            _ => {}
+        }
         Ok(())
     }
 
@@ -1039,7 +1059,8 @@ impl Cli {
         feature = "ext-web",
         feature = "ext-lsp",
         feature = "ext-subagent",
-        feature = "ext-memory"
+        feature = "ext-memory",
+        feature = "ext-codemode"
     ))]
     fn default_batteries(&self) -> bool {
         !self.host_extension && matches!(self.effective_profile(), CliProfile::Carnot)
@@ -1063,6 +1084,11 @@ impl Cli {
     #[cfg(feature = "ext-memory")]
     fn memory_enabled(&self) -> bool {
         !self.no_memory && (self.memory || self.memory_dir.is_some() || self.default_batteries())
+    }
+
+    #[cfg(feature = "ext-codemode")]
+    fn codemode_enabled(&self) -> bool {
+        !self.no_codemode && (self.codemode || self.default_batteries())
     }
 
     /// Resolves `--provider`, or auto-selects the first configured cloud provider before falling
@@ -1540,6 +1566,10 @@ async fn build_agent_full(
             mc.root_dir.clone_from(dir);
         }
         b = b.memory_config(mc);
+    }
+    #[cfg(feature = "ext-codemode")]
+    if cli.codemode_enabled() {
+        b = b.codemode(true);
     }
     for ext in &cli.extensions {
         b = b.extension(ext.clone());

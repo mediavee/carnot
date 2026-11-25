@@ -1,0 +1,894 @@
+//! Isolated `QuickJS` async execution engine for `carnot-ext-codemode`.
+//!
+//! Runs each script inside a fresh `rquickjs::AsyncRuntime` on a dedicated worker thread with:
+//! - Hard memory limit (`set_memory_limit`) and stack limit (`set_max_stack_size`)
+//! - Cooperative interrupt handler (`set_interrupt_handler`) killing tight loops on timeout or cancel
+//! - True multi-threaded concurrency for `Promise.all` via `tokio::runtime::Handle::spawn`
+//! - Transactional session `store()`/`load()` committed only when the script succeeds
+
+use crate::{CodeModeConfig, CodeModeHost};
+use carnot_core::{ToolOutput, ToolResultBlock, ToolSpec};
+use rquickjs::{
+    AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Function, Promise, prelude::Async,
+};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+const MAX_STORE_ENTRY_BYTES: usize = 256 * 1024;
+const EXIT_SENTINEL: &str = "__CARNOT_CODEMODE_EXIT__";
+
+const PRELUDE: &str = r#"
+(() => {
+  const fmt = (v) => {
+    if (typeof v === "string") return v;
+    if (v instanceof Error) {
+      return v.stack ? `${v.name}: ${v.message}\n${v.stack}` : `${v.name}: ${v.message}`;
+    }
+    try {
+      const s = JSON.stringify(v);
+      return s === undefined ? String(v) : s;
+    } catch (_) {
+      return String(v);
+    }
+  };
+  globalThis.__carnotFmt = fmt;
+
+  const logFn = (level) => (...args) => __log(level, args.map(fmt).join(" "));
+  globalThis.console = {
+    log: logFn("log"),
+    info: logFn("info"),
+    warn: logFn("warn"),
+    error: logFn("error"),
+    debug: logFn("debug"),
+  };
+
+  globalThis.text = (v) => {
+    if (v !== undefined) __text(fmt(v));
+  };
+
+  globalThis.exit = (v) => {
+    if (v !== undefined) __text(fmt(v));
+    throw new Error("__CARNOT_CODEMODE_EXIT__");
+  };
+
+  const call = async (name, args) => {
+    const payload = args === undefined ? "{}" : JSON.stringify(args);
+    const raw = await __callTool(String(name), payload);
+    const r = JSON.parse(raw);
+    if (!r.ok) throw new Error(`${name}: ${r.error}`);
+    return r.value;
+  };
+  globalThis.callTool = call;
+  globalThis.tools = new Proxy({}, {
+    get(_, name) {
+      if (typeof name !== "string" || name === "then" || name === "toJSON") return undefined;
+      return (args) => call(name, args);
+    },
+    has(_, name) {
+      return typeof name === "string" && __hasTool(name);
+    },
+    ownKeys() {
+      return JSON.parse(__listTools()).map((t) => t.name);
+    },
+    getOwnPropertyDescriptor(_, name) {
+      return typeof name === "string" && __hasTool(name)
+        ? { enumerable: true, configurable: true }
+        : undefined;
+    },
+  });
+
+  globalThis.listTools = (filter) => {
+    const all = JSON.parse(__listTools());
+    if (!filter) return all;
+    const f = String(filter).toLowerCase();
+    return all.filter(
+      (t) => t.name.toLowerCase().includes(f) || t.description.toLowerCase().includes(f)
+    );
+  };
+
+  globalThis.searchTools = (query, limit) => {
+    const lim = typeof limit === "number" && limit > 0 ? Math.floor(limit) : 8;
+    return JSON.parse(__searchTools(String(query ?? ""), lim));
+  };
+
+  globalThis.describeTool = (name) => {
+    const raw = __describeTool(String(name));
+    return raw === "" ? undefined : JSON.parse(raw);
+  };
+
+  Object.defineProperty(globalThis, "ALL_TOOLS", {
+    get() {
+      return globalThis.listTools();
+    },
+    enumerable: true,
+  });
+
+  globalThis.store = (key, value) => {
+    const k = String(key);
+    if (value === undefined) {
+      __storeSet(k, "", true);
+      return undefined;
+    }
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+      __storeSet(k, "", true);
+      return undefined;
+    }
+    const err = __storeSet(k, serialized, false);
+    if (err !== "") throw new Error(err);
+    return value;
+  };
+
+  globalThis.load = (key) => {
+    const raw = __storeGet(String(key));
+    return raw === "" ? undefined : JSON.parse(raw);
+  };
+
+  globalThis.storedKeys = () => JSON.parse(__storeKeys());
+})();
+"#;
+
+#[derive(Debug)]
+pub(crate) struct RunOutput {
+    pub(crate) ok: bool,
+    pub(crate) return_value: Option<String>,
+    pub(crate) text_items: Vec<String>,
+    pub(crate) console_lines: Vec<String>,
+    pub(crate) logs_truncated: bool,
+    pub(crate) tool_calls: usize,
+    pub(crate) tool_names_called: Vec<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) duration_ms: u64,
+    pub(crate) next_store: Option<BTreeMap<String, Value>>,
+}
+
+/// Converts a tool name (e.g. `mcp__dev-radius__search`) into a valid JS identifier
+/// (`mcp__dev_radius__search`) so `tools.<ident>(args)` resolves cleanly.
+pub(crate) fn sanitize_js_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (idx, ch) in name.chars().enumerate() {
+        let valid = if idx == 0 {
+            ch.is_ascii_alphabetic() || ch == '_' || ch == '$'
+        } else {
+            ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+        };
+        out.push(if valid { ch } else { '_' });
+    }
+    if out.is_empty() { "_".into() } else { out }
+}
+
+/// Strips a single outer markdown code fence (```js ... ```) if a model wraps the snippet.
+pub(crate) fn strip_outer_code_fence(code: &str) -> &str {
+    let trimmed = code.trim();
+    if let Some(rest) = trimmed.strip_prefix("```")
+        && let Some(nl) = rest.find('\n')
+        && let Some(body) = rest[nl + 1..].strip_suffix("```")
+    {
+        return body.trim();
+    }
+    trimmed
+}
+
+fn is_forbidden_inner_tool(name: &str) -> bool {
+    matches!(name, "CodeMode" | "CallDeferredTool")
+}
+
+fn is_core_text_tool(name: &str) -> bool {
+    matches!(name, "Read" | "Edit" | "Write" | "Grep" | "Bash")
+}
+
+/// Converts a [`ToolOutput`] into a JS-ready JSON payload for `await tools.<name>(args)`.
+///
+/// - Failed calls become `{ ok: false, error }`.
+/// - Image results (e.g. `Read` on PNG/JPEG) become `{ ok: true, value: { type: "image", ... } }`.
+/// - Non-core tools (MCP / extensions) whose text is a JSON object or array auto-parse to JS objects/arrays.
+/// - Core text tools (`Read`, `Edit`, `Write`, `Grep`, `Bash`) always return strings.
+fn encode_tool_output_for_js(tool_name: &str, out: &ToolOutput) -> String {
+    if out.is_error {
+        return json!({ "ok": false, "error": out.text_only() }).to_string();
+    }
+    for block in &out.blocks {
+        if let ToolResultBlock::Image {
+            media_type,
+            data_base64,
+        } = block
+        {
+            return json!({
+                "ok": true,
+                "value": {
+                    "type": "image",
+                    "media_type": media_type,
+                    "data_base64": data_base64,
+                    "note": out.text_only(),
+                }
+            })
+            .to_string();
+        }
+    }
+    let text = out.text_only();
+    let trimmed = text.trim();
+    if !is_core_text_tool(tool_name)
+        && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+        && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
+    {
+        return json!({ "ok": true, "value": parsed }).to_string();
+    }
+    json!({ "ok": true, "value": text }).to_string()
+}
+
+/// Simple token-overlap relevance search over tool specs (mirrors Carnot's deferred tool search).
+fn rank_tools(specs: &[ToolSpec], query: &str, limit: usize) -> Vec<Value> {
+    let q_lower = query.to_ascii_lowercase();
+    let tokens: Vec<&str> = q_lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let mut scored: Vec<(usize, &ToolSpec)> = specs
+        .iter()
+        .filter_map(|spec| {
+            if tokens.is_empty() {
+                return Some((1, spec));
+            }
+            let name_l = spec.name.to_ascii_lowercase();
+            let desc_l = spec.description.to_ascii_lowercase();
+            let mut score = 0usize;
+            if name_l == q_lower {
+                score += 100;
+            } else if name_l.contains(&q_lower) {
+                score += 40;
+            }
+            for tok in &tokens {
+                if name_l.contains(tok) {
+                    score += 10;
+                }
+                if desc_l.contains(tok) {
+                    score += 3;
+                }
+            }
+            (score > 0).then_some((score, spec))
+        })
+        .collect();
+
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    scored
+        .into_iter()
+        .take(limit.max(1))
+        .map(|(_, s)| {
+            json!({
+                "name": s.name,
+                "js_name": sanitize_js_ident(&s.name),
+                "description": s.description,
+                "deferred": s.defer_loading,
+            })
+        })
+        .collect()
+}
+
+struct SharedState {
+    host: Arc<dyn CodeModeHost>,
+    outer: tokio::runtime::Handle,
+    parent_call_id: String,
+    child_cancel: CancellationToken,
+    cancelled_flag: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
+    specs: Vec<ToolSpec>,
+    /// Lookup map from exact name AND sanitized JS identifier -> canonical tool name.
+    name_map: HashMap<String, String>,
+    store: Mutex<BTreeMap<String, Value>>,
+    text_items: Mutex<(Vec<String>, usize, bool)>,
+    logs: Mutex<(Vec<String>, usize, bool)>,
+    return_value: Mutex<Option<String>>,
+    tool_calls: AtomicUsize,
+    tool_names_called: Mutex<Vec<String>>,
+    config: CodeModeConfig,
+}
+
+impl SharedState {
+    fn resolve_tool_name(&self, raw: &str) -> Option<String> {
+        self.name_map.get(raw).cloned()
+    }
+
+    fn push_log(&self, level: &str, msg: String) {
+        let mut g = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (lines, bytes, truncated) = &mut *g;
+        if *truncated {
+            return;
+        }
+        let formatted = if level == "log" || level == "info" {
+            msg
+        } else {
+            format!("[{level}] {msg}")
+        };
+        if bytes.saturating_add(formatted.len()) > self.config.max_log_bytes {
+            *truncated = true;
+            return;
+        }
+        *bytes += formatted.len() + 1;
+        lines.push(formatted);
+    }
+
+    fn push_text(&self, msg: String) {
+        let mut g = self
+            .text_items
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (items, bytes, truncated) = &mut *g;
+        if *truncated {
+            return;
+        }
+        // Allow up to 4x preview cap in memory so CAS spill receives full lossless data.
+        let hard_cap = self
+            .config
+            .max_output_bytes
+            .saturating_mul(64)
+            .max(1_048_576);
+        if bytes.saturating_add(msg.len()) > hard_cap {
+            *truncated = true;
+            return;
+        }
+        *bytes += msg.len() + 1;
+        items.push(msg);
+    }
+}
+
+fn format_caught_error(err: CaughtError<'_>) -> String {
+    match err {
+        CaughtError::Exception(ex) => {
+            let msg = ex.message().unwrap_or_default();
+            let stack = ex.stack().unwrap_or_default();
+            if stack.trim().is_empty() {
+                if msg.is_empty() {
+                    "JavaScript exception".to_string()
+                } else {
+                    msg
+                }
+            } else if msg.is_empty() {
+                stack
+            } else {
+                format!("{msg}\n{stack}")
+            }
+        }
+        CaughtError::Value(val) => format!("Thrown value: {val:?}"),
+        CaughtError::Error(e) => e.to_string(),
+    }
+}
+
+fn run_on_worker_thread(
+    code: &str,
+    shared: &Arc<SharedState>,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    let rt_tokio = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|e| format!("failed to build CodeMode local runtime: {e}"))?;
+
+    rt_tokio.block_on(async move {
+        let js_rt = AsyncRuntime::new()
+            .map_err(|e| format!("failed to create QuickJS runtime: {e}"))?;
+        js_rt
+            .set_memory_limit(shared.config.memory_limit_bytes)
+            .await;
+        js_rt
+            .set_max_stack_size(shared.config.max_stack_size_bytes)
+            .await;
+
+        let cancel_flag = Arc::clone(&shared.cancelled_flag);
+        let timed_out_flag = Arc::clone(&shared.timed_out);
+        js_rt
+            .set_interrupt_handler(Some(Box::new(move || {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    timed_out_flag.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                false
+            })))
+            .await;
+
+        let js_ctx = AsyncContext::full(&js_rt)
+            .await
+            .map_err(|e| format!("failed to create QuickJS context: {e}"))?;
+
+        let eval_res: std::result::Result<(), String> = js_ctx
+            .async_with(async |ctx| {
+            let globals = ctx.globals();
+
+            // __log(level, msg)
+            let s_log = Arc::clone(shared);
+            globals
+                .set(
+                    "__log",
+                    Function::new(ctx.clone(), move |level: String, msg: String| {
+                        s_log.push_log(&level, msg);
+                    })
+                    .map_err(|e| format!("bind __log: {e}"))?,
+                )
+                .map_err(|e| format!("set __log: {e}"))?;
+
+            // __text(msg)
+            let s_text = Arc::clone(shared);
+            globals
+                .set(
+                    "__text",
+                    Function::new(ctx.clone(), move |msg: String| {
+                        s_text.push_text(msg);
+                    })
+                    .map_err(|e| format!("bind __text: {e}"))?,
+                )
+                .map_err(|e| format!("set __text: {e}"))?;
+
+            // __setReturn(msg)
+            let s_ret = Arc::clone(shared);
+            globals
+                .set(
+                    "__setReturn",
+                    Function::new(ctx.clone(), move |msg: String| {
+                        *s_ret
+                            .return_value
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(msg);
+                    })
+                    .map_err(|e| format!("bind __setReturn: {e}"))?,
+                )
+                .map_err(|e| format!("set __setReturn: {e}"))?;
+
+            // __hasTool(name)
+            let s_has = Arc::clone(shared);
+            globals
+                .set(
+                    "__hasTool",
+                    Function::new(ctx.clone(), move |name: String| -> bool {
+                        s_has.resolve_tool_name(&name).is_some()
+                    })
+                    .map_err(|e| format!("bind __hasTool: {e}"))?,
+                )
+                .map_err(|e| format!("set __hasTool: {e}"))?;
+
+            // __listTools()
+            let list_json = serde_json::to_string(
+                &shared
+                    .specs
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s.name,
+                            "js_name": sanitize_js_ident(&s.name),
+                            "description": s.description,
+                            "deferred": s.defer_loading,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_string());
+            globals
+                .set(
+                    "__listTools",
+                    Function::new(ctx.clone(), move || list_json.clone())
+                        .map_err(|e| format!("bind __listTools: {e}"))?,
+                )
+                .map_err(|e| format!("set __listTools: {e}"))?;
+
+            // __searchTools(query, limit)
+            let s_search = Arc::clone(shared);
+            globals
+                .set(
+                    "__searchTools",
+                    Function::new(ctx.clone(), move |query: String, limit: usize| -> String {
+                        let ranked = rank_tools(&s_search.specs, &query, limit);
+                        serde_json::to_string(&ranked).unwrap_or_else(|_| "[]".to_string())
+                    })
+                    .map_err(|e| format!("bind __searchTools: {e}"))?,
+                )
+                .map_err(|e| format!("set __searchTools: {e}"))?;
+
+            // __describeTool(name)
+            let s_desc = Arc::clone(shared);
+            globals
+                .set(
+                    "__describeTool",
+                    Function::new(ctx.clone(), move |name: String| -> String {
+                        let Some(canon) = s_desc.resolve_tool_name(&name) else {
+                            return String::new();
+                        };
+                        let Some(spec) = s_desc.specs.iter().find(|s| s.name == canon) else {
+                            return String::new();
+                        };
+                        json!({
+                            "name": spec.name,
+                            "js_name": sanitize_js_ident(&spec.name),
+                            "description": spec.description,
+                            "input_schema": spec.input_schema,
+                            "deferred": spec.defer_loading,
+                        })
+                        .to_string()
+                    })
+                    .map_err(|e| format!("bind __describeTool: {e}"))?,
+                )
+                .map_err(|e| format!("set __describeTool: {e}"))?;
+
+            // __storeSet(key, val_json, is_delete) -> "" on ok, error string on cap violation
+            let s_sset = Arc::clone(shared);
+            globals
+                .set(
+                    "__storeSet",
+                    Function::new(
+                        ctx.clone(),
+                        move |key: String, val_json: String, is_delete: bool| -> String {
+                            let mut st = s_sset
+                                .store
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if is_delete {
+                                st.remove(&key);
+                                return String::new();
+                            }
+                            if val_json.len() > MAX_STORE_ENTRY_BYTES {
+                                return format!(
+                                    "store('{key}') value exceeds {MAX_STORE_ENTRY_BYTES} bytes limit"
+                                );
+                            }
+                            let Ok(parsed) = serde_json::from_str::<Value>(&val_json) else {
+                                return format!("store('{key}') value is not valid JSON");
+                            };
+                            let current_total: usize = st
+                                .iter()
+                                .filter(|(k, _)| k.as_str() != key.as_str())
+                                .map(|(k, v)| k.len() + v.to_string().len())
+                                .sum();
+                            if current_total + key.len() + val_json.len()
+                                > s_sset.config.max_store_bytes
+                            {
+                                return format!(
+                                    "store exceeds total session cap ({} bytes)",
+                                    s_sset.config.max_store_bytes
+                                );
+                            }
+                            st.insert(key, parsed);
+                            String::new()
+                        },
+                    )
+                    .map_err(|e| format!("bind __storeSet: {e}"))?,
+                )
+                .map_err(|e| format!("set __storeSet: {e}"))?;
+
+            // __storeGet(key) -> json string or ""
+            let s_sget = Arc::clone(shared);
+            globals
+                .set(
+                    "__storeGet",
+                    Function::new(ctx.clone(), move |key: String| -> String {
+                        s_sget
+                            .store
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&key)
+                            .map(Value::to_string)
+                            .unwrap_or_default()
+                    })
+                    .map_err(|e| format!("bind __storeGet: {e}"))?,
+                )
+                .map_err(|e| format!("set __storeGet: {e}"))?;
+
+            // __storeKeys() -> json array
+            let s_skeys = Arc::clone(shared);
+            globals
+                .set(
+                    "__storeKeys",
+                    Function::new(ctx.clone(), move || -> String {
+                        let keys: Vec<String> = s_skeys
+                            .store
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .keys()
+                            .cloned()
+                            .collect();
+                        serde_json::to_string(&keys).unwrap_or_else(|_| "[]".to_string())
+                    })
+                    .map_err(|e| format!("bind __storeKeys: {e}"))?,
+                )
+                .map_err(|e| format!("set __storeKeys: {e}"))?;
+
+            // async __callTool(name, args_json) -> json `{ ok, value | error }`
+            let s_call = Arc::clone(shared);
+            globals
+                .set(
+                    "__callTool",
+                    Function::new(
+                        ctx.clone(),
+                        Async(move |name: String, args_json: String| {
+                            let s = Arc::clone(&s_call);
+                            async move {
+                                if s.cancelled_flag.load(Ordering::Relaxed)
+                                    || s.child_cancel.is_cancelled()
+                                {
+                                    return json!({
+                                        "ok": false,
+                                        "error": "CodeMode execution cancelled or timed out"
+                                    })
+                                    .to_string();
+                                }
+                                if is_forbidden_inner_tool(&name) {
+                                    return json!({
+                                        "ok": false,
+                                        "error": format!("cannot invoke `{name}` recursively inside CodeMode")
+                                    })
+                                    .to_string();
+                                }
+                                let Some(canon) = s.resolve_tool_name(&name) else {
+                                    return json!({
+                                        "ok": false,
+                                        "error": format!("unknown tool `{name}`; call listTools() or searchTools(query) to inspect available tools")
+                                    })
+                                    .to_string();
+                                };
+                                let seq = s.tool_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                                if seq > s.config.max_tool_calls {
+                                    s.tool_calls.fetch_sub(1, Ordering::SeqCst);
+                                    return json!({
+                                        "ok": false,
+                                        "error": format!(
+                                            "CodeMode exceeded max_tool_calls limit ({})",
+                                            s.config.max_tool_calls
+                                        )
+                                    })
+                                    .to_string();
+                                }
+                                let args: Value = match serde_json::from_str(&args_json) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        return json!({
+                                            "ok": false,
+                                            "error": format!("invalid JSON arguments for `{canon}`: {e}")
+                                        })
+                                        .to_string();
+                                    }
+                                };
+                                {
+                                    let mut names = s
+                                        .tool_names_called
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    names.push(canon.clone());
+                                }
+                                let inner_call_id =
+                                    format!("{}:cm:{seq}", s.parent_call_id);
+                                let host = Arc::clone(&s.host);
+                                let cancel = s.child_cancel.clone();
+                                let target_name = canon.clone();
+                                // Dispatch on the outer multi-threaded Tokio runtime so
+                                // `Promise.all([...])` runs tool calls truly in parallel!
+                                let jh = s.outer.spawn(async move {
+                                    host.call_tool(inner_call_id, target_name, args, cancel)
+                                        .await
+                                });
+                                match jh.await {
+                                    Ok(Ok(out)) => encode_tool_output_for_js(&canon, &out),
+                                    Ok(Err(e)) => json!({
+                                        "ok": false,
+                                        "error": e.to_string()
+                                    })
+                                    .to_string(),
+                                    Err(e) => json!({
+                                        "ok": false,
+                                        "error": format!("inner tool task panicked: {e}")
+                                    })
+                                    .to_string(),
+                                }
+                            }
+                        }),
+                    )
+                    .map_err(|e| format!("bind __callTool: {e}"))?,
+                )
+                .map_err(|e| format!("set __callTool: {e}"))?;
+
+            // Install JS prelude
+            ctx.eval::<(), _>(PRELUDE.as_bytes())
+                .catch(&ctx)
+                .map_err(|e| format!("CodeMode prelude error: {}", format_caught_error(e)))?;
+
+            // Execute user async snippet
+            let body = strip_outer_code_fence(code);
+            let wrapped = format!(
+                "(async () => {{\n{body}\n}})().then(\n\
+                 (v) => {{ if (v !== undefined) __setReturn(globalThis.__carnotFmt(v)); }},\n\
+                 (e) => {{ if (e && e.message === \"{EXIT_SENTINEL}\") return; throw e; }}\n\
+                 )"
+            );
+            let promise: Promise<'_> = ctx
+                .eval(wrapped.as_bytes())
+                .catch(&ctx)
+                .map_err(format_caught_error)?;
+
+            promise
+                .into_future::<()>()
+                .await
+                .catch(&ctx)
+                .map_err(format_caught_error)?;
+
+            Ok(())
+            })
+            .await;
+
+        js_rt.idle().await;
+        eval_res
+    })
+}
+
+pub(crate) async fn execute_script(
+    code: String,
+    parent_call_id: String,
+    host: Arc<dyn CodeModeHost>,
+    initial_store: BTreeMap<String, Value>,
+    config: CodeModeConfig,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> RunOutput {
+    let started = Instant::now();
+    let deadline = started + timeout;
+
+    let specs: Vec<ToolSpec> = host
+        .list_tools()
+        .into_iter()
+        .filter(|s| !is_forbidden_inner_tool(&s.name))
+        .collect();
+
+    let mut name_map = HashMap::with_capacity(specs.len() * 2);
+    for spec in &specs {
+        name_map.insert(spec.name.clone(), spec.name.clone());
+        let sanitized = sanitize_js_ident(&spec.name);
+        name_map
+            .entry(sanitized)
+            .or_insert_with(|| spec.name.clone());
+    }
+
+    let child_cancel = cancel.child_token();
+    let cancelled_flag = Arc::new(AtomicBool::new(false));
+    let timed_out = Arc::new(AtomicBool::new(false));
+
+    let shared = Arc::new(SharedState {
+        host,
+        outer: tokio::runtime::Handle::current(),
+        parent_call_id,
+        child_cancel: child_cancel.clone(),
+        cancelled_flag: Arc::clone(&cancelled_flag),
+        timed_out: Arc::clone(&timed_out),
+        specs,
+        name_map,
+        store: Mutex::new(initial_store),
+        text_items: Mutex::new((Vec::new(), 0, false)),
+        logs: Mutex::new((Vec::new(), 0, false)),
+        return_value: Mutex::new(None),
+        tool_calls: AtomicUsize::new(0),
+        tool_names_called: Mutex::new(Vec::new()),
+        config,
+    });
+
+    // Watchdog cancels QuickJS interrupt handler + all in-flight inner tool calls on timeout or Ctrl+C.
+    let wd_done = CancellationToken::new();
+    let wd_done_clone = wd_done.clone();
+    let wd_cancel = cancel.clone();
+    let wd_child_cancel = child_cancel.clone();
+    let wd_flag = Arc::clone(&cancelled_flag);
+    let wd_timed_out = Arc::clone(&timed_out);
+    let watchdog = tokio::spawn(async move {
+        tokio::select! {
+            () = wd_done_clone.cancelled() => {}
+            () = wd_cancel.cancelled() => {
+                wd_flag.store(true, Ordering::SeqCst);
+                wd_child_cancel.cancel();
+            }
+            () = tokio::time::sleep(timeout) => {
+                wd_timed_out.store(true, Ordering::SeqCst);
+                wd_flag.store(true, Ordering::SeqCst);
+                wd_child_cancel.cancel();
+            }
+        }
+    });
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let worker_shared = Arc::clone(&shared);
+    let spawn_res = std::thread::Builder::new()
+        .name("carnot-codemode".into())
+        .spawn(move || {
+            let res = run_on_worker_thread(&code, &worker_shared, deadline);
+            let _ = tx.send(res);
+        });
+
+    let run_result = match spawn_res {
+        Ok(_handle) => rx
+            .await
+            .unwrap_or_else(|_| Err("CodeMode worker thread terminated unexpectedly".into())),
+        Err(e) => Err(format!("failed to spawn CodeMode worker thread: {e}")),
+    };
+
+    // Stop watchdog and cancel any unawaited in-flight inner tool calls.
+    wd_done.cancel();
+    child_cancel.cancel();
+    let _ = watchdog.await;
+
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (text_items, _, text_trunc) = {
+        let mut g = shared
+            .text_items
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let items = std::mem::take(&mut g.0);
+        (items, g.1, g.2)
+    };
+    let (console_lines, _, logs_trunc) = {
+        let mut g = shared
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lines = std::mem::take(&mut g.0);
+        (lines, g.1, g.2)
+    };
+    let return_value = shared
+        .return_value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let tool_calls = shared.tool_calls.load(Ordering::Relaxed);
+    let tool_names_called = {
+        let mut g = shared
+            .tool_names_called
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *g)
+    };
+
+    match run_result {
+        Ok(()) => {
+            let next_store = shared
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            RunOutput {
+                ok: true,
+                return_value,
+                text_items,
+                console_lines,
+                logs_truncated: logs_trunc || text_trunc,
+                tool_calls,
+                tool_names_called,
+                error: None,
+                duration_ms,
+                next_store: Some(next_store),
+            }
+        }
+        Err(err) => {
+            let error_msg = if timed_out.load(Ordering::Relaxed) {
+                format!("CodeMode timed out after {}ms", timeout.as_millis())
+            } else if cancel.is_cancelled() {
+                "CodeMode cancelled".to_string()
+            } else {
+                err
+            };
+            RunOutput {
+                ok: false,
+                return_value,
+                text_items,
+                console_lines,
+                logs_truncated: logs_trunc || text_trunc,
+                tool_calls,
+                tool_names_called,
+                error: Some(error_msg),
+                duration_ms,
+                next_store: None,
+            }
+        }
+    }
+}

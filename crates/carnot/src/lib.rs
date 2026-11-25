@@ -65,6 +65,8 @@ pub use carnot_ext_claude_plugins::{
     ClaudePluginsConfig, ClaudePluginsModule, LoadedClaudePlugin, PluginAsset,
     discover_installed_claude_plugin_dirs,
 };
+#[cfg(feature = "ext-codemode")]
+pub use carnot_ext_codemode::{CodeModeConfig, CodeModeHost, CodeModeModule, CodeModeTool};
 #[cfg(feature = "ext-hooks")]
 pub use carnot_ext_hooks::{
     CompiledHook, HookEvent, HooksConfig, HooksModule, parse_hooks_file, parse_hooks_value,
@@ -136,6 +138,8 @@ pub struct CarnotBuilder {
     claude_plugins_config: Option<ClaudePluginsConfig>,
     #[cfg(feature = "ext-memory")]
     memory_config: Option<MemoryConfig>,
+    #[cfg(feature = "ext-codemode")]
+    codemode_config: Option<CodeModeConfig>,
 }
 
 impl CarnotBuilder {
@@ -163,6 +167,8 @@ impl CarnotBuilder {
             claude_plugins_config: None,
             #[cfg(feature = "ext-memory")]
             memory_config: None,
+            #[cfg(feature = "ext-codemode")]
+            codemode_config: None,
         }
     }
 
@@ -341,6 +347,20 @@ impl CarnotBuilder {
     #[cfg(feature = "ext-memory")]
     pub fn memory_config(mut self, cfg: MemoryConfig) -> Self {
         self.memory_config = Some(cfg);
+        self
+    }
+
+    /// Enables or disables the isolated `QuickJS` `CodeMode` orchestration extension with default limits.
+    #[cfg(feature = "ext-codemode")]
+    pub fn codemode(mut self, enabled: bool) -> Self {
+        self.codemode_config = enabled.then(CodeModeConfig::default);
+        self
+    }
+
+    /// Configures the isolated `QuickJS` `CodeMode` orchestration extension (`CodeModeModule`).
+    #[cfg(feature = "ext-codemode")]
+    pub fn codemode_config(mut self, cfg: CodeModeConfig) -> Self {
+        self.codemode_config = Some(cfg);
         self
     }
 
@@ -652,6 +672,18 @@ impl CarnotBuilder {
         } else {
             None
         };
+        #[cfg(feature = "ext-codemode")]
+        let codemode_mod: Option<Arc<CodeModeModule>> =
+            self.codemode_config.clone().map(|cm_cfg| {
+                let cm = Arc::new(CodeModeModule::new(
+                    Arc::clone(cas),
+                    sw.cas_handles,
+                    self.config.redact_cas_secrets,
+                    cm_cfg,
+                ));
+                modules.push(Arc::clone(&cm) as Arc<dyn Module>);
+                cm
+            });
         modules.extend(self.extra_modules);
         // Always run PolicyGuard LAST so `RewriteInput` from earlier modules can never bypass it!
         if let Some(pm) = policy_mod {
@@ -682,6 +714,10 @@ impl CarnotBuilder {
         #[cfg(feature = "ext-subagent")]
         if let Some(ref sm) = subagent_mod {
             sm.attach_parent(&agent);
+        }
+        #[cfg(feature = "ext-codemode")]
+        if let Some(ref cm) = codemode_mod {
+            cm.attach_parent(&agent);
         }
         Ok(agent)
     }

@@ -704,6 +704,50 @@ impl Agent {
         (eager, deferred)
     }
 
+    /// Returns all registered tool specifications in deterministic canonical order
+    /// (including deferred MCP and extension tools).
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.tools.specs()
+    }
+
+    /// Executes one tool call through Carnot's full security pipeline (`before_tool_call` module
+    /// hooks, `PermissionBroker`, `Tool::execute_with_id`, and `after_tool_result` hooks such as
+    /// secret redaction and LSP diagnostics).
+    ///
+    /// Used by orchestration extensions such as `carnot-ext-codemode` so nested tool invocations
+    /// can never bypass policies, hooks, or interactive approval gates.
+    pub async fn invoke_tool_gated(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        raw_input: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput> {
+        let Some(tool) = self.tools.get(tool_name) else {
+            return Ok(ToolOutput::err_text(format!("Unknown tool `{tool_name}`")));
+        };
+        let (effective_input, denied) = self.gate_tool_call(call_id, tool_name, &raw_input).await;
+        if let Some(reason) = denied {
+            return Ok(ToolOutput::err_text(format!(
+                "Tool `{tool_name}` denied: {reason}"
+            )));
+        }
+        let mut out = match tool
+            .execute_with_id(call_id, effective_input.clone(), cancel)
+            .await
+        {
+            Ok(out) => out,
+            Err(CarnotError::Cancelled) => return Err(CarnotError::Cancelled),
+            Err(e) => ToolOutput::err_text(format!("Tool `{tool_name}` error: {e}")),
+        };
+        for m in &self.modules {
+            let _ = m
+                .after_tool_result(tool_name, &effective_input, &mut out)
+                .await;
+        }
+        Ok(out)
+    }
+
     /// Attaches an interactive `UserQuestionBroker` for the deferred `AskUser` tool.
     pub async fn set_question_broker(&self, broker: Arc<dyn UserQuestionBroker>) {
         *self.question_broker.lock().await = Some(broker);

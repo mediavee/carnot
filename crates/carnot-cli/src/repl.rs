@@ -117,6 +117,17 @@ pub(crate) fn summarize_tool_call(tool: &str, input: &Value) -> String {
             .get("command")
             .and_then(Value::as_str)
             .map(|s| clip_one_line(s, 72)),
+        "CodeMode" => effective_input
+            .get("code")
+            .and_then(Value::as_str)
+            .map(|s| {
+                let first = s
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with("```"))
+                    .unwrap_or("js");
+                clip_one_line(first, 64)
+            }),
         "Grep" => effective_input
             .get("pattern")
             .and_then(Value::as_str)

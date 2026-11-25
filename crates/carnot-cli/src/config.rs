@@ -15,6 +15,7 @@ pub(crate) struct ExtensionsConfig {
     pub(crate) lsp: Option<bool>,
     pub(crate) subagent: Option<bool>,
     pub(crate) memory: Option<bool>,
+    pub(crate) codemode: Option<bool>,
     pub(crate) mcp: Option<bool>,
     pub(crate) memory_dir: Option<PathBuf>,
 }

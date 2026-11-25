@@ -26,6 +26,7 @@ ext-subagent = ["carnot/ext-subagent"]
 ext-hooks = ["carnot/ext-hooks"]
 ext-claude-plugins = ["carnot/ext-claude-plugins"]
 ext-memory = ["carnot/ext-memory"]
+ext-codemode = ["carnot/ext-codemode"]
 all-ext = [
     "ext-web",
     "ext-lsp",
@@ -33,6 +34,7 @@ all-ext = [
     "ext-hooks",
     "ext-claude-plugins",
     "ext-memory",
+    "ext-codemode",
 ]
 
 [dependencies]

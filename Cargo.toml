@@ -20,6 +20,7 @@ members = [
     "extensions/carnot-ext-hooks",
     "extensions/carnot-ext-claude-plugins",
     "extensions/carnot-ext-memory",
+    "extensions/carnot-ext-codemode",
 ]
 
 [workspace.package]
@@ -116,6 +117,7 @@ carnot-ext-subagent = { version = "0.1.0", path = "extensions/carnot-ext-subagen
 carnot-ext-hooks = { version = "0.1.0", path = "extensions/carnot-ext-hooks" }
 carnot-ext-claude-plugins = { version = "0.1.0", path = "extensions/carnot-ext-claude-plugins" }
 carnot-ext-memory = { version = "0.1.0", path = "extensions/carnot-ext-memory" }
+carnot-ext-codemode = { version = "0.1.0", path = "extensions/carnot-ext-codemode" }
 
 [profile.release]
 opt-level = 3
