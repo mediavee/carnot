@@ -268,7 +268,7 @@ impl Tool for CodeModeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "CodeMode".into(),
-            description: "Execute an async JavaScript snippet in an isolated QuickJS sandbox with access to all session tools via `await tools.<name>(args)` (supports `Promise.all`, `return`, `text()`, `console.log`, `exit()`, `store`/`load`, `searchTools(q)`, `describeTool(name)`). Use to batch parallel tool/MCP calls or filter/aggregate large payloads in one turn instead of pulling raw data into context. For single Read/Edit/Grep/Bash calls, call those tools directly. MCP/extension JSON outputs auto-parse; core text tools return strings; failed calls reject.".into(),
+            description: "Run an async JS script in QuickJS with all session tools on `tools.<ExactToolName>(args)` (`Promise.all`, `return`, `text()`, `console.log`, `exit()`, `store`/`load`, `searchTools(q)`, `describeTool(name)`). Prefer CodeMode whenever you need 4+ parallel/chained tool or MCP calls (e.g. Grep->Read->Edit across many files, or filtering/aggregating large payloads in JS before returning a compact result to context). Example: `const xs = await Promise.all(files.map(f => tools.Read({file_path: f}))); return ...;`. For 1-3 simple Read/Edit/Grep/Bash calls, call those tools directly. MCP/extension JSON auto-parses; core text tools return strings; errors reject.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
