@@ -271,6 +271,125 @@ const PRELUDE: &str = r#"
     const raw = await call("Read", { file_path: String(filePath) });
     return JSON.parse(globalThis.stripLineNumbers(raw));
   };
+
+  // Psychoscript-inspired standard Web pure-data built-ins (zero I/O):
+  // atob/btoa, structuredClone, crypto.randomUUID, TextEncoder/TextDecoder, URL/URLSearchParams.
+  globalThis.btoa = (s) => __base64Encode(String(s ?? ""));
+  globalThis.atob = (s) => globalThis.base64Decode(s);
+  globalThis.structuredClone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+  globalThis.crypto = Object.freeze({
+    randomUUID: () => __randomUUID(),
+  });
+
+  globalThis.TextEncoder = class TextEncoder {
+    encode(input = "") {
+      const s = String(input);
+      const out = [];
+      for (let i = 0; i < s.length; i++) {
+        let c = s.charCodeAt(i);
+        if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+          const lo = s.charCodeAt(++i);
+          c = ((c - 0xd800) << 10) + (lo - 0xdc00) + 0x10000;
+        }
+        if (c < 0x80) out.push(c);
+        else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+        else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+        else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+      }
+      return new Uint8Array(out);
+    }
+  };
+
+  globalThis.TextDecoder = class TextDecoder {
+    decode(bytes) {
+      if (!bytes) return "";
+      const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      let out = "";
+      let i = 0;
+      while (i < arr.length) {
+        const b0 = arr[i++];
+        if (b0 < 0x80) out += String.fromCharCode(b0);
+        else if ((b0 & 0xe0) === 0xc0 && i < arr.length) {
+          const b1 = arr[i++];
+          out += String.fromCharCode(((b0 & 0x1f) << 6) | (b1 & 0x3f));
+        } else if ((b0 & 0xf0) === 0xe0 && i + 1 < arr.length) {
+          const b1 = arr[i++], b2 = arr[i++];
+          out += String.fromCharCode(((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f));
+        } else if ((b0 & 0xf8) === 0xf0 && i + 2 < arr.length) {
+          const b1 = arr[i++], b2 = arr[i++], b3 = arr[i++];
+          const cp = (((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f)) - 0x10000;
+          out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+        } else {
+          out += "\ufffd";
+        }
+      }
+      return out;
+    }
+  };
+
+  globalThis.URLSearchParams = class URLSearchParams {
+    constructor(init) {
+      this._entries = [];
+      if (typeof init === "string") {
+        const raw = init.startsWith("?") ? init.slice(1) : init;
+        if (raw) {
+          for (const part of raw.split("&")) {
+            if (!part) continue;
+            const eq = part.indexOf("=");
+            const k = decodeURIComponent((eq >= 0 ? part.slice(0, eq) : part).replace(/\+/g, " "));
+            const v = eq >= 0 ? decodeURIComponent(part.slice(eq + 1).replace(/\+/g, " ")) : "";
+            this._entries.push([k, v]);
+          }
+        }
+      } else if (Array.isArray(init)) {
+        for (const [k, v] of init) this._entries.push([String(k), String(v)]);
+      } else if (init && typeof init === "object") {
+        for (const [k, v] of Object.entries(init)) this._entries.push([k, String(v)]);
+      }
+    }
+    get(k) { const hit = this._entries.find(([key]) => key === String(k)); return hit ? hit[1] : null; }
+    getAll(k) { return this._entries.filter(([key]) => key === String(k)).map(([, v]) => v); }
+    has(k) { return this._entries.some(([key]) => key === String(k)); }
+    append(k, v) { this._entries.push([String(k), String(v)]); }
+    set(k, v) {
+      const ks = String(k), vs = String(v);
+      let set = false;
+      this._entries = this._entries.filter(([key]) => key !== ks || (!set && (set = true)));
+      if (set) { const idx = this._entries.findIndex(([key]) => key === ks); this._entries[idx][1] = vs; }
+      else this._entries.push([ks, vs]);
+    }
+    delete(k) { const ks = String(k); this._entries = this._entries.filter(([key]) => key !== ks); }
+    entries() { return this._entries[Symbol.iterator](); }
+    keys() { return this._entries.map(([k]) => k)[Symbol.iterator](); }
+    values() { return this._entries.map(([, v]) => v)[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+    toString() {
+      return this._entries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+    }
+  };
+
+  globalThis.URL = class URL {
+    constructor(input, base) {
+      const raw = base ? String(base).replace(/\/+$/, "") + "/" + String(input).replace(/^\/+/, "") : String(input);
+      const m = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
+      if (!m) throw new TypeError(`Invalid URL: ${raw}`);
+      this.protocol = m[1].toLowerCase();
+      this.host = m[2];
+      const colon = this.host.lastIndexOf(":");
+      this.hostname = colon >= 0 ? this.host.slice(0, colon) : this.host;
+      this.port = colon >= 0 ? this.host.slice(colon + 1) : "";
+      this.origin = `${this.protocol}//${this.host}`;
+      this.pathname = m[3] || "/";
+      this.search = m[4] || "";
+      this.hash = m[5] || "";
+      this.searchParams = new globalThis.URLSearchParams(this.search);
+    }
+    get href() {
+      const q = this.searchParams.toString();
+      return `${this.origin}${this.pathname}${q ? "?" + q : ""}${this.hash}`;
+    }
+    toString() { return this.href; }
+  };
 })();
 "#;
 
@@ -437,6 +556,36 @@ struct SharedState {
 impl SharedState {
     fn resolve_tool_name(&self, raw: &str) -> Option<String> {
         self.name_map.get(raw).cloned()
+    }
+
+    /// Returns up to `max` fuzzy-matched tool names (case-insensitive exact/prefix/substring +
+    /// bounded Levenshtein distance) so mistyped `tools.<name>` calls get immediate suggestions.
+    fn suggest_tool_names(&self, raw: &str, max: usize) -> Vec<String> {
+        let q = raw.to_ascii_lowercase();
+        let mut scored: Vec<(usize, String)> = self
+            .specs
+            .iter()
+            .filter(|s| !is_forbidden_inner_tool(&s.name))
+            .filter_map(|s| {
+                let js_name = sanitize_js_ident(&s.name);
+                let low = js_name.to_ascii_lowercase();
+                let score = if low == q {
+                    0
+                } else if low.starts_with(&q) || q.starts_with(&low) {
+                    1
+                } else if low.contains(&q) || q.contains(&low) {
+                    2
+                } else {
+                    let d = edit_distance(&q, &low);
+                    let threshold = (q.len().max(low.len()) / 2).clamp(2, 5);
+                    if d <= threshold { 2 + d } else { return None }
+                };
+                Some((score, js_name))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        scored.truncate(max);
+        scored.into_iter().map(|(_, n)| n).collect()
     }
 
     fn push_log(&self, level: &str, msg: String) {
@@ -811,6 +960,16 @@ fn run_on_worker_thread(
                 )
                 .map_err(|e| format!("set __blake3: {e}"))?;
 
+            globals
+                .set(
+                    "__randomUUID",
+                    Function::new(ctx.clone(), || -> String {
+                        uuid::Uuid::new_v4().to_string()
+                    })
+                    .map_err(|e| format!("bind __randomUUID: {e}"))?,
+                )
+                .map_err(|e| format!("set __randomUUID: {e}"))?;
+
             // async __callTool(name, args_json) -> json `{ ok, value | error }`
             let s_call = Arc::clone(shared);
             globals
@@ -838,9 +997,19 @@ fn run_on_worker_thread(
                                     .to_string();
                                 }
                                 let Some(canon) = s.resolve_tool_name(&name) else {
+                                    let suggestions = s.suggest_tool_names(&name, 4);
+                                    let hint = if suggestions.is_empty() {
+                                        "call listTools() or searchTools(query) to inspect available tools".to_string()
+                                    } else {
+                                        format!(
+                                            "did you mean: {}? (or call listTools() / searchTools(query))",
+                                            suggestions.join(", ")
+                                        )
+                                    };
                                     return json!({
                                         "ok": false,
-                                        "error": format!("unknown tool `{name}`; call listTools() or searchTools(query) to inspect available tools")
+                                        "error": format!("unknown tool `{name}`; {hint}"),
+                                        "suggestions": suggestions,
                                     })
                                     .to_string();
                                 };
@@ -1137,4 +1306,29 @@ pub(crate) async fn execute_script(
             }
         }
     }
+}
+
+/// Classic two-row Wagner-Fischer Levenshtein distance for fuzzy tool name suggestions.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    if a_chars.is_empty() {
+        return b_chars.len();
+    }
+    if b_chars.is_empty() {
+        return a_chars.len();
+    }
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut cur = vec![0usize; b_chars.len() + 1];
+    for (i, &ca) in a_chars.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1)
+                .min(cur[j] + 1)
+                .min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b_chars.len()]
 }

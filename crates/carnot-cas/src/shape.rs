@@ -58,7 +58,60 @@ pub fn clean_terminal_noise(raw: &str) -> String {
     if repeat_count > 0 {
         let _ = write!(out, "\n  [... repeated {repeat_count} more times]");
     }
-    out
+    collapse_repeated_line_cycles(&out)
+}
+
+/// Collapses contiguous repeating multi-line blocks (period `2..=6` repeated `>= 3` times,
+/// e.g. recursive Python/Node/Rust/Java stack traces) into one occurrence + summary marker.
+fn collapse_repeated_line_cycles(input: &str) -> String {
+    let lines: Vec<&str> = input.split('\n').collect();
+    if lines.len() < 8 {
+        return input.to_string();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    let mut changed = false;
+    while i < lines.len() {
+        let mut matched_cycle: Option<(usize, usize)> = None;
+        for period in 2..=6 {
+            if i + period * 3 > lines.len() {
+                continue;
+            }
+            let block = &lines[i..i + period];
+            if block.iter().all(|l| l.trim().is_empty()) {
+                continue;
+            }
+            let mut reps = 1usize;
+            while i + (reps + 1) * period <= lines.len()
+                && lines[i + reps * period..i + (reps + 1) * period] == *block
+            {
+                reps += 1;
+            }
+            if reps >= 3 {
+                matched_cycle = Some((period, reps));
+                break;
+            }
+        }
+        if let Some((period, reps)) = matched_cycle {
+            changed = true;
+            for line in &lines[i..i + period] {
+                out.push((*line).to_string());
+            }
+            out.push(format!(
+                "  [... {period}-line block repeated {} more times]",
+                reps - 1
+            ));
+            i += period * reps;
+        } else {
+            out.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+    if changed {
+        out.join("\n")
+    } else {
+        input.to_string()
+    }
 }
 
 fn clip_line(line: &str, max_bytes: usize) -> &str {
@@ -79,6 +132,8 @@ enum CommandKind {
     JestVitest,
     Tsc,
     Eslint,
+    GoTest,
+    PkgOrDocker,
     GitDiffOrLog,
     Generic,
 }
@@ -213,6 +268,15 @@ fn classify_command(command: &str) -> CommandKind {
         "jest" | "vitest" => CommandKind::JestVitest,
         "tsc" => CommandKind::Tsc,
         "eslint" => CommandKind::Eslint,
+        "go" if sub == "test" => CommandKind::GoTest,
+        "apt" | "apt-get" | "pip" | "pip3" => CommandKind::PkgOrDocker,
+        "uv" if matches!(sub, "pip" | "sync" | "add" | "venv") => CommandKind::PkgOrDocker,
+        "npm" | "pnpm" | "yarn" | "bun"
+            if matches!(sub, "install" | "i" | "ci" | "add" | "update") =>
+        {
+            CommandKind::PkgOrDocker
+        }
+        "docker" if matches!(sub, "build" | "compose") => CommandKind::PkgOrDocker,
         "git" if matches!(sub, "diff" | "log" | "show") => CommandKind::GitDiffOrLog,
         _ => CommandKind::Generic,
     }
@@ -511,6 +575,178 @@ fn compress_tsc_or_eslint(cleaned: &str, kind: CommandKind) -> Option<(String, &
     Some((out, label))
 }
 
+/// Deterministic compressor for `go test`: buffers per-test lines after `=== RUN`, discards
+/// passing tests on `--- PASS:`, and flushes full failure output on `--- FAIL:` plus panics and
+/// package summary lines.
+fn compress_go_test(cleaned: &str) -> Option<(String, &'static str)> {
+    let mut passed_count = 0usize;
+    let mut skipped_run = 0usize;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut pending_run: Vec<&str> = Vec::new();
+    let mut in_fail_block = false;
+
+    for line in cleaned.lines() {
+        let t = line.trim();
+        if t.starts_with("=== RUN") {
+            pending_run.clear();
+            pending_run.push(line);
+            skipped_run += 1;
+            in_fail_block = false;
+            continue;
+        }
+        if t.starts_with("=== PAUSE") || t.starts_with("=== CONT") {
+            skipped_run += 1;
+            continue;
+        }
+        if t.starts_with("--- PASS:") {
+            passed_count += 1;
+            pending_run.clear();
+            in_fail_block = false;
+            continue;
+        }
+        if t.starts_with("--- FAIL:") {
+            kept.append(&mut pending_run);
+            kept.push(line);
+            in_fail_block = true;
+            continue;
+        }
+        if t.starts_with("FAIL\t") || t.starts_with("panic:") {
+            kept.append(&mut pending_run);
+            in_fail_block = true;
+            kept.push(line);
+            continue;
+        }
+        if t.starts_with("ok  \t") || t.starts_with("ok\t") || t == "PASS" || t == "FAIL" {
+            pending_run.clear();
+            in_fail_block = false;
+            kept.push(line);
+            continue;
+        }
+        if !pending_run.is_empty() {
+            pending_run.push(line);
+        } else if in_fail_block || is_genuine_diagnostic_line(line) || t.starts_with('#') {
+            kept.push(line);
+        }
+    }
+    if passed_count + skipped_run < 6 {
+        return None;
+    }
+    let mut out = format!(
+        "[go test summary: {passed_count} passed tests collapsed ({skipped_run} run lines)]\n"
+    );
+    out.push_str(&kept.join("\n"));
+    Some((out, "go-test"))
+}
+
+/// Deterministic compressor for package managers (`apt-get`, `pip`, `uv`, `npm`, `pnpm`, `yarn`,
+/// `bun`) and `docker build` logs: strips download/unpack/layer chatter while preserving errors,
+/// warnings, and the final summary tail.
+fn compress_pkg_or_docker(cleaned: &str) -> Option<(String, &'static str)> {
+    let lines: Vec<&str> = cleaned.lines().collect();
+    if lines.len() < 16 {
+        return None;
+    }
+    let mut skipped = 0usize;
+    let mut kept: Vec<&str> = Vec::new();
+    let tail_start = lines.len().saturating_sub(6);
+
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        let is_chatter = t.starts_with("Get:")
+            || t.starts_with("Hit:")
+            || t.starts_with("Ign:")
+            || t.starts_with("Selecting previously unselected")
+            || t.starts_with("Preparing to unpack")
+            || t.starts_with("Unpacking ")
+            || t.starts_with("Setting up ")
+            || t.starts_with("Processing triggers for ")
+            || t.starts_with("Collecting ")
+            || t.starts_with("Downloading ")
+            || t.starts_with("Using cached ")
+            || t.starts_with("Requirement already satisfied:")
+            || t.starts_with("Resolved ")
+            || t.starts_with("Prepared ")
+            || t.starts_with("Installed ")
+            || (t.starts_with('#') && (t.contains(" DONE ") || t.contains(" CACHED")));
+
+        let is_diag = is_genuine_diagnostic_line(line)
+            || t.starts_with("E:")
+            || t.starts_with("W:")
+            || t.starts_with("ERR!")
+            || t.starts_with("npm error")
+            || t.starts_with("ERROR:");
+        if is_diag || idx >= tail_start || !is_chatter {
+            if !t.is_empty() || is_diag {
+                kept.push(line);
+            }
+        } else {
+            skipped += 1;
+        }
+    }
+    if skipped < 8 {
+        return None;
+    }
+    let out = format!(
+        "[install/build summary: {skipped} progress/unpack lines collapsed]\n{}",
+        kept.join("\n")
+    );
+    Some((out, "pkg-build"))
+}
+
+/// Deterministic compressor for large `git diff` / `git show` outputs (>4 KiB): emits a complete
+/// per-file `+add/-del` inventory so the model sees every touched file at a glance alongside the
+/// lossless CAS handle.
+fn compress_git_diff_or_log(cleaned: &str) -> Option<(String, &'static str)> {
+    if cleaned.len() < 4_096 {
+        return None;
+    }
+    let mut files: Vec<(String, usize, usize)> = Vec::new();
+    let mut cur_file: Option<String> = None;
+    let mut adds = 0usize;
+    let mut dels = 0usize;
+
+    for line in cleaned.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(f) = cur_file.take() {
+                files.push((f, adds, dels));
+            }
+            let path = rest
+                .split_whitespace()
+                .nth(1)
+                .map_or(rest, |s| s.strip_prefix("b/").unwrap_or(s))
+                .to_string();
+            cur_file = Some(path);
+            adds = 0;
+            dels = 0;
+        } else if cur_file.is_some() {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                adds += 1;
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                dels += 1;
+            }
+        }
+    }
+    if let Some(f) = cur_file.take() {
+        files.push((f, adds, dels));
+    }
+    if files.len() < 2 {
+        return None;
+    }
+    let total_adds: usize = files.iter().map(|(_, a, _)| *a).sum();
+    let total_dels: usize = files.iter().map(|(_, _, d)| *d).sum();
+    let mut out = format!(
+        "[git diff summary: {} files (+{total_adds}/-{total_dels})]\n",
+        files.len()
+    );
+    for (f, a, d) in files.iter().take(60) {
+        let _ = writeln!(out, "  {f} (+{a}/-{d})");
+    }
+    if files.len() > 60 {
+        let _ = writeln!(out, "  [... {} more files ...]", files.len() - 60);
+    }
+    Some((out, "git-diff"))
+}
+
 /// Shapes a text output using generic head/diagnostics/tail spilling (no command context).
 pub fn shape_text_output(
     raw: &str,
@@ -604,7 +840,10 @@ pub fn shape_command_output_with_redaction(
             CommandKind::JestVitest => compress_jest_vitest(&cleaned),
             CommandKind::Tsc => compress_tsc_or_eslint(&cleaned, CommandKind::Tsc),
             CommandKind::Eslint => compress_tsc_or_eslint(&cleaned, CommandKind::Eslint),
-            CommandKind::GitDiffOrLog | CommandKind::Generic => None,
+            CommandKind::GoTest => compress_go_test(&cleaned),
+            CommandKind::PkgOrDocker => compress_pkg_or_docker(&cleaned),
+            CommandKind::GitDiffOrLog => compress_git_diff_or_log(&cleaned),
+            CommandKind::Generic => None,
         };
         if let Some((mut comp_text, comp_name)) = compressed_opt
             && comp_text.len() * 100 <= cleaned.len() * 80
@@ -817,6 +1056,70 @@ mod tests {
         // Exact CAS integrity
         let h = s1.spilled.expect("cas handle");
         assert_eq!(store.get_verified(&h.hash).expect("read"), log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collapses_recursive_stack_trace_cycles_preserving_head_and_tail() {
+        let mut trace = String::from("Traceback (most recent call last):\n  File \"main.py\", line 1, in <module>\n");
+        for _ in 0..40 {
+            trace.push_str("  File \"rec.py\", line 12, in recurse\n    return recurse(n + 1)\n");
+        }
+        trace.push_str("RecursionError: maximum recursion depth exceeded\n");
+        let cleaned = clean_terminal_noise(&trace);
+        assert!(
+            cleaned.contains("2-line block repeated 39 more times"),
+            "got:\n{cleaned}"
+        );
+        assert!(cleaned.contains("RecursionError"), "must keep final error");
+        assert!(cleaned.len() < trace.len() / 5, "expected >80% reduction");
+    }
+
+    #[test]
+    fn go_test_pkg_and_git_diff_compressors_preserve_signal_and_shrink_noise() {
+        let dir = std::env::temp_dir().join(format!("carnot-shape-ext-{}", uuid::Uuid::new_v4()));
+        let store = CasStore::open(&dir).expect("cas");
+
+        // 1. go test
+        let mut go_log = String::new();
+        for i in 0..40 {
+            let _ = writeln!(go_log, "=== RUN   TestPass{i}\n--- PASS: TestPass{i} (0.00s)");
+        }
+        go_log.push_str("=== RUN   TestBroken\n    auth_test.go:42: expected 200 got 401\n--- FAIL: TestBroken (0.01s)\nFAIL\texample.com/pkg\t0.12s\n");
+        let s_go = shape_command_output(Some("go test -v ./..."), &go_log, Some(&store), 4096, 1400)
+            .expect("go");
+        assert_eq!(s_go.compressor, Some("go-test"), "go-test compressor");
+        assert!(s_go.text.contains("auth_test.go:42"), "keeps fail detail");
+        assert!(!s_go.text.contains("TestPass12"), "drops passing spam");
+
+        // 2. apt-get / pip install chatter
+        let mut pkg_log = String::new();
+        for i in 0..35 {
+            let _ = writeln!(pkg_log, "Get:{i} http://deb.debian.org/debian bookworm/main pkg-{i} [123 kB]");
+            let _ = writeln!(pkg_log, "Unpacking pkg-{i} (1.0.{i}) ...");
+        }
+        pkg_log.push_str("E: Failed to fetch http://deb.debian.org/missing.deb 404 Not Found\n");
+        let s_pkg =
+            shape_command_output(Some("apt-get install -y foo"), &pkg_log, Some(&store), 4096, 1400)
+                .expect("pkg");
+        assert_eq!(s_pkg.compressor, Some("pkg-build"), "pkg-build compressor");
+        assert!(s_pkg.text.contains("E: Failed to fetch"), "keeps apt error");
+        assert!(s_pkg.shaped_bytes < s_pkg.raw_bytes / 3, "big reduction");
+
+        // 3. Large git diff
+        let mut diff = String::new();
+        for f in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            let _ = writeln!(diff, "diff --git a/{f} b/{f}\n--- a/{f}\n+++ b/{f}");
+            for i in 0..60 {
+                let _ = writeln!(diff, "+let line_{i} = \"some added code payload padding\";");
+            }
+        }
+        let s_diff =
+            shape_command_output(Some("git diff"), &diff, Some(&store), 4096, 1400).expect("diff");
+        assert_eq!(s_diff.compressor, Some("git-diff"), "git-diff compressor");
+        assert!(s_diff.text.contains("src/a.rs (+60/-0)"), "per-file stats");
+        assert!(s_diff.text.contains("src/c.rs (+60/-0)"), "per-file stats");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

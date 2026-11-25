@@ -68,8 +68,10 @@ mod imp {
     }
 
     /// Tier-0 silent syntax delta: returns `Some(warning)` ONLY when `after` introduces MORE
-    /// syntax error nodes than `before`. Returns `None` (0 bytes!) on clean edits.
-    pub fn syntax_regression_warning(
+    /// syntax error nodes than `before`. Includes up to 2 compact offending source lines so the
+    /// agent can repair immediately without an extra `Read` round-trip. Returns `None` (0 bytes!)
+    /// on clean edits.
+    pub(super) fn tree_sitter_regression_warning(
         path: &Path,
         before: Option<&str>,
         after: &str,
@@ -80,8 +82,25 @@ mod imp {
             .map_or(0, |v| v.len());
         if after_errs.len() > before_count {
             let sample: Vec<String> = after_errs.iter().take(6).map(usize::to_string).collect();
+            let lines: Vec<&str> = after.lines().collect();
+            let mut snippets = String::new();
+            for &ln in after_errs.iter().take(2) {
+                if let Some(src_line) = lines.get(ln.saturating_sub(1)) {
+                    let trimmed = src_line.trim();
+                    let clipped: String = if trimmed.chars().count() > 110 {
+                        let s: String = trimmed.chars().take(110).collect();
+                        format!("{s}…")
+                    } else {
+                        trimmed.to_string()
+                    };
+                    if !clipped.is_empty() {
+                        use std::fmt::Write as _;
+                        let _ = write!(snippets, "\n  L{ln}: {clipped}");
+                    }
+                }
+            }
             Some(format!(
-                "[syntax-warning] {} now has {} parse error(s) (was {}) near line(s): {}",
+                "[syntax-warning] {} now has {} parse error(s) (was {}) near line(s): {}{snippets}",
                 path.display(),
                 after_errs.len(),
                 before_count,
@@ -287,22 +306,78 @@ mod imp {
 }
 
 #[cfg(feature = "syntax")]
-pub use imp::{
-    SourceLang, find_symbol_ranges, parse_error_lines, structural_outline,
-    syntax_regression_warning,
-};
+pub use imp::{SourceLang, find_symbol_ranges, parse_error_lines, structural_outline};
 
-#[cfg(not(feature = "syntax"))]
-pub fn parse_error_lines(_path: &std::path::Path, _src: &str) -> Option<Vec<usize>> {
-    None
+/// Tier-0 silent structural validation for `.json` and `.toml` config files (zero C deps).
+/// Returns `Some(warning)` only when `after` fails to parse and `before` was valid (or new file).
+fn structured_data_regression_warning(
+    path: &std::path::Path,
+    before: Option<&str>,
+    after: &str,
+) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "json" => {
+            if let Err(err) = serde_json::from_str::<serde_json::Value>(after) {
+                let was_broken = before.is_some_and(|b| {
+                    serde_json::from_str::<serde_json::Value>(b).is_err()
+                });
+                if !was_broken {
+                    let line = err.line();
+                    let snippet = after
+                        .lines()
+                        .nth(line.saturating_sub(1))
+                        .map(|l| format!("\n  L{line}: {}", l.trim()))
+                        .unwrap_or_default();
+                    return Some(format!(
+                        "[syntax-warning] {} invalid JSON at line {}, col {}: {err}{snippet}",
+                        path.display(),
+                        line,
+                        err.column()
+                    ));
+                }
+            }
+            None
+        }
+        "toml" => {
+            if let Err(err) = toml::from_str::<toml::Value>(after) {
+                let was_broken = before.is_some_and(|b| toml::from_str::<toml::Value>(b).is_err());
+                if !was_broken {
+                    return Some(format!(
+                        "[syntax-warning] {} invalid TOML: {}",
+                        path.display(),
+                        err.message()
+                    ));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Tier-0 silent syntax delta across Rust/Python/TypeScript/Go (via tree-sitter when `syntax` is
+/// enabled) AND `.json`/`.toml` config files. Returns `None` (0 bytes!) on clean edits.
+pub fn syntax_regression_warning(
+    path: &std::path::Path,
+    before: Option<&str>,
+    after: &str,
+) -> Option<String> {
+    if let Some(w) = structured_data_regression_warning(path, before, after) {
+        return Some(w);
+    }
+    #[cfg(feature = "syntax")]
+    {
+        imp::tree_sitter_regression_warning(path, before, after)
+    }
+    #[cfg(not(feature = "syntax"))]
+    {
+        None
+    }
 }
 
 #[cfg(not(feature = "syntax"))]
-pub fn syntax_regression_warning(
-    _path: &std::path::Path,
-    _before: Option<&str>,
-    _after: &str,
-) -> Option<String> {
+pub fn parse_error_lines(_path: &std::path::Path, _src: &str) -> Option<Vec<usize>> {
     None
 }
 
@@ -326,25 +401,55 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn tier0_silent_on_valid_edit_warns_on_broken_rust() {
+    fn tier0_silent_on_valid_edit_warns_on_broken_rust_with_snippet() {
         let p = Path::new("lib.rs");
         let ok_before = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
         let ok_after = "pub fn add(a: i32, b: i32) -> i32 { a + b + 1 }\n";
-        assert!(syntax_regression_warning(p, Some(ok_before), ok_after).is_none());
+        assert!(
+            syntax_regression_warning(p, Some(ok_before), ok_after).is_none(),
+            "valid Rust must produce zero warning"
+        );
 
         let broken = "pub fn add(a: i32, b: i32) -> i32 { a + \n";
-        let warn = syntax_regression_warning(p, Some(ok_before), broken);
-        assert!(warn.is_some());
+        let warn = syntax_regression_warning(p, Some(ok_before), broken).expect("warning");
+        assert!(warn.contains("L1:"), "expected offending line snippet: {warn}");
+        assert!(warn.contains("pub fn add"), "expected source snippet: {warn}");
+    }
+
+    #[test]
+    fn tier0_validates_json_and_toml_regressions_silently() {
+        // JSON
+        let jp = Path::new("package.json");
+        assert!(
+            syntax_regression_warning(jp, Some("{\"a\":1}"), "{\"a\":2}").is_none(),
+            "valid JSON must stay silent"
+        );
+        let jwarn = syntax_regression_warning(jp, Some("{\"a\":1}"), "{\n  \"a\": 1,\n}")
+            .expect("broken JSON warning");
+        assert!(jwarn.contains("invalid JSON"), "got: {jwarn}");
+        assert!(jwarn.contains("line 3"), "expected exact line: {jwarn}");
+
+        // TOML
+        let tp = Path::new("Cargo.toml");
+        assert!(
+            syntax_regression_warning(tp, Some("[pkg]\nname = \"a\"\n"), "[pkg]\nname = \"b\"\n")
+                .is_none(),
+            "valid TOML must stay silent"
+        );
+        let twarn =
+            syntax_regression_warning(tp, Some("[pkg]\nname = \"a\"\n"), "[pkg\nname = \"b\"\n")
+                .expect("broken TOML warning");
+        assert!(twarn.contains("invalid TOML"), "got: {twarn}");
     }
 
     #[test]
     fn generates_rust_structural_outline() {
         let src = "pub struct Engine {}\nimpl Engine {\n    pub fn run(&self) {}\n}\n";
         let outline = structural_outline(Path::new("engine.rs"), src).expect("outline");
-        assert!(outline.contains("pub struct Engine"));
-        assert!(outline.contains("pub fn run"));
+        assert!(outline.contains("pub struct Engine"), "got: {outline}");
+        assert!(outline.contains("pub fn run"), "got: {outline}");
 
         let ranges = find_symbol_ranges(Path::new("engine.rs"), src, "Engine::run");
-        assert_eq!(ranges, vec![(3, 3)]);
+        assert_eq!(ranges, vec![(3, 3)], "symbol range");
     }
 }

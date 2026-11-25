@@ -844,4 +844,69 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn web_builtins_and_fuzzy_tool_suggestions_work() {
+        let (tool, dir) = make_tool(CodeModeConfig::default());
+        let out = tool
+            .execute(
+                json!({
+                    "code": r#"
+                        const u = new URL("https://api.example.com:8443/v1/items?a=1&b=hello+world#top");
+                        u.searchParams.set("c", "42");
+                        const enc = new TextEncoder().encode("café");
+                        const dec = new TextDecoder().decode(enc);
+                        const clone = structuredClone({ nested: [1, 2] });
+                        clone.nested.push(3);
+                        const id = crypto.randomUUID();
+                        const b64 = atob(btoa("quick-check"));
+                        let errMsg = "";
+                        try {
+                            await tools.read({ file_path: "a.txt" });
+                        } catch (e) {
+                            errMsg = String(e.message);
+                        }
+                        return {
+                            host: u.hostname,
+                            port: u.port,
+                            b: u.searchParams.get("b"),
+                            href: u.href,
+                            dec,
+                            cloneLen: clone.nested.length,
+                            uuidLen: id.length,
+                            b64,
+                            errMsg,
+                        };
+                    "#
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("web builtins run");
+        assert!(!out.is_error, "web builtins failed: {}", out.text_only());
+        let txt = out.text_only();
+        let json_line = txt
+            .lines()
+            .find(|l| l.trim_start().starts_with('{'))
+            .unwrap_or(&txt);
+        let parsed: Value = serde_json::from_str(json_line).expect("json");
+        assert_eq!(parsed["host"], "api.example.com", "URL hostname");
+        assert_eq!(parsed["port"], "8443", "URL port");
+        assert_eq!(parsed["b"], "hello world", "URLSearchParams decode");
+        assert!(
+            parsed["href"].as_str().is_some_and(|s| s.contains("c=42")),
+            "URL href mutation"
+        );
+        assert_eq!(parsed["dec"], "café", "TextEncoder/TextDecoder UTF-8");
+        assert_eq!(parsed["cloneLen"], 3, "structuredClone");
+        assert_eq!(parsed["uuidLen"], 36, "crypto.randomUUID");
+        assert_eq!(parsed["b64"], "quick-check", "atob/btoa");
+        let err = parsed["errMsg"].as_str().unwrap_or("");
+        assert!(
+            err.contains("did you mean") && err.contains("Read"),
+            "expected fuzzy suggestion for `tools.read`, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -590,6 +590,7 @@ dependencies = [
  "similar",
  "tokio",
  "tokio-util",
+ "toml",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-python",
