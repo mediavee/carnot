@@ -4047,3 +4047,74 @@ async fn e2e_bash_streams_live_tool_update_events_and_pty_roundtrip() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn e2e_diagnostic_prefetch_turns_compile_read_edit_into_compile_edit() {
+    let dir = std::env::temp_dir().join(format!("carnot-e2e-diag-pf-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(dir.join("src")).expect("mkdir");
+    let broken = dir.join("src/broken.rs");
+    fs::write(
+        &broken,
+        "pub fn ok() -> i32 {\n    1\n}\npub fn buggy() -> i32 {\n    \"nope\"\n}\n",
+    )
+    .expect("write");
+
+    let faux = Arc::new(FauxProvider::new(vec![
+        // Turn 1: Run failing build/check command referencing src/broken.rs:5:5
+        ScriptedTurn::tool_calls(vec![(
+            "call-check",
+            "Bash",
+            json!({"command": "printf 'error[E0308]: mismatched types\\n --> src/broken.rs:5:5\\n' >&2; exit 1"}),
+        )]),
+        // Turn 2: Edit line 5 directly with ZERO intermediate Read call!
+        ScriptedTurn::tool_calls(vec![(
+            "call-fix",
+            "Edit",
+            json!({
+                "file_path": "src/broken.rs",
+                "start_line": 5,
+                "end_line": 5,
+                "new_string": "    42"
+            }),
+        )]),
+        ScriptedTurn::text("Fixed src/broken.rs without an intermediate Read turn."),
+    ]));
+
+    let agent = CarnotBuilder::new(dir.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
+        .sandbox(false)
+        .persist_session(false)
+        .build()
+        .expect("build");
+
+    let outcome = agent.prompt("Fix the compile error").await.expect("prompt");
+    assert_eq!(
+        outcome.final_text,
+        "Fixed src/broken.rs without an intermediate Read turn."
+    );
+    assert_eq!(
+        outcome.metrics.turns, 3,
+        "compile -> edit -> done in 3 turns (zero intermediate Read)"
+    );
+    assert!(
+        fs::read_to_string(&broken)
+            .expect("read")
+            .contains("    42\n")
+    );
+
+    let reqs = faux.recorded_requests();
+    assert!(
+        msgs_json(&reqs[1].messages).contains("[diagnostic-context:"),
+        "Turn 2 must see auto-prefetched diagnostic context"
+    );
+    assert!(
+        msgs_json(&reqs[1].messages).contains("5\\t    \\\"nope\\\""),
+        "Turn 2 must see failing line 5 in tool_result"
+    );
+    assert!(
+        !msgs_json(&reqs[2].messages).contains("must be read first"),
+        "Edit must succeed immediately without unread error"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

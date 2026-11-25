@@ -207,6 +207,7 @@ struct PtyHandle {
 
 struct BackgroundJob {
     command: String,
+    exec_dir: PathBuf,
     is_pty: bool,
     started: Instant,
     output: Mutex<BoundedOutput>,
@@ -409,6 +410,7 @@ pub struct BashTool {
     cas: Arc<CasStore>,
     jobs: Arc<JobRegistry>,
     seen_cas_hashes: Arc<Mutex<HashSet<String>>>,
+    read_tracker: Option<Arc<Mutex<crate::tracker::ReadTracker>>>,
     cas_enabled: bool,
     redact_cas_secrets: bool,
     spill_threshold: usize,
@@ -441,6 +443,7 @@ impl BashTool {
             cas,
             jobs,
             seen_cas_hashes: Arc::new(Mutex::new(HashSet::new())),
+            read_tracker: None,
             cas_enabled,
             redact_cas_secrets: true,
             spill_threshold,
@@ -463,6 +466,43 @@ impl BashTool {
     pub fn with_seen_cas_hashes(mut self, seen_cas_hashes: Arc<Mutex<HashSet<String>>>) -> Self {
         self.seen_cas_hashes = seen_cas_hashes;
         self
+    }
+
+    /// Attaches the shared [`ReadTracker`] so failing build/test commands can auto-prefetch
+    /// bounded source slices around diagnostic lines and seed the tracker for immediate `Edit`.
+    #[must_use]
+    pub fn with_read_tracker(
+        mut self,
+        read_tracker: Arc<Mutex<crate::tracker::ReadTracker>>,
+    ) -> Self {
+        self.read_tracker = Some(read_tracker);
+        self
+    }
+
+    fn maybe_append_diagnostics(
+        &self,
+        exec_dir: &std::path::Path,
+        raw: &str,
+        shaped: &mut String,
+    ) -> usize {
+        if crate::tracker::is_read_tracking_suppressed() {
+            return 0;
+        }
+        let Some(pf) = crate::diagnostics::prefetch_diagnostic_context(
+            &self.workspace_root,
+            exec_dir,
+            &self.sandbox.extra_writable_roots,
+            raw,
+            self.read_tracker.as_deref(),
+            self.redact_cas_secrets,
+        ) else {
+            return 0;
+        };
+        if !shaped.is_empty() && !shaped.ends_with('\n') {
+            shaped.push('\n');
+        }
+        shaped.push_str(&pf.block);
+        pf.snippets_attached
     }
 
     fn format_output(
@@ -589,6 +629,7 @@ impl BashTool {
         let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
         let job = Arc::new(BackgroundJob {
             command: command.to_string(),
+            exec_dir: exec_dir.to_path_buf(),
             is_pty: true,
             started: Instant::now(),
             output: Mutex::new(BoundedOutput::default()),
@@ -732,11 +773,14 @@ impl BashTool {
                 compressor,
                 deduplicated,
             } = self.format_output(&job.command, &delta, exit.is_some())?;
+            let mut diag_snippets = 0usize;
             if let Some(code) = exit {
-                if code != 0
-                    && let Some(note) = annotate_sandbox_denial(&delta, &self.sandbox)
-                {
-                    shaped.push_str(&note);
+                if code != 0 {
+                    if let Some(note) = annotate_sandbox_denial(&delta, &self.sandbox) {
+                        shaped.push_str(&note);
+                    }
+                    diag_snippets =
+                        self.maybe_append_diagnostics(&job.exec_dir, &delta, &mut shaped);
                 }
                 self.jobs.remove(job_id);
             }
@@ -767,6 +811,7 @@ impl BashTool {
                     "bytes_saved": bytes_saved,
                     "compressor": compressor,
                     "deduplicated": deduplicated,
+                    "diagnostic_snippets": diag_snippets,
                 }),
             });
         }
@@ -849,6 +894,7 @@ impl BashTool {
             let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
             let job = Arc::new(BackgroundJob {
                 command: command.to_string(),
+                exec_dir: exec_dir.clone(),
                 is_pty: false,
                 started: Instant::now(),
                 output: Mutex::new(BoundedOutput::default()),
@@ -951,10 +997,12 @@ impl BashTool {
                 compressor,
                 deduplicated,
             } = self.format_output(command, &raw, true)?;
-            if exit != 0
-                && let Some(note) = annotate_sandbox_denial(&raw, &self.sandbox)
-            {
-                shaped.push_str(&note);
+            let mut diag_snippets = 0usize;
+            if exit != 0 {
+                if let Some(note) = annotate_sandbox_denial(&raw, &self.sandbox) {
+                    shaped.push_str(&note);
+                }
+                diag_snippets = self.maybe_append_diagnostics(&exec_dir, &raw, &mut shaped);
             }
             let elapsed = job.started.elapsed().as_secs_f64();
             let text = if shaped.is_empty() {
@@ -974,6 +1022,7 @@ impl BashTool {
                     "bytes_saved": bytes_saved,
                     "compressor": compressor,
                     "deduplicated": deduplicated,
+                    "diagnostic_snippets": diag_snippets,
                     "yielded": false,
                 }),
             })
@@ -1303,6 +1352,70 @@ mod tests {
             "expected sandboxed PTY output, got: {}",
             out.text_only()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failing_bash_prefetches_diagnostic_slice_and_enables_immediate_line_edit() {
+        let dir =
+            std::env::temp_dir().join(format!("carnot-bash-diag-pf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+        let broken = dir.join("src/broken.rs");
+        std::fs::write(
+            &broken,
+            "fn one() -> i32 {\n    1\n}\nfn broken() -> i32 {\n    \"wrong\"\n}\n",
+        )
+        .expect("write broken.rs");
+
+        let mut cfg = carnot_core::CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let reg = crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let bash = reg.get("Bash").expect("Bash");
+        let edit = reg.get("Edit").expect("Edit");
+
+        // Failing command referencing src/broken.rs:5:5
+        let out = bash
+            .execute(
+                json!({"command": "printf 'error[E0308]: mismatched types\\n --> src/broken.rs:5:5\\n' >&2; exit 1"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("bash");
+        assert!(out.is_error);
+        assert_eq!(out.details["diagnostic_snippets"], 1);
+        assert!(
+            out.text_only().contains("[diagnostic-context:"),
+            "expected diagnostic block: {}",
+            out.text_only()
+        );
+        assert!(
+            out.text_only().contains("5\t    \"wrong\""),
+            "expected failing line in prefetch: {}",
+            out.text_only()
+        );
+
+        // Immediate line-range Edit succeeds with ZERO intermediate Read call!
+        let edit_out = edit
+            .execute(
+                json!({
+                    "file_path": "src/broken.rs",
+                    "start_line": 5,
+                    "end_line": 5,
+                    "new_string": "    42"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("edit");
+        assert!(
+            !edit_out.is_error,
+            "immediate Edit after diagnostic prefetch must succeed: {}",
+            edit_out.text_only()
+        );
+        let updated = std::fs::read_to_string(&broken).expect("read");
+        assert!(updated.contains("    42\n"), "got:\n{updated}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

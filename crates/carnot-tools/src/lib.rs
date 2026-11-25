@@ -3,6 +3,7 @@
 //! and adaptive-yield sandboxed shell.
 
 pub mod bash;
+pub(crate) mod diagnostics;
 pub mod files;
 pub mod grep;
 pub mod syntax;
@@ -137,7 +138,8 @@ impl ToolRegistry {
                 config.extra_env.clone(),
             )
             .with_redact_cas_secrets(config.redact_cas_secrets)
-            .with_seen_cas_hashes(seen_cas_hashes),
+            .with_seen_cas_hashes(seen_cas_hashes)
+            .with_read_tracker(Arc::clone(&read_tracker)),
         ));
 
         // Allow read-only access to configured `--skills-dir` and global `~/.carnot/skills`

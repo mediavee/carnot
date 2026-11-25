@@ -274,6 +274,55 @@ impl ReadTracker {
         entry.disk_hash = disk_hash;
     }
 
+    /// Returns `true` when the model already holds an up-to-date line view covering
+    /// `start_line..=end_line` for the current on-disk content of `path`.
+    pub fn has_fresh_view_range(
+        &self,
+        path: &Path,
+        full_file_bytes: &[u8],
+        start_line: usize,
+        end_line: usize,
+    ) -> bool {
+        let disk_hash = *blake3::hash(full_file_bytes).as_bytes();
+        let Some(entry) = self.files.get(&tracker_key(path)) else {
+            return false;
+        };
+        if entry.view_disk_hash != Some(disk_hash) {
+            return false;
+        }
+        (start_line..=end_line).all(|ln| entry.view.contains_key(&ln))
+    }
+
+    /// Seeds `view` with a compact diagnostic-prefetched line window (without mutating
+    /// `last_slice`) so follow-up `Edit(start_line, end_line)` succeeds immediately while a
+    /// subsequent full `Read` still returns full file content rather than a stub.
+    pub fn record_diagnostic_slice(
+        &mut self,
+        path: &Path,
+        full_file_bytes: &[u8],
+        start_line: usize,
+        slice_lines: &[&str],
+    ) {
+        let disk_hash = *blake3::hash(full_file_bytes).as_bytes();
+        let entry = self
+            .files
+            .entry(tracker_key(path))
+            .or_insert_with(|| TrackedFile {
+                disk_hash,
+                view_disk_hash: None,
+                view: BTreeMap::new(),
+                last_slice: None,
+            });
+        entry.disk_hash = disk_hash;
+        if entry.view_disk_hash != Some(disk_hash) {
+            entry.view.clear();
+            entry.view_disk_hash = Some(disk_hash);
+        }
+        for (idx, line) in slice_lines.iter().enumerate() {
+            entry.view.insert(start_line + idx, viewed_line(line));
+        }
+    }
+
     /// Rebases `view` and updates `disk_hash` after a model-initiated `Edit` transforms `before`
     /// into `after`. Returns an optional line-shift note (`[lines after Lx shifted by ±n]`) when
     /// the line count changed.
