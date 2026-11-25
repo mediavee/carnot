@@ -67,6 +67,10 @@ pub use carnot_ext_claude_plugins::{
 };
 #[cfg(feature = "ext-codemode")]
 pub use carnot_ext_codemode::{CodeModeConfig, CodeModeHost, CodeModeModule, CodeModeTool};
+#[cfg(feature = "ext-goal")]
+pub use carnot_ext_goal::{
+    GoalConfig, GoalHandle, GoalModule, GoalState, GoalStatus, VerifierDecision,
+};
 #[cfg(feature = "ext-hooks")]
 pub use carnot_ext_hooks::{
     CompiledHook, HookEvent, HooksConfig, HooksModule, parse_hooks_file, parse_hooks_value,
@@ -140,6 +144,12 @@ pub struct CarnotBuilder {
     memory_config: Option<MemoryConfig>,
     #[cfg(feature = "ext-codemode")]
     codemode_config: Option<CodeModeConfig>,
+    #[cfg(feature = "ext-goal")]
+    goal_config: Option<GoalConfig>,
+    #[cfg(feature = "ext-goal")]
+    goal_handle: Option<GoalHandle>,
+    #[cfg(feature = "ext-goal")]
+    goal_verifier_override: Option<(Arc<dyn Provider>, String)>,
 }
 
 impl CarnotBuilder {
@@ -169,6 +179,12 @@ impl CarnotBuilder {
             memory_config: None,
             #[cfg(feature = "ext-codemode")]
             codemode_config: None,
+            #[cfg(feature = "ext-goal")]
+            goal_config: None,
+            #[cfg(feature = "ext-goal")]
+            goal_handle: None,
+            #[cfg(feature = "ext-goal")]
+            goal_verifier_override: None,
         }
     }
 
@@ -361,6 +377,47 @@ impl CarnotBuilder {
     #[cfg(feature = "ext-codemode")]
     pub fn codemode_config(mut self, cfg: CodeModeConfig) -> Self {
         self.codemode_config = Some(cfg);
+        self
+    }
+
+    /// Sets a natural-language goal criterion verified by an independent virgin-context verifier.
+    #[cfg(feature = "ext-goal")]
+    pub fn goal(mut self, criterion: impl Into<String>) -> Self {
+        let cfg = self.goal_config.get_or_insert_with(GoalConfig::default);
+        cfg.criterion = Some(criterion.into());
+        self
+    }
+
+    /// Appends a deterministic sandboxed shell verification command to the active goal loop.
+    #[cfg(feature = "ext-goal")]
+    pub fn goal_cmd(mut self, cmd: impl Into<String>) -> Self {
+        let cfg = self.goal_config.get_or_insert_with(GoalConfig::default);
+        cfg.verify_commands.push(cmd.into());
+        self
+    }
+
+    /// Configures the goal-driven autonomous verification loop (`GoalModule`).
+    #[cfg(feature = "ext-goal")]
+    pub fn goal_config(mut self, cfg: GoalConfig) -> Self {
+        self.goal_config = Some(cfg);
+        self
+    }
+
+    /// Attaches an externally-held [`GoalHandle`] for live goal status/set/clear control (e.g. TUI `/goal`).
+    #[cfg(feature = "ext-goal")]
+    pub fn goal_handle(mut self, handle: GoalHandle) -> Self {
+        self.goal_handle = Some(handle);
+        self
+    }
+
+    /// Overrides the verifier `(Provider, model)` used by `GoalModule` (useful for custom judges or tests).
+    #[cfg(feature = "ext-goal")]
+    pub fn goal_verifier_provider(
+        mut self,
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.goal_verifier_override = Some((provider, model.into()));
         self
     }
 
@@ -658,7 +715,7 @@ impl CarnotBuilder {
             inherited_for_child.extend(
                 self.extra_modules
                     .iter()
-                    .filter(|m| m.name() != "codemode")
+                    .filter(|m| !matches!(m.name(), "codemode" | "goal"))
                     .cloned(),
             );
             if let Some(ref pm) = policy_mod {
@@ -689,6 +746,38 @@ impl CarnotBuilder {
                 modules.push(Arc::clone(&cm) as Arc<dyn Module>);
                 cm
             });
+        #[cfg(feature = "ext-goal")]
+        let goal_mod: Option<Arc<GoalModule>> = {
+            let mut gm_opt = if let Some(handle) = self.goal_handle.take() {
+                if let Some(cfg) = self.goal_config.clone()
+                    && cfg.is_active()
+                {
+                    handle.set(cfg);
+                }
+                Some(GoalModule::from_handle(
+                    &self.config,
+                    Arc::clone(cas),
+                    handle,
+                ))
+            } else {
+                self.goal_config
+                    .clone()
+                    .filter(GoalConfig::is_active)
+                    .map(|cfg| GoalModule::new(&self.config, Arc::clone(cas), cfg))
+            };
+            if let Some(gm) = gm_opt.take() {
+                let gm = if let Some((vp, vm)) = self.goal_verifier_override.take() {
+                    gm.with_verifier_provider(vp, vm)
+                } else {
+                    gm
+                };
+                let gm = Arc::new(gm);
+                modules.push(Arc::clone(&gm) as Arc<dyn Module>);
+                Some(gm)
+            } else {
+                None
+            }
+        };
         modules.extend(self.extra_modules);
         // Always run PolicyGuard LAST so `RewriteInput` from earlier modules can never bypass it!
         if let Some(pm) = policy_mod {
@@ -723,6 +812,10 @@ impl CarnotBuilder {
         #[cfg(feature = "ext-codemode")]
         if let Some(ref cm) = codemode_mod {
             cm.attach_parent(&agent);
+        }
+        #[cfg(feature = "ext-goal")]
+        if let Some(ref gm) = goal_mod {
+            gm.attach_parent(&agent);
         }
         Ok(agent)
     }

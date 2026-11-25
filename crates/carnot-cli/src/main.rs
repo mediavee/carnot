@@ -259,6 +259,26 @@ struct Cli {
     #[arg(long = "no-codemode")]
     no_codemode: bool,
 
+    /// Natural-language goal criterion evaluated by an independent virgin-context verifier (`carnot-ext-goal`)
+    #[cfg(feature = "ext-goal")]
+    #[arg(long = "goal")]
+    goal: Option<String>,
+
+    /// Deterministic sandboxed verification shell command(s) for goal mode (repeatable, e.g. `cargo test`)
+    #[cfg(feature = "ext-goal")]
+    #[arg(long = "goal-cmd")]
+    goal_cmds: Vec<String>,
+
+    /// Maximum autonomous continuation iterations for `--goal` / `--goal-cmd` (default: 8)
+    #[cfg(feature = "ext-goal")]
+    #[arg(long = "goal-max-iter")]
+    goal_max_iter: Option<u32>,
+
+    /// Optional model/provider override for the independent goal verifier (e.g. `gemini/gemini-2.5-flash`)
+    #[cfg(feature = "ext-goal")]
+    #[arg(long = "goal-model")]
+    goal_model: Option<String>,
+
     /// Enable enterprise `PolicyGuard` (command/path guardrails + secret redaction)
     #[arg(long)]
     policy_guard: bool,
@@ -918,6 +938,10 @@ fn active_extension_badges(cli: &Cli) -> Vec<String> {
     if cli.codemode_enabled() {
         out.push("codemode".to_string());
     }
+    #[cfg(feature = "ext-goal")]
+    if cli.goal.is_some() || !cli.goal_cmds.is_empty() {
+        out.push("goal".to_string());
+    }
     #[cfg(feature = "ext-hooks")]
     if !cli.hooks_files.is_empty() || cli.claude_hooks || cli.trust_workspace_hooks {
         out.push("hooks".to_string());
@@ -1570,6 +1594,17 @@ async fn build_agent_full(
     #[cfg(feature = "ext-codemode")]
     if cli.codemode_enabled() {
         b = b.codemode(true);
+    }
+    #[cfg(feature = "ext-goal")]
+    if cli.goal.is_some() || !cli.goal_cmds.is_empty() {
+        let mut gc = carnot::GoalConfig::default();
+        gc.criterion.clone_from(&cli.goal);
+        gc.verify_commands.clone_from(&cli.goal_cmds);
+        if let Some(max_iter) = cli.goal_max_iter {
+            gc.max_iterations = max_iter.max(1);
+        }
+        gc.verifier_model.clone_from(&cli.goal_model);
+        b = b.goal_config(gc);
     }
     for ext in &cli.extensions {
         b = b.extension(ext.clone());

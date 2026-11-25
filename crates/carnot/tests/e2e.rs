@@ -3851,3 +3851,137 @@ async fn e2e_codemode_batches_tools_enforces_policy_guard_and_preserves_prefix_i
     let _ = fs::remove_dir_all(&dir1);
     let _ = fs::remove_dir_all(&dir2);
 }
+
+#[cfg(feature = "ext-goal")]
+#[tokio::test]
+async fn e2e_goal_deterministic_and_independent_verifier_loop_preserves_prefix_invariance() {
+    let dir1 = std::env::temp_dir().join(format!("carnot-goal-1-{}", uuid::Uuid::new_v4()));
+    let dir2 = std::env::temp_dir().join(format!("carnot-goal-2-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir1).expect("mkdir 1");
+    fs::create_dir_all(&dir2).expect("mkdir 2");
+    fs::write(dir1.join("answer.txt"), "wrong\n").expect("seed answer.txt");
+
+    // Worker tries to stop prematurely on Turn 1 (fails deterministic check -> 0 verifier calls),
+    // then reads & fixes answer.txt on Turns 2-4, then verifier rejects once (asks for comment),
+    // then worker updates answer.txt and verifier returns `met`.
+    let worker_faux = Arc::new(FauxProvider::new(vec![
+        // Attempt 1: premature stop -> deterministic check `grep -q "^42$" answer.txt` fails
+        ScriptedTurn::text("I think it's already done."),
+        // Attempt 2: worker reads answer.txt, writes 42, then stops
+        ScriptedTurn::tool_calls(vec![("r1", "Read", json!({"file_path": "answer.txt"}))]),
+        ScriptedTurn::tool_calls(vec![(
+            "w1",
+            "Write",
+            json!({"file_path": "answer.txt", "content": "42\n"}),
+        )]),
+        ScriptedTurn::text("Fixed answer.txt to 42."),
+        // Attempt 3 (after independent verifier says `not_met`): add marker.txt and stop
+        ScriptedTurn::tool_calls(vec![(
+            "w2",
+            "Write",
+            json!({"file_path": "marker.txt", "content": "verified\n"}),
+        )]),
+        ScriptedTurn::text("Added marker.txt as requested."),
+    ]));
+
+    // Independent virgin-context verifier: only invoked AFTER deterministic check passes!
+    let verifier_faux = Arc::new(FauxProvider::new(vec![
+        ScriptedTurn::text(
+            r#"{"status":"not_met","feedback":"Also create marker.txt containing verified."}"#,
+        ),
+        ScriptedTurn::text(
+            r#"{"status":"met","feedback":"answer.txt is 42 and marker.txt is present."}"#,
+        ),
+    ]));
+
+    let goal_cfg = carnot::GoalConfig {
+        criterion: Some("Ensure answer.txt contains 42 and marker.txt contains verified.".into()),
+        verify_commands: vec!["grep -q '^42$' answer.txt".into()],
+        max_iterations: 6,
+        stagnation_limit: 3,
+        ..carnot::GoalConfig::default()
+    };
+    let handle = carnot::GoalHandle::new(goal_cfg);
+
+    let mut cfg1 = CarnotConfig::new(dir1.clone());
+    cfg1.modules.sandbox = false;
+    let agent1 = CarnotBuilder::new(dir1.clone())
+        .config(cfg1)
+        .provider(Arc::clone(&worker_faux) as Arc<dyn carnot::Provider>)
+        .persist_session(false)
+        .goal_handle(handle.clone())
+        .goal_verifier_provider(
+            Arc::clone(&verifier_faux) as Arc<dyn carnot::Provider>,
+            "faux-verifier",
+        )
+        .build()
+        .expect("build goal agent");
+
+    // Baseline agent WITHOUT GoalModule in a different workspace to prove 0-byte static prefix overhead!
+    let mut cfg2 = CarnotConfig::new(dir2.clone());
+    cfg2.modules.sandbox = false;
+    let agent_plain = CarnotBuilder::new(dir2.clone())
+        .config(cfg2)
+        .provider(Arc::new(FauxProvider::new(vec![ScriptedTurn::text("ok")])))
+        .persist_session(false)
+        .build()
+        .expect("build plain agent");
+
+    assert_eq!(
+        agent1.prefix_hash().await,
+        agent_plain.prefix_hash().await,
+        "GoalModule must add ZERO bytes to the static cached system prompt prefix"
+    );
+
+    let out = agent1
+        .prompt("Make answer.txt equal 42 and create marker.txt.")
+        .await
+        .expect("goal prompt");
+    assert!(out.final_text.contains("Added marker.txt"));
+
+    let status = handle.status();
+    assert_eq!(status.status, carnot::GoalStatus::Met);
+    assert_eq!(
+        status.iterations, 2,
+        "expected 1 deterministic retry + 1 verifier retry"
+    );
+
+    // Verifier MUST only have been called twice (skipped when deterministic check failed on Attempt 1),
+    // with 0 tools, 1 clean user message, and skip_tail_cache_write = true.
+    let vreqs = verifier_faux.recorded_requests();
+    assert_eq!(
+        vreqs.len(),
+        2,
+        "verifier should be skipped on deterministic check failure"
+    );
+    for vr in &vreqs {
+        assert!(vr.tools.is_empty(), "verifier must have zero tools");
+        assert_eq!(
+            vr.messages.len(),
+            1,
+            "verifier must run in virgin single-turn context"
+        );
+        assert!(
+            vr.skip_tail_cache_write,
+            "verifier must set skip_tail_cache_write = true"
+        );
+    }
+
+    // Worker must have received the `[carnot:goal]` dynamic user prompt note & continuation messages.
+    let wreqs = worker_faux.recorded_requests();
+    assert_eq!(wreqs.len(), 6);
+    assert!(msgs_json(&wreqs[0].messages).contains("[carnot:goal]"));
+    assert!(msgs_json(&wreqs[1].messages).contains("Deterministic verification command failed"));
+    assert!(msgs_json(&wreqs[4].messages).contains("Also create marker.txt"));
+
+    // Acyclic drop check.
+    let weak = Arc::downgrade(&agent1);
+    drop(agent1);
+    assert!(
+        weak.upgrade().is_none(),
+        "Agent with GoalModule must drop cleanly with zero Arc cycles"
+    );
+
+    let _ = fs::remove_dir_all(&dir1);
+    let _ = fs::remove_dir_all(&dir2);
+}

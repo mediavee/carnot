@@ -86,7 +86,7 @@ def summarize_job(job_dir: Path) -> dict[str, Any]:
                     u_cw1 += int(u.get("cache_write_1h_tokens") or 0)
                     u_out += int(u.get("output_tokens") or 0)
                     u_cost += float(u.get("cost_usd") or 0.0)
-                elif ev.get("event") == "rewind_applied":
+                elif ev.get("event") in ("compaction_applied", "rewind_applied"):
                     u_rewinds += 1
                 elif ev.get("event") == "run_settled" and isinstance(ev.get("metrics"), dict):
                     m = ev["metrics"]
@@ -98,7 +98,9 @@ def summarize_job(job_dir: Path) -> dict[str, Any]:
                     u_out = int(tu.get("output_tokens", u_out) or 0)
                     u_cost = float(tu.get("cost_usd", u_cost) or 0.0)
                     u_turns = int(m.get("turns", u_turns) or u_turns)
-                    u_rewinds = int(m.get("rewinds_applied", u_rewinds) or u_rewinds)
+                    u_rewinds = int(
+                        m.get("compactions_applied", m.get("rewinds_applied", u_rewinds)) or u_rewinds
+                    )
                     u_prefix_hits = int(m.get("prefix_cache_hits") or 0)
                     u_prefix_misses = int(m.get("prefix_cache_misses") or 0)
                     u_sem_saved = int(m.get("semantic_bytes_saved") or 0)
@@ -109,7 +111,7 @@ def summarize_job(job_dir: Path) -> dict[str, Any]:
                 out_t = u_out
                 cost_usd = round(u_cost, 6)
                 meta.setdefault("turns", u_turns)
-                meta.setdefault("rewinds_applied", u_rewinds)
+                meta.setdefault("compactions_applied", u_rewinds)
                 meta.setdefault("prefix_cache_hits", u_prefix_hits)
                 meta.setdefault("prefix_cache_misses", u_prefix_misses)
                 meta.setdefault("semantic_bytes_saved", u_sem_saved)
@@ -130,7 +132,8 @@ def summarize_job(job_dir: Path) -> dict[str, Any]:
                 "cache_hit_rate": round(cache_t / in_t, 4) if in_t > 0 else 0.0,
                 "cost_usd": round(float(cost_usd), 6) if cost_usd is not None else None,
                 "turns": meta.get("turns"),
-                "rewinds_applied": meta.get("rewinds_applied"),
+                "compactions_applied": meta.get("compactions_applied", meta.get("rewinds_applied")),
+                "codemode_calls": meta.get("codemode_calls"),
                 "exception": (exc or {}).get("exception_type") if isinstance(exc, dict) else None,
             }
         )
@@ -162,12 +165,34 @@ def summarize_job(job_dir: Path) -> dict[str, Any]:
     }
 
 
+def print_markdown_table(report: list[dict[str, Any]]) -> None:
+    print("| Agent | Model | Pass | Total Cost | Mean Cost | Cache Hit | Mean Wall |")
+    print("| :--- | :--- | ---: | ---: | ---: | ---: | ---: |")
+    for r in report:
+        cost = f"${r['total_cost_usd']:.4f}" if r["total_cost_usd"] is not None else "-"
+        mcost = f"${r['mean_cost_usd']:.4f}" if r["mean_cost_usd"] is not None else "-"
+        wall = f"{r['mean_agent_wall_s']:.1f}s" if r["mean_agent_wall_s"] is not None else "-"
+        print(
+            f"| {r['agent'] or '-'} | {r['model'] or '-'} | "
+            f"{r['passed']}/{r['total_tasks']} ({r['pass_rate_pct']}%) | "
+            f"{cost} | {mcost} | {r['aggregate_cache_hit_pct']}% | {wall} |"
+        )
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("usage: summarize_harbor_run.py <job_dir> [<job_dir2> ...]", file=sys.stderr)
+    args = sys.argv[1:]
+    table_mode = False
+    if "--table" in args:
+        table_mode = True
+        args = [a for a in args if a != "--table"]
+    if not args:
+        print("usage: summarize_harbor_run.py [--table] <job_dir> [<job_dir2> ...]", file=sys.stderr)
         sys.exit(2)
-    report = [summarize_job(Path(p)) for p in sys.argv[1:]]
-    print(json.dumps(report, indent=2))
+    report = [summarize_job(Path(p)) for p in args]
+    if table_mode:
+        print_markdown_table(report)
+    else:
+        print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

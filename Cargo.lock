@@ -246,6 +246,7 @@ dependencies = [
  "carnot-ext",
  "carnot-ext-claude-plugins",
  "carnot-ext-codemode",
+ "carnot-ext-goal",
  "carnot-ext-hooks",
  "carnot-ext-lsp",
  "carnot-ext-memory",
@@ -382,6 +383,24 @@ dependencies = [
  "carnot-ext",
  "carnot-tools",
  "rquickjs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "carnot-ext-goal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "carnot-agent",
+ "carnot-ai",
+ "carnot-cas",
+ "carnot-core",
+ "carnot-ext",
+ "carnot-sandbox",
  "serde",
  "serde_json",
  "tokio",

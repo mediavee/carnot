@@ -59,9 +59,9 @@ class CarnotHarborOptions(AgentOptions):
         default="medium",
         description="Carnot --effort level (low, medium, high, xhigh, max).",
     )
-    cache_ttl: Literal["hybrid", "5m", "1h"] = Field(
+    cache_ttl: Literal["short", "hybrid", "long", "5m", "1h", "24h"] = Field(
         default="hybrid",
-        description="Carnot --cache-ttl policy (hybrid, 5m, 1h).",
+        description="Carnot --cache-ttl policy (short|hybrid|long, or 5m|1h|24h).",
     )
     bin_dir: str | None = Field(
         default=None,
@@ -75,9 +75,45 @@ class CarnotHarborOptions(AgentOptions):
         default=None,
         description="Optional override for Carnot --max-turns (default 500).",
     )
+    max_cost_usd: float | None = Field(
+        default=None,
+        description="Hard per-task USD circuit-breaker passed to Carnot --max-cost-usd.",
+    )
     subagent: bool = Field(
         default=False,
-        description="Enable Carnot disposable-context Subagent tool.",
+        description="Enable Carnot disposable-context Subagent tool (default false for clean A/B).",
+    )
+    codemode: bool = Field(
+        default=False,
+        description="Enable isolated QuickJS CodeMode tool orchestration (default false for clean A/B).",
+    )
+    web: bool = Field(
+        default=False,
+        description="Enable Carnot web search/fetch extension (default false in offline containers).",
+    )
+    lsp: bool = Field(
+        default=False,
+        description="Enable Carnot LSP diagnostics extension (default false for clean A/B).",
+    )
+    memory: bool = Field(
+        default=False,
+        description="Enable Carnot cross-session memory extension (default false in isolated trials).",
+    )
+    goal: str | None = Field(
+        default=None,
+        description="Optional natural-language goal criterion passed to Carnot --goal.",
+    )
+    goal_cmd: str | None = Field(
+        default=None,
+        description="Optional deterministic verification shell command passed to Carnot --goal-cmd.",
+    )
+    goal_max_iter: int | None = Field(
+        default=None,
+        description="Optional max iterations for --goal / --goal-cmd (default 8).",
+    )
+    goal_model: str | None = Field(
+        default=None,
+        description="Optional verifier model/provider override passed to --goal-model.",
     )
 
 
@@ -206,8 +242,22 @@ class CarnotHarborAgent(BaseAgent):
         extra_flags: list[str] = []
         if opts.max_turns is not None:
             extra_flags.append(f"--max-turns {int(opts.max_turns)}")
-        if opts.subagent:
-            extra_flags.append("--subagent")
+        if opts.max_cost_usd is not None and opts.max_cost_usd > 0:
+            extra_flags.append(f"--max-cost-usd {float(opts.max_cost_usd):.4f}")
+        # Explicitly toggle standalone batteries so A/B runs remain 100% deterministic.
+        extra_flags.append("--subagent" if opts.subagent else "--no-subagent")
+        extra_flags.append("--codemode" if opts.codemode else "--no-codemode")
+        extra_flags.append("--web" if opts.web else "--no-web")
+        extra_flags.append("--lsp" if opts.lsp else "--no-lsp")
+        extra_flags.append("--memory" if opts.memory else "--no-memory")
+        if opts.goal:
+            extra_flags.append(f"--goal {shlex.quote(opts.goal)}")
+        if opts.goal_cmd:
+            extra_flags.append(f"--goal-cmd {shlex.quote(opts.goal_cmd)}")
+        if opts.goal_max_iter is not None:
+            extra_flags.append(f"--goal-max-iter {int(opts.goal_max_iter)}")
+        if opts.goal_model:
+            extra_flags.append(f"--goal-model {shlex.quote(opts.goal_model)}")
         if self.skills_dir:
             extra_flags.append(f"--skills-dir {shlex.quote(str(self.skills_dir))}")
 
@@ -280,6 +330,10 @@ class CarnotHarborAgent(BaseAgent):
         context.metadata["carnot_effort"] = effort
         context.metadata["carnot_cache_ttl"] = opts.cache_ttl
         context.metadata["carnot_profile"] = opts.profile
+        context.metadata["carnot_codemode"] = opts.codemode
+        context.metadata["carnot_subagent"] = opts.subagent
+        if opts.max_cost_usd is not None:
+            context.metadata["carnot_max_cost_usd"] = opts.max_cost_usd
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         jsonl_file = self.logs_dir / "carnot.jsonl"
@@ -293,7 +347,8 @@ class CarnotHarborAgent(BaseAgent):
         out_t = 0
         cost_usd = 0.0
         turns = 0
-        rewinds = 0
+        compactions = 0
+        codemode_calls = 0
         settled_metrics: dict | None = None
         last_error: str | None = None
 
@@ -316,8 +371,10 @@ class CarnotHarborAgent(BaseAgent):
                     cw1_t += int(u.get("cache_write_1h_tokens", 0) or 0)
                     out_t += int(u.get("output_tokens", 0) or 0)
                     cost_usd += float(u.get("cost_usd", 0.0) or 0.0)
-                elif kind == "rewind_applied":
-                    rewinds += 1
+                elif kind in ("compaction_applied", "rewind_applied"):
+                    compactions += 1
+                elif kind == "tool_start" and (ev.get("tool") == "CodeMode" or ev.get("name") == "CodeMode"):
+                    codemode_calls += 1
                 elif kind == "run_settled":
                     settled_metrics = ev.get("metrics")
                 elif kind == "error":
@@ -334,7 +391,10 @@ class CarnotHarborAgent(BaseAgent):
             out_t = int(u.get("output_tokens", out_t) or 0)
             cost_usd = float(u.get("cost_usd", cost_usd) or 0.0)
             turns = int(settled_metrics.get("turns", turns) or turns)
-            rewinds = int(settled_metrics.get("rewinds_applied", rewinds) or rewinds)
+            compactions = int(
+                settled_metrics.get("compactions_applied", settled_metrics.get("rewinds_applied", compactions))
+                or compactions
+            )
 
         total_in = in_t + cr_t + cw5_t + cw1_t
         if total_in > 0 or out_t > 0:
@@ -356,7 +416,8 @@ class CarnotHarborAgent(BaseAgent):
         meta.update(
             {
                 "turns": turns,
-                "rewinds_applied": rewinds,
+                "compactions_applied": compactions,
+                "codemode_calls": codemode_calls,
                 "cache_read_tokens": cr_t,
                 "cache_write_5m_tokens": cw5_t,
                 "cache_write_1h_tokens": cw1_t,
