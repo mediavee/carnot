@@ -257,6 +257,11 @@ pub(crate) struct Cli {
     #[arg(long = "goal-model")]
     pub(crate) goal_model: Option<String>,
 
+    /// Enable cache-safe adaptive reasoning-effort routing + ephemeral thrash / edit-oscillation guard (`carnot-ext-adaptive`)
+    #[cfg(feature = "ext-adaptive")]
+    #[arg(long)]
+    pub(crate) adaptive: bool,
+
     /// Enable enterprise `PolicyGuard` (command/path guardrails + secret redaction)
     #[arg(long)]
     pub(crate) policy_guard: bool,
@@ -456,6 +461,10 @@ pub(crate) fn active_extension_badges(cli: &Cli) -> Vec<String> {
     #[cfg(feature = "ext-goal")]
     if cli.goal.is_some() || !cli.goal_cmds.is_empty() {
         out.push("goal".to_string());
+    }
+    #[cfg(feature = "ext-adaptive")]
+    if cli.adaptive {
+        out.push("adaptive".to_string());
     }
     #[cfg(feature = "ext-hooks")]
     if !cli.hooks_files.is_empty() || cli.claude_hooks || cli.trust_workspace_hooks {

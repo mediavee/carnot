@@ -4047,3 +4047,132 @@ async fn e2e_bash_streams_live_tool_update_events_and_pty_roundtrip() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[cfg(feature = "ext-adaptive")]
+#[tokio::test]
+async fn e2e_adaptive_effort_routing_and_ephemeral_thrash_guard_preserve_cache() {
+    use carnot::ReasoningEffort;
+
+    let dir = std::env::temp_dir().join(format!("carnot-e2e-adaptive-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::write(dir.join("notes.txt"), "hello adaptive\n").expect("write");
+
+    // Baseline agent WITHOUT AdaptiveModule to prove 0-byte static prefix overhead!
+    let base_faux = Arc::new(FauxProvider::new(vec![ScriptedTurn::text("baseline")]));
+    let base_agent = CarnotBuilder::new(dir.clone())
+        .provider(Arc::clone(&base_faux) as Arc<dyn carnot::Provider>)
+        .sandbox(false)
+        .persist_session(false)
+        .build()
+        .expect("baseline build");
+    let base_prefix = base_agent.prefix_hash().await;
+
+    // Adaptive agent with a cache-preserving provider (`effort_preserves_cache = true`):
+    // Turn 1: Read notes.txt (default High)
+    // Turn 2: Read notes.txt again -> 2nd consecutive read-only turn steps effort down to Low!
+    // Turn 3: Failing Bash #1 (runs at Low, fails -> steps effort back up to High!)
+    // Turn 4: Failing Bash #2 (runs at High)
+    // Turn 5: Failing Bash #3 (runs at High -> triggers 1-turn ephemeral thrash advisory!)
+    // Turn 6: Passing Bash (receives ephemeral advisory in `ephemeral_tail_notes`, NOT `messages`!)
+    // Turn 7: Final answer (ephemeral advisory is GONE — zero permanent context bloat!)
+    let faux = Arc::new(
+        FauxProvider::new(vec![
+            ScriptedTurn::tool_calls(vec![("c1", "Read", json!({"file_path": "notes.txt"}))]),
+            ScriptedTurn::tool_calls(vec![("c2", "Read", json!({"file_path": "notes.txt"}))]),
+            ScriptedTurn::tool_calls(vec![(
+                "c3",
+                "Bash",
+                json!({"command": "echo 'boom 1' >&2; exit 1"}),
+            )]),
+            ScriptedTurn::tool_calls(vec![(
+                "c4",
+                "Bash",
+                json!({"command": "echo 'boom 1' >&2; exit 1"}),
+            )]),
+            ScriptedTurn::tool_calls(vec![(
+                "c5",
+                "Bash",
+                json!({"command": "echo 'boom 1' >&2; exit 1"}),
+            )]),
+            ScriptedTurn::tool_calls(vec![("c6", "Bash", json!({"command": "echo recovered"}))]),
+            ScriptedTurn::text("Recovered after adaptive thrash advisory."),
+        ])
+        .with_effort_preserves_cache(true),
+    );
+
+    let agent = CarnotBuilder::new(dir.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
+        .sandbox(false)
+        .persist_session(false)
+        .adaptive(true)
+        .build()
+        .expect("adaptive build");
+
+    assert_eq!(
+        agent.prefix_hash().await,
+        base_prefix,
+        "AdaptiveModule must add ZERO bytes to the static cached prefix"
+    );
+
+    let outcome = agent.prompt("Investigate and fix").await.expect("prompt");
+    assert_eq!(
+        outcome.final_text,
+        "Recovered after adaptive thrash advisory."
+    );
+    assert_eq!(outcome.metrics.cache_breaks, 0, "zero cache breaks");
+
+    let reqs = faux.recorded_requests();
+    assert_eq!(reqs.len(), 7, "expected 7 turns");
+    // Turn 1: default High; Turn 3 (after 2 read-only turns): Low; Turn 4 (after Bash fail): High!
+    assert_eq!(reqs[0].effort, ReasoningEffort::High, "turn 1 default");
+    assert_eq!(reqs[2].effort, ReasoningEffort::Low, "turn 3 read-only stepdown");
+    assert_eq!(reqs[3].effort, ReasoningEffort::High, "turn 4 failure escalation");
+    assert_eq!(reqs[6].effort, ReasoningEffort::Medium, "turn 7 settled to Medium after passing Bash");
+
+    // Turn 6 (index 5) MUST carry the ephemeral thrash advisory AFTER cache breakpoints,
+    // NEVER persisted into `messages`, and Turn 7 (index 6) MUST NOT repeat it!
+    assert!(
+        reqs[5]
+            .ephemeral_tail_notes
+            .iter()
+            .any(|n| n.contains("[carnot:adaptive]") && n.contains("3 consecutive identical failures")),
+        "Turn 6 must receive one-turn ephemeral thrash advisory: {:?}",
+        reqs[5].ephemeral_tail_notes
+    );
+    assert!(
+        !msgs_json(&reqs[5].messages).contains("[carnot:adaptive]"),
+        "Ephemeral advisory must NOT pollute persisted session messages"
+    );
+    assert!(
+        reqs[6].ephemeral_tail_notes.is_empty(),
+        "Ephemeral advisory must vanish on Turn 7 after recovery: {:?}",
+        reqs[6].ephemeral_tail_notes
+    );
+
+    // Non-cache-preserving provider (`effort_preserves_cache = false`) must keep effort frozen!
+    let rigid_faux = Arc::new(
+        FauxProvider::new(vec![
+            ScriptedTurn::tool_calls(vec![("r1", "Read", json!({"file_path": "notes.txt"}))]),
+            ScriptedTurn::tool_calls(vec![("r2", "Read", json!({"file_path": "notes.txt"}))]),
+            ScriptedTurn::text("done"),
+        ])
+        .with_effort_preserves_cache(false),
+    );
+    let rigid_agent = CarnotBuilder::new(dir.clone())
+        .provider(Arc::clone(&rigid_faux) as Arc<dyn carnot::Provider>)
+        .sandbox(false)
+        .persist_session(false)
+        .adaptive(true)
+        .build()
+        .expect("rigid build");
+    rigid_agent.prompt("Read twice").await.expect("rigid prompt");
+    for (i, r) in rigid_faux.recorded_requests().iter().enumerate() {
+        assert_eq!(
+            r.effort,
+            ReasoningEffort::High,
+            "turn {i}: effort must stay frozen when effort_preserves_cache == false"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

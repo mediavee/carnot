@@ -159,6 +159,7 @@ pub struct FauxProvider {
     cached_prefix_tokens: Arc<Mutex<u64>>,
     last_prefix_hash: Arc<Mutex<Option<String>>>,
     web_caps: ProviderWebCapabilities,
+    effort_cache_safe: bool,
 }
 
 impl FauxProvider {
@@ -169,12 +170,19 @@ impl FauxProvider {
             cached_prefix_tokens: Arc::new(Mutex::new(0)),
             last_prefix_hash: Arc::new(Mutex::new(None)),
             web_caps: ProviderWebCapabilities::default(),
+            effort_cache_safe: false,
         }
     }
 
     #[must_use]
     pub fn with_web_capabilities(mut self, caps: ProviderWebCapabilities) -> Self {
         self.web_caps = caps;
+        self
+    }
+
+    #[must_use]
+    pub fn with_effort_preserves_cache(mut self, preserves: bool) -> Self {
+        self.effort_cache_safe = preserves;
         self
     }
 
@@ -193,6 +201,10 @@ impl Provider for FauxProvider {
 
     fn web_capabilities(&self, _model: &str) -> ProviderWebCapabilities {
         self.web_caps
+    }
+
+    fn effort_preserves_cache(&self, _model: &str) -> bool {
+        self.effort_cache_safe
     }
 
     fn stream(

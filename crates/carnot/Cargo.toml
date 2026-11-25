@@ -23,6 +23,7 @@ ext-claude-plugins = ["dep:carnot-ext-claude-plugins", "ext-hooks"]
 ext-memory = ["dep:carnot-ext-memory"]
 ext-codemode = ["dep:carnot-ext-codemode"]
 ext-goal = ["dep:carnot-ext-goal"]
+ext-adaptive = ["dep:carnot-ext-adaptive"]
 all-ext = [
     "ext-web",
     "ext-lsp",
@@ -32,6 +33,7 @@ all-ext = [
     "ext-memory",
     "ext-codemode",
     "ext-goal",
+    "ext-adaptive",
 ]
 
 [dependencies]
@@ -40,6 +42,7 @@ carnot-ai.workspace = true
 carnot-cas.workspace = true
 carnot-core.workspace = true
 carnot-ext.workspace = true
+carnot-ext-adaptive = { workspace = true, optional = true }
 carnot-ext-claude-plugins = { workspace = true, optional = true }
 carnot-ext-codemode = { workspace = true, optional = true }
 carnot-ext-goal = { workspace = true, optional = true }

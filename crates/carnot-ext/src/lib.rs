@@ -58,8 +58,14 @@ pub trait UserQuestionBroker: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Clone)]
 pub enum BoundaryAction {
     Continue,
-    /// Append an advisory `system` note (append-only, cache-safe).
+    /// Append an advisory `system` note (append-only, persisted to session, cache-safe).
     AppendAdvisory {
+        signal: String,
+        message: String,
+    },
+    /// Attach a one-turn ephemeral advisory note AFTER all provider cache breakpoints
+    /// (`ephemeral_tail_notes`, never persisted to session history — zero context bloat).
+    AppendEphemeralAdvisory {
         signal: String,
         message: String,
     },

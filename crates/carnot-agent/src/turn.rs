@@ -262,6 +262,7 @@ impl Agent {
 
         // Collect per-prompt module injections (`before_prompt`: durable vs ephemeral)
         let mut ephemeral_notes: Vec<String> = Vec::new();
+        let mut next_turn_ephemeral_advisories: Vec<String> = Vec::new();
         let mut durable_notes: Vec<String> = Vec::new();
         if !continue_existing {
             for m in &self.modules {
@@ -365,6 +366,8 @@ impl Agent {
                     &self.tools.specs(),
                     active_provider.supports_native_tool_search(),
                 );
+                let mut turn_ephemeral_notes = ephemeral_notes.clone();
+                turn_ephemeral_notes.append(&mut next_turn_ephemeral_advisories);
                 let req = ProviderRequest {
                     model: eff_cfg.model.clone(),
                     static_system_prompt: proj.static_system_prompt,
@@ -378,7 +381,7 @@ impl Agent {
                     max_output_tokens: eff_cfg.max_output_tokens,
                     skip_tail_cache_write: false,
                     native_web: eff_cfg.native_web.clone(),
-                    ephemeral_tail_notes: ephemeral_notes.clone(),
+                    ephemeral_tail_notes: turn_ephemeral_notes,
                 };
                 (req, turn_num, ctx_est)
             };
@@ -855,6 +858,14 @@ impl Agent {
                                 .lock()
                                 .await
                                 .push_message(Message::system_note(message.clone()))?;
+                            self.events
+                                .push(AgentEvent::ModuleAdvisory { signal, message });
+                        }
+                        BoundaryAction::AppendEphemeralAdvisory { signal, message } => {
+                            let trimmed = message.trim();
+                            if !trimmed.is_empty() {
+                                next_turn_ephemeral_advisories.push(trimmed.to_string());
+                            }
                             self.events
                                 .push(AgentEvent::ModuleAdvisory { signal, message });
                         }

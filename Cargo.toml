@@ -22,6 +22,7 @@ members = [
     "extensions/carnot-ext-memory",
     "extensions/carnot-ext-codemode",
     "extensions/carnot-ext-goal",
+    "extensions/carnot-ext-adaptive",
 ]
 
 [workspace.package]
@@ -124,6 +125,7 @@ carnot-ext-claude-plugins = { version = "0.1.0", path = "extensions/carnot-ext-c
 carnot-ext-memory = { version = "0.1.0", path = "extensions/carnot-ext-memory" }
 carnot-ext-codemode = { version = "0.1.0", path = "extensions/carnot-ext-codemode" }
 carnot-ext-goal = { version = "0.1.0", path = "extensions/carnot-ext-goal" }
+carnot-ext-adaptive = { version = "0.1.0", path = "extensions/carnot-ext-adaptive" }
 
 [profile.release]
 opt-level = 3

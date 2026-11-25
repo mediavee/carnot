@@ -60,6 +60,8 @@ pub use carnot_ext::{
     prefix_guard::assert_prefix_invariance,
     warm_fork::{IsolatedForkWorktree, LandOutcome},
 };
+#[cfg(feature = "ext-adaptive")]
+pub use carnot_ext_adaptive::{AdaptiveConfig, AdaptiveModule, AdaptiveTelemetry};
 #[cfg(feature = "ext-claude-plugins")]
 pub use carnot_ext_claude_plugins::{
     ClaudePluginsConfig, ClaudePluginsModule, LoadedClaudePlugin, PluginAsset,
@@ -150,6 +152,8 @@ pub struct CarnotBuilder {
     goal_handle: Option<GoalHandle>,
     #[cfg(feature = "ext-goal")]
     goal_verifier_override: Option<(Arc<dyn Provider>, String)>,
+    #[cfg(feature = "ext-adaptive")]
+    adaptive_config: Option<AdaptiveConfig>,
 }
 
 impl CarnotBuilder {
@@ -185,6 +189,8 @@ impl CarnotBuilder {
             goal_handle: None,
             #[cfg(feature = "ext-goal")]
             goal_verifier_override: None,
+            #[cfg(feature = "ext-adaptive")]
+            adaptive_config: None,
         }
     }
 
@@ -418,6 +424,21 @@ impl CarnotBuilder {
         model: impl Into<String>,
     ) -> Self {
         self.goal_verifier_override = Some((provider, model.into()));
+        self
+    }
+
+    /// Enables or disables cache-safe adaptive reasoning-effort routing + ephemeral thrash /
+    /// edit-oscillation guard (`AdaptiveModule`). Zero static prefix overhead.
+    #[cfg(feature = "ext-adaptive")]
+    pub fn adaptive(mut self, enabled: bool) -> Self {
+        self.adaptive_config = enabled.then(AdaptiveConfig::default);
+        self
+    }
+
+    /// Configures `AdaptiveModule` with custom effort bounds and thrash/oscillation thresholds.
+    #[cfg(feature = "ext-adaptive")]
+    pub fn adaptive_config(mut self, cfg: AdaptiveConfig) -> Self {
+        self.adaptive_config = Some(cfg);
         self
     }
 
@@ -778,6 +799,14 @@ impl CarnotBuilder {
                 None
             }
         };
+        #[cfg(feature = "ext-adaptive")]
+        if let Some(cfg) = self.adaptive_config.clone() {
+            modules.push(Arc::new(AdaptiveModule::new(
+                self.config.workspace_root.clone(),
+                self.config.extra_writable_roots.clone(),
+                cfg,
+            )));
+        }
         modules.extend(self.extra_modules);
         // Always run PolicyGuard LAST so `RewriteInput` from earlier modules can never bypass it!
         if let Some(pm) = policy_mod {

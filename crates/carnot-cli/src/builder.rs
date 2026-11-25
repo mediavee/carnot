@@ -201,6 +201,10 @@ pub(crate) async fn build_agent_full(
         // so interactive TUI `/goal`, RPC `set_goal`, and HTTP `POST /v1/goal` work live.
         b = b.goal_handle(carnot::GoalHandle::new(gc));
     }
+    #[cfg(feature = "ext-adaptive")]
+    if cli.adaptive {
+        b = b.adaptive(true);
+    }
     for ext in &cli.extensions {
         b = b.extension(ext.clone());
     }

@@ -28,6 +28,7 @@ ext-claude-plugins = ["carnot/ext-claude-plugins"]
 ext-memory = ["carnot/ext-memory"]
 ext-codemode = ["carnot/ext-codemode"]
 ext-goal = ["carnot/ext-goal"]
+ext-adaptive = ["carnot/ext-adaptive"]
 all-ext = [
     "ext-web",
     "ext-lsp",
@@ -37,6 +38,7 @@ all-ext = [
     "ext-memory",
     "ext-codemode",
     "ext-goal",
+    "ext-adaptive",
 ]
 
 [dependencies]

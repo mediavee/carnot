@@ -256,6 +256,7 @@ dependencies = [
  "carnot-cas",
  "carnot-core",
  "carnot-ext",
+ "carnot-ext-adaptive",
  "carnot-ext-claude-plugins",
  "carnot-ext-codemode",
  "carnot-ext-goal",
@@ -367,6 +368,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "carnot-ext-adaptive"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "carnot-core",
+ "carnot-ext",
+ "carnot-tools",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
