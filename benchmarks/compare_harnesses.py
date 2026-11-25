@@ -679,13 +679,27 @@ def build_harnesses(port: int) -> List[Dict[str, Any]]:
     harnesses = [
         {
             "id": "carnot",
-            "label": "Carnot (Rust)",
+            "label": "Carnot (Rust, standalone)",
             "protocol": "anthropic-messages",
             "binary_mb": round(resolve_real_file_mb(carnot_bin), 1),
             "closure_mb": round(resolve_real_file_mb(carnot_bin), 1),
             "cmd": lambda cwd: [
                 carnot_bin, "--provider", "anthropic", "--model", "claude-sonnet-4-5-20250929",
                 "--no-session", "-C", cwd, "-p", "Reply OK",
+            ],
+            "env": base_env,
+            "setup_home": None,
+        },
+        {
+            "id": "carnot-core",
+            "label": "Carnot (Rust, 5-tool core)",
+            "protocol": "anthropic-messages",
+            "binary_mb": round(resolve_real_file_mb(carnot_bin), 1),
+            "closure_mb": round(resolve_real_file_mb(carnot_bin), 1),
+            "cmd": lambda cwd: [
+                carnot_bin, "--provider", "anthropic", "--model", "claude-sonnet-4-5-20250929",
+                "--no-session", "--no-web", "--no-lsp", "--no-memory", "--no-subagent", "--no-codemode",
+                "-C", cwd, "-p", "Reply OK",
             ],
             "env": base_env,
             "setup_home": None,
@@ -787,14 +801,18 @@ def main():
 
         for h in harnesses:
             hid = h["id"]
+            cmd_a = h["cmd"](str(ws_a))
+            cmd_b = h["cmd"](str(ws_b))
+            exe = cmd_a[0] if cmd_a else ""
+            if not exe or not (os.path.isfile(exe) or shutil.which(exe)):
+                print(f"\n>>> Skipping {h['label']} ({hid}): binary not installed.", file=sys.stderr, flush=True)
+                continue
             print(f"\n>>> Benchmarking {h['label']} ({hid}) ...", file=sys.stderr, flush=True)
             home_dir = Path(tmp_root) / f"home-{hid}"
             home_dir.mkdir(parents=True, exist_ok=True)
             if h["setup_home"]:
                 h["setup_home"](str(home_dir))
             env = h["env"](str(home_dir))
-            cmd_a = h["cmd"](str(ws_a))
-            cmd_b = h["cmd"](str(ws_b))
 
             # 1) Probe + Warmups (also filters out Gatekeeper/first-run cold cost & kernel download)
             probe_ok = False
