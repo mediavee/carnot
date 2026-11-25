@@ -26,6 +26,10 @@ class CarnotClient:
         profile: str | None = None,
         effort: str | None = None,
         cache_ttl: str | None = None,
+        goal: str | None = None,
+        goal_cmds: list[str] | None = None,
+        goal_max_iter: int | None = None,
+        goal_model: str | None = None,
         no_session: bool = False,
         extra_args: list[str] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -37,6 +41,10 @@ class CarnotClient:
         self.profile = profile
         self.effort = effort
         self.cache_ttl = cache_ttl
+        self.goal = goal
+        self.goal_cmds = list(goal_cmds or [])
+        self.goal_max_iter = goal_max_iter
+        self.goal_model = goal_model
         self.no_session = no_session
         self.extra_args = list(extra_args or [])
         self.on_event = on_event
@@ -57,6 +65,14 @@ class CarnotClient:
             args.extend(["--effort", self.effort])
         if self.cache_ttl:
             args.extend(["--cache-ttl", self.cache_ttl])
+        if self.goal:
+            args.extend(["--goal", self.goal])
+        for cmd in self.goal_cmds:
+            args.extend(["--goal-cmd", cmd])
+        if self.goal_max_iter is not None:
+            args.extend(["--goal-max-iter", str(self.goal_max_iter)])
+        if self.goal_model:
+            args.extend(["--goal-model", self.goal_model])
         if self.no_session:
             args.append("--no-session")
         args.extend(self.extra_args)
@@ -191,6 +207,34 @@ class CarnotClient:
     async def set_cache_ttl(self, ttl: str) -> dict[str, Any]:
         """Set prompt-cache retention tier (`short`, `hybrid`, or `long`)."""
         return await self.call("set_cache_ttl", {"ttl": ttl})
+
+    async def goal_status(self) -> dict[str, Any]:
+        """Inspect active goal verification status and progress."""
+        return await self.call("goal_status")
+
+    async def set_goal(
+        self,
+        criterion: str | None = None,
+        verify_commands: list[str] | None = None,
+        *,
+        max_iterations: int | None = None,
+        verifier_model: str | None = None,
+    ) -> dict[str, Any]:
+        """Configure or replace the active autonomous verification goal live."""
+        params: dict[str, Any] = {}
+        if criterion is not None:
+            params["criterion"] = criterion
+        if verify_commands is not None:
+            params["verify_commands"] = verify_commands
+        if max_iterations is not None:
+            params["max_iterations"] = max_iterations
+        if verifier_model is not None:
+            params["verifier_model"] = verifier_model
+        return await self.call("set_goal", params)
+
+    async def clear_goal(self) -> dict[str, Any]:
+        """Clear any active goal so the session settles normally."""
+        return await self.call("clear_goal")
 
     async def get_available_models(self) -> dict[str, Any]:
         return await self.call("get_available_models")

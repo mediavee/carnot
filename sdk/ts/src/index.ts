@@ -4,6 +4,31 @@
 
 export type CacheRetention = "short" | "hybrid" | "long";
 
+export type GoalStatus =
+  | "idle"
+  | "running"
+  | "met"
+  | "unreachable"
+  | "stagnated"
+  | "max_iterations"
+  | "cleared";
+
+export interface GoalState {
+  status: GoalStatus;
+  criterion: string | null;
+  verify_commands: string[];
+  iterations: number;
+  max_iterations: number;
+  last_feedback: string | null;
+}
+
+export interface GoalConfigInput {
+  criterion?: string;
+  verify_commands?: string[];
+  max_iterations?: number;
+  verifier_model?: string;
+}
+
 export interface SessionMetrics {
   turns: number;
   requests: number;
@@ -98,6 +123,33 @@ export class CarnotHttpClient {
       method: "POST",
       headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ ttl }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async goalStatus(): Promise<GoalState> {
+    const res = await fetch(`${this.baseUrl}/v1/goal`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async setGoal(input: GoalConfigInput): Promise<GoalState> {
+    const res = await fetch(`${this.baseUrl}/v1/goal`, {
+      method: "POST",
+      headers: this.authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async clearGoal(): Promise<GoalState> {
+    const res = await fetch(`${this.baseUrl}/v1/goal`, {
+      method: "DELETE",
+      headers: this.authHeaders(),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();

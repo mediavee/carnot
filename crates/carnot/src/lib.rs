@@ -48,8 +48,8 @@ pub use carnot_core::{
     ToolSpec, Usage, UserQuestion, UserQuestionAnswer, UserQuestionOption, canonicalize_json,
 };
 pub use carnot_ext::{
-    BoundaryAction, CompactionHookAction, CompactionHookContext, Module, PermissionBroker,
-    PromptInjection, ToolGateDecision, TurnBoundarySnapshot, UserQuestionBroker,
+    BoundaryAction, CompactionHookAction, CompactionHookContext, GoalController, Module,
+    PermissionBroker, PromptInjection, ToolGateDecision, TurnBoundarySnapshot, UserQuestionBroker,
     ask_user::{AskUserModule, SharedQuestionBroker},
     dropin::{
         DropinExtension, DropinExtensionSpec, FailurePolicy, discover_dropin_specs,
@@ -816,6 +816,7 @@ impl CarnotBuilder {
         #[cfg(feature = "ext-goal")]
         if let Some(ref gm) = goal_mod {
             gm.attach_parent(&agent);
+            agent.set_goal_controller(Arc::new(gm.handle()));
         }
         Ok(agent)
     }

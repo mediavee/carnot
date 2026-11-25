@@ -1596,7 +1596,7 @@ async fn build_agent_full(
         b = b.codemode(true);
     }
     #[cfg(feature = "ext-goal")]
-    if cli.goal.is_some() || !cli.goal_cmds.is_empty() {
+    {
         let mut gc = carnot::GoalConfig::default();
         gc.criterion.clone_from(&cli.goal);
         gc.verify_commands.clone_from(&cli.goal_cmds);
@@ -1604,7 +1604,9 @@ async fn build_agent_full(
             gc.max_iterations = max_iter.max(1);
         }
         gc.verifier_model.clone_from(&cli.goal_model);
-        b = b.goal_config(gc);
+        // Always attach a lightweight GoalHandle (0 static prefix bytes; dormant until configured)
+        // so interactive TUI `/goal`, RPC `set_goal`, and HTTP `POST /v1/goal` work live.
+        b = b.goal_handle(carnot::GoalHandle::new(gc));
     }
     for ext in &cli.extensions {
         b = b.extension(ext.clone());

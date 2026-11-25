@@ -80,7 +80,8 @@ impl GoalConfig {
 }
 
 /// Lifecycle state of an active or completed goal loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
     Idle,
     Running,
@@ -106,7 +107,7 @@ impl GoalStatus {
 }
 
 /// Snapshot of the current goal loop state (for CLI/TUI `/goal` status displays).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GoalState {
     pub status: GoalStatus,
     pub criterion: Option<String>,
@@ -213,6 +214,45 @@ impl GoalHandle {
         g.status = GoalStatus::Cleared;
         g.last_failure_fingerprint = None;
         g.consecutive_same_failure = 0;
+    }
+}
+
+impl carnot_ext::GoalController for GoalHandle {
+    fn status_json(&self) -> serde_json::Value {
+        serde_json::to_value(self.status()).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn set_goal(
+        &self,
+        criterion: Option<String>,
+        verify_commands: Vec<String>,
+        max_iterations: Option<u32>,
+        verifier_model: Option<String>,
+    ) -> serde_json::Value {
+        let mut cfg = GoalConfig {
+            criterion: criterion
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            verify_commands: verify_commands
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            verifier_model: verifier_model
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            ..GoalConfig::default()
+        };
+        if let Some(m) = max_iterations {
+            cfg.max_iterations = m.max(1);
+        }
+        self.set(cfg);
+        self.status_json()
+    }
+
+    fn clear_goal(&self) -> serde_json::Value {
+        self.clear();
+        self.status_json()
     }
 }
 

@@ -366,6 +366,83 @@ impl TuiApp {
                 );
                 self.push_notice(NoticeKind::Info, "Prompt Cache Audit", Some(body));
             }
+            "goal" => {
+                let Some(ctrl) = self.agent.goal_controller() else {
+                    self.push_notice(
+                        NoticeKind::Warning,
+                        "Goal verification extension is not enabled in this build.",
+                        None,
+                    );
+                    return false;
+                };
+                let arg = rest.trim();
+                if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
+                    let st = ctrl.status_json();
+                    let status = st
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("idle");
+                    let iter = st
+                        .get("iterations")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let max_iter = st
+                        .get("max_iterations")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(8);
+                    let criterion = st
+                        .get("criterion")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("(none)");
+                    let cmds: Vec<&str> = st
+                        .get("verify_commands")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+                        .unwrap_or_default();
+                    let fb = st
+                        .get("last_feedback")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-");
+                    let cmds_str = if cmds.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        cmds.join(" && ")
+                    };
+                    let body = format!(
+                        "  Status:     {status} ({iter}/{max_iter} iterations)\n  Criterion:  {criterion}\n  Commands:   {cmds_str}\n  Feedback:   {fb}\n  Usage:      /goal <criterion> | /goal --cmd <sh> | /goal clear"
+                    );
+                    self.push_notice(NoticeKind::Info, "Goal Verification", Some(body));
+                } else if arg.eq_ignore_ascii_case("clear") || arg.eq_ignore_ascii_case("off") {
+                    let _ = ctrl.clear_goal();
+                    self.push_notice(NoticeKind::Success, "Active goal cleared.", None);
+                } else if let Some(cmd_body) = arg
+                    .strip_prefix("--cmd ")
+                    .or_else(|| arg.strip_prefix("cmd:"))
+                {
+                    let cmd_clean = cmd_body.trim();
+                    if cmd_clean.is_empty() {
+                        self.push_notice(
+                            NoticeKind::Warning,
+                            "Usage: /goal --cmd <shell command>",
+                            None,
+                        );
+                    } else {
+                        let _ = ctrl.set_goal(None, vec![cmd_clean.to_string()], None, None);
+                        self.push_notice(
+                            NoticeKind::Success,
+                            format!("Goal check set → `{cmd_clean}`"),
+                            None,
+                        );
+                    }
+                } else {
+                    let _ = ctrl.set_goal(Some(arg.to_string()), Vec::new(), None, None);
+                    self.push_notice(
+                        NoticeKind::Success,
+                        format!("Goal criterion set → {arg}"),
+                        None,
+                    );
+                }
+            }
             "fleet" => {
                 if self.workers.is_empty() {
                     self.push_notice(

@@ -306,6 +306,7 @@ pub struct Agent {
     pending_follow_ups: Mutex<VecDeque<String>>,
     permission_broker: Mutex<Option<Arc<dyn PermissionBroker>>>,
     question_broker: SharedQuestionBroker,
+    goal_controller: std::sync::RwLock<Option<Arc<dyn carnot_ext::GoalController>>>,
     deferred_server_descriptions: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     /// Live runtime prefix-freeze fingerprint checked before every provider request (< 5 µs)
     /// to detect unexpected static-prefix or reused-history cache breaks immediately.
@@ -630,6 +631,7 @@ impl Agent {
             pending_follow_ups: Mutex::new(VecDeque::new()),
             permission_broker: Mutex::new(None),
             question_broker,
+            goal_controller: std::sync::RwLock::new(None),
             deferred_server_descriptions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             last_prefix_state: Mutex::new(None),
             last_prompt_context_tokens: Mutex::new(None),
@@ -761,6 +763,18 @@ impl Agent {
     /// delegate approvals to the parent broker instead of bypassing user consent!).
     pub async fn permission_broker(&self) -> Option<Arc<dyn PermissionBroker>> {
         self.permission_broker.lock().await.clone()
+    }
+
+    /// Attaches a runtime `GoalController` (from `carnot-ext-goal`) for live TUI/RPC/HTTP control.
+    pub fn set_goal_controller(&self, controller: Arc<dyn carnot_ext::GoalController>) {
+        if let Ok(mut g) = self.goal_controller.write() {
+            *g = Some(controller);
+        }
+    }
+
+    /// Returns the attached `GoalController`, if goal mode is available on this agent.
+    pub fn goal_controller(&self) -> Option<Arc<dyn carnot_ext::GoalController>> {
+        self.goal_controller.read().ok().and_then(|g| g.clone())
     }
 
     /// Returns a clone of the current run's `CancellationToken` so module hooks (such as reactive

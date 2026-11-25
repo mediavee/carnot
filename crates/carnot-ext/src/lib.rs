@@ -197,3 +197,24 @@ pub trait Module: Send + Sync + std::fmt::Debug {
         Box::pin(async { Ok(CompactionHookAction::Continue) })
     }
 }
+
+/// Lightweight runtime control bridge for goal-driven verification (`carnot-ext-goal`).
+///
+/// Exposed via `Agent::goal_controller()` so TUI (`/goal`), RPC, HTTP, and SDKs can inspect,
+/// set, or clear an active goal live without coupling core crates to `carnot-ext-goal`.
+pub trait GoalController: Send + Sync + std::fmt::Debug {
+    /// Returns a JSON snapshot of the current goal state.
+    fn status_json(&self) -> Value;
+
+    /// Replaces the active goal configuration and returns the updated JSON state.
+    fn set_goal(
+        &self,
+        criterion: Option<String>,
+        verify_commands: Vec<String>,
+        max_iterations: Option<u32>,
+        verifier_model: Option<String>,
+    ) -> Value;
+
+    /// Clears any active goal and returns the updated JSON state.
+    fn clear_goal(&self) -> Value;
+}

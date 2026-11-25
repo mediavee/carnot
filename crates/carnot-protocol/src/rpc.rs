@@ -818,6 +818,58 @@ async fn serve_rpc_loop(
                     })
                 }
             }
+            "goal_status" => match agent.goal_controller() {
+                Some(ctrl) => json!({"jsonrpc": "2.0", "id": id, "result": ctrl.status_json()}),
+                None => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": "goal extension not enabled on this agent"}
+                }),
+            },
+            "set_goal" => match agent.goal_controller() {
+                Some(ctrl) => {
+                    let criterion = params
+                        .get("criterion")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let verify_commands: Vec<String> = params
+                        .get("verify_commands")
+                        .or_else(|| params.get("commands"))
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let max_iterations = params
+                        .get("max_iterations")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok());
+                    let verifier_model = params
+                        .get("verifier_model")
+                        .or_else(|| params.get("model"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let st =
+                        ctrl.set_goal(criterion, verify_commands, max_iterations, verifier_model);
+                    json!({"jsonrpc": "2.0", "id": id, "result": st})
+                }
+                None => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": "goal extension not enabled on this agent"}
+                }),
+            },
+            "clear_goal" => match agent.goal_controller() {
+                Some(ctrl) => json!({"jsonrpc": "2.0", "id": id, "result": ctrl.clear_goal()}),
+                None => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": "goal extension not enabled on this agent"}
+                }),
+            },
             "get_available_models" => {
                 let models = host.as_ref().map(|h| h.list_models()).unwrap_or_default();
                 json!({

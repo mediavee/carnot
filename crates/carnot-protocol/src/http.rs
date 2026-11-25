@@ -453,6 +453,67 @@ async fn handle_conn(
                 }
             }
         }
+        ("GET", "/v1/goal") => match agent.goal_controller() {
+            Some(ctrl) => write_json(&mut write_half, 200, &ctrl.status_json()).await,
+            None => {
+                write_json(
+                    &mut write_half,
+                    501,
+                    &json!({"error": "goal extension not enabled on this agent"}),
+                )
+                .await
+            }
+        },
+        ("POST", "/v1/goal") => match agent.goal_controller() {
+            Some(ctrl) => {
+                let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let criterion = payload
+                    .get("criterion")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let verify_commands: Vec<String> = payload
+                    .get("verify_commands")
+                    .or_else(|| payload.get("commands"))
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let max_iterations = payload
+                    .get("max_iterations")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                let verifier_model = payload
+                    .get("verifier_model")
+                    .or_else(|| payload.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let st = ctrl.set_goal(criterion, verify_commands, max_iterations, verifier_model);
+                write_json(&mut write_half, 200, &st).await
+            }
+            None => {
+                write_json(
+                    &mut write_half,
+                    501,
+                    &json!({"error": "goal extension not enabled on this agent"}),
+                )
+                .await
+            }
+        },
+        ("DELETE", "/v1/goal") => match agent.goal_controller() {
+            Some(ctrl) => write_json(&mut write_half, 200, &ctrl.clear_goal()).await,
+            None => {
+                write_json(
+                    &mut write_half,
+                    501,
+                    &json!({"error": "goal extension not enabled on this agent"}),
+                )
+                .await
+            }
+        },
         ("GET", "/v1/events") => {
             let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
             write_half.write_all(hdr.as_bytes()).await?;

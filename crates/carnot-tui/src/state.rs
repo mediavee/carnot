@@ -81,6 +81,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashSpec] = &[
         desc: "Show prompt-cache audit, prefix hash & TTL tiers",
     },
     SlashSpec {
+        name: "goal",
+        usage: "/goal [criterion | --cmd <sh> | clear]",
+        desc: "Configure, inspect, or clear autonomous goal verification",
+    },
+    SlashSpec {
         name: "fleet",
         usage: "/fleet",
         desc: "Show live status of background subagent workers",

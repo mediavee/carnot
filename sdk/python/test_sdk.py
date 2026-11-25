@@ -54,6 +54,19 @@ class TestCarnotSdk(unittest.TestCase):
                     self.assertIn("prefix_retention_rate", stats)
                     cmds = await client.get_commands()
                     self.assertIsInstance(cmds, dict)
+                    g0 = await client.goal_status()
+                    self.assertEqual(g0["status"], "idle")
+                    g1 = await client.set_goal(
+                        criterion="All tests pass",
+                        verify_commands=["true"],
+                        max_iterations=4,
+                    )
+                    self.assertEqual(g1["status"], "running")
+                    self.assertEqual(g1["criterion"], "All tests pass")
+                    self.assertEqual(g1["verify_commands"], ["true"])
+                    self.assertEqual(g1["max_iterations"], 4)
+                    g2 = await client.clear_goal()
+                    self.assertEqual(g2["status"], "cleared")
 
         asyncio.run(run())
 
