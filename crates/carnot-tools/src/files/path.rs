@@ -74,7 +74,8 @@ fn resolve_with_symlinks(candidate: &Path, depth: usize) -> std::result::Result<
             normalize_lexical(&link_target)
         } else {
             let parent = existing.parent().unwrap_or_else(|| Path::new("/"));
-            normalize_lexical(&parent.join(link_target))
+            let canon_parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            normalize_lexical(&canon_parent.join(link_target))
         };
         resolve_with_symlinks(&next, depth + 1)?
     } else {
@@ -144,6 +145,59 @@ pub(super) fn effect_key_path(
     }
 }
 
+/// Maximum file size `Edit` / `Write` will load into memory (guards against OOM & non-regular files).
+pub(super) const MAX_EDITABLE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Verifies `path` is a regular file within `MAX_EDITABLE_FILE_BYTES` (prevents FIFO hangs & OOM).
+pub(super) fn validate_regular_file_for_read(path: &Path) -> std::result::Result<(), String> {
+    let meta = fs::metadata(path).map_err(|e| format!("Cannot stat {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "Refusing to read non-regular file `{}`",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_EDITABLE_FILE_BYTES {
+        return Err(format!(
+            "Refusing to load `{}` ({} bytes exceeds {} byte edit safety limit)",
+            path.display(),
+            meta.len(),
+            MAX_EDITABLE_FILE_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// Enforces the same `.git` read-only invariant as `carnot-sandbox` for in-process `Edit`/`Write`
+/// tools so hooks (`core.hooksPath`, `.git/hooks/*`) and `.git/config` cannot be modified.
+pub(super) fn reject_protected_git_write(
+    workspace_root: &Path,
+    resolved_target: &Path,
+) -> std::result::Result<(), String> {
+    let is_dot_git = |c: std::path::Component<'_>| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+    };
+    let ws_canon =
+        fs::canonicalize(workspace_root).unwrap_or_else(|_| normalize_lexical(workspace_root));
+    if let Ok(rel) = resolved_target.strip_prefix(&ws_canon)
+        && rel.components().any(is_dot_git)
+    {
+        return Err(format!(
+            "refusing to write inside protected `.git` metadata path `{}`",
+            resolved_target.display()
+        ));
+    }
+    if resolved_target.components().any(is_dot_git) {
+        return Err(format!(
+            "refusing to write inside protected `.git` metadata path `{}`",
+            resolved_target.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Symlink-safe, permission-preserving atomic write with temp cleanup on failure.
 pub(super) fn atomic_write_confined(
     workspace_root: &Path,
@@ -159,6 +213,7 @@ pub(super) fn atomic_write_confined(
     } else {
         path.to_path_buf()
     };
+    reject_protected_git_write(workspace_root, &target)?;
 
     let existing_perms = fs::metadata(&target).ok().map(|m| m.permissions());
 

@@ -1,6 +1,9 @@
 //! Canonical `Edit` tool: atomic line-range & resilient 4-tier text patching with CAS Undo and syntax guard.
 
-use super::path::{atomic_write_confined, effect_key_path, resolve_confined_path};
+use super::path::{
+    atomic_write_confined, effect_key_path, reject_protected_git_write, resolve_confined_path,
+    validate_regular_file_for_read,
+};
 use crate::syntax::syntax_regression_warning;
 use crate::{BoxFuture, Tool, UndoEntry, UndoKind};
 use carnot_cas::CasStore;
@@ -280,6 +283,12 @@ impl Tool for EditTool {
                     Ok(p) => p,
                     Err(msg) => return Ok(ToolOutput::err_text(msg)),
                 };
+                if let Err(msg) = reject_protected_git_write(&ws, &path) {
+                    return Ok(ToolOutput::err_text(msg));
+                }
+                if let Err(msg) = validate_regular_file_for_read(&path) {
+                    return Ok(ToolOutput::err_text(msg));
+                }
                 let before = match fs::read_to_string(&path) {
                     Ok(s) => s,
                     Err(e) => return Ok(ToolOutput::err_text(format!("Cannot read {}: {e}", path.display()))),

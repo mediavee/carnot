@@ -339,6 +339,15 @@ mod tests {
         fs::create_dir_all(&dir).expect("mkdir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("chmod 555");
 
+        // When running as root (CAP_DAC_OVERRIDE), chmod 0555 still allows writes; skip cleanly.
+        let probe = dir.join(".ro-probe");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
         let store = CasStore::open(&dir).expect("fallback cas should open cleanly");
         assert!(!store.root().starts_with(&dir));
         let h = store.put_text("hello from ro workspace\n").expect("put");

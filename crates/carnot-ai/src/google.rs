@@ -386,9 +386,9 @@ impl GoogleProvider {
         let compat = self.spec.effective_compat(&req.model);
         let inner = self.build_inner_body(req);
         let mut body = if self.cloudcode_envelope {
+            let prefix_short: String = req.prefix_hash.chars().take(8).collect();
             let req_id = format!(
-                "carnot-{}-{}",
-                &req.prefix_hash[..8.min(req.prefix_hash.len())],
+                "carnot-{prefix_short}-{}",
                 SYNTHETIC_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
             );
             let mut env = json!({
@@ -549,39 +549,52 @@ impl Provider for GoogleProvider {
                 let mut usage = Usage::default();
                 let mut stop_reason = StopReason::EndTurn;
                 let mut saw_any_candidate = false;
+                let mut stream_eof = false;
 
                 loop {
-                    let next_chunk = tokio::select! {
-                        _ = cancel.cancelled() => {
-                            let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
-                            return;
-                        }
-                        res = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => res,
-                    };
+                    if !stream_eof {
+                        let next_chunk = tokio::select! {
+                            _ = cancel.cancelled() => {
+                                let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
+                                return;
+                            }
+                            res = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => res,
+                        };
 
-                    let chunk_opt = match next_chunk {
-                        Ok(opt) => opt,
-                        Err(_) => {
-                            let _ = tx
-                                .send(StreamEvent::Error {
-                                    message: "stream idle timeout (120s)".into(),
-                                    retryable: true,
-                                })
-                                .await;
-                            return;
+                        let chunk_opt = match next_chunk {
+                            Ok(opt) => opt,
+                            Err(_) => {
+                                let _ = tx
+                                    .send(StreamEvent::Error {
+                                        message: "stream idle timeout (300s)".into(),
+                                        retryable: true,
+                                    })
+                                    .await;
+                                return;
+                            }
+                        };
+                        match chunk_opt {
+                            Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
+                            Some(Err(_)) => {
+                                let _ = tx
+                                    .send(StreamEvent::Error {
+                                        message: "stream read error".into(),
+                                        retryable: true,
+                                    })
+                                    .await;
+                                return;
+                            }
+                            None => {
+                                stream_eof = true;
+                                if raw_buf.is_empty() {
+                                    break;
+                                }
+                                raw_buf.extend_from_slice(b"\n\n");
+                            }
                         }
-                    };
-                    let Some(chunk) = chunk_opt else { break };
-                    let Ok(bytes) = chunk else {
-                        let _ = tx
-                            .send(StreamEvent::Error {
-                                message: "stream read error".into(),
-                                retryable: true,
-                            })
-                            .await;
-                        return;
-                    };
-                    raw_buf.extend_from_slice(&bytes);
+                    } else {
+                        break;
+                    }
 
                     while let Some((end, delim_len)) = find_sse_frame_end(&raw_buf) {
                         let frame_bytes: Vec<u8> = raw_buf.drain(..end + delim_len).collect();

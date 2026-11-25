@@ -1221,7 +1221,7 @@ fn build_mcp_http_client(
     timeout_secs: Option<u64>,
 ) -> Result<reqwest::Client> {
     if enforce_ssrf {
-        return crate::ssrf::build_ssrf_safe_client(timeout_secs.unwrap_or(60))
+        return crate::ssrf::build_ssrf_safe_client_with_timeout(timeout_secs)
             .map_err(CarnotError::Sandbox);
     }
     let make = || {

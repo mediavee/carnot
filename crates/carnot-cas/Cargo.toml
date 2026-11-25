@@ -2,6 +2,7 @@
 name = "carnot-cas"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Content-addressed BLAKE3 tool-output spill store and shape summarization for Carnot"

@@ -1,6 +1,6 @@
-//! The 4 Canonical LID Tools (`Bash`, `Read`, `Edit`, `Write`, ~700 tokens total),
+//! The 5 Canonical Core Tools (`Bash`, `Read`, `Edit`, `Write`, `Grep`),
 //! tree-sitter Tier-0 silent syntax delta & structural outliner, disk-coherent read tracker,
-//! adaptive-yield sandboxed shell, and deferred MCP stdio client.
+//! and adaptive-yield sandboxed shell.
 
 pub mod bash;
 pub mod files;

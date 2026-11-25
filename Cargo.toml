@@ -24,9 +24,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mediavee/carnot"
 description = "Fast, safe Rust coding-agent harness with prefix-invariant caching and fail-closed OS sandboxing"
+keywords = ["ai", "agent", "llm", "cli", "coding-agent"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -64,23 +67,23 @@ url = "2.5"
 uuid = { version = "1.29", features = ["v4", "v7", "serde"] }
 webpki-root-certs = "1"
 
-carnot-core = { path = "crates/carnot-core" }
-carnot-cas = { path = "crates/carnot-cas" }
-carnot-sandbox = { path = "crates/carnot-sandbox" }
-carnot-session = { path = "crates/carnot-session" }
-carnot-ai = { path = "crates/carnot-ai" }
-carnot-tools = { path = "crates/carnot-tools" }
-carnot-mcp = { path = "crates/carnot-mcp" }
-carnot-ext = { path = "crates/carnot-ext" }
-carnot-agent = { path = "crates/carnot-agent" }
-carnot-protocol = { path = "crates/carnot-protocol" }
-carnot = { path = "crates/carnot" }
-carnot-ext-web = { path = "extensions/carnot-ext-web" }
-carnot-ext-lsp = { path = "extensions/carnot-ext-lsp" }
-carnot-ext-subagent = { path = "extensions/carnot-ext-subagent" }
-carnot-ext-hooks = { path = "extensions/carnot-ext-hooks" }
-carnot-ext-claude-plugins = { path = "extensions/carnot-ext-claude-plugins" }
-carnot-ext-memory = { path = "extensions/carnot-ext-memory" }
+carnot-core = { version = "0.1.0", path = "crates/carnot-core" }
+carnot-cas = { version = "0.1.0", path = "crates/carnot-cas" }
+carnot-sandbox = { version = "0.1.0", path = "crates/carnot-sandbox" }
+carnot-session = { version = "0.1.0", path = "crates/carnot-session" }
+carnot-ai = { version = "0.1.0", path = "crates/carnot-ai" }
+carnot-tools = { version = "0.1.0", path = "crates/carnot-tools" }
+carnot-mcp = { version = "0.1.0", path = "crates/carnot-mcp" }
+carnot-ext = { version = "0.1.0", path = "crates/carnot-ext" }
+carnot-agent = { version = "0.1.0", path = "crates/carnot-agent" }
+carnot-protocol = { version = "0.1.0", path = "crates/carnot-protocol" }
+carnot = { version = "0.1.0", path = "crates/carnot" }
+carnot-ext-web = { version = "0.1.0", path = "extensions/carnot-ext-web" }
+carnot-ext-lsp = { version = "0.1.0", path = "extensions/carnot-ext-lsp" }
+carnot-ext-subagent = { version = "0.1.0", path = "extensions/carnot-ext-subagent" }
+carnot-ext-hooks = { version = "0.1.0", path = "extensions/carnot-ext-hooks" }
+carnot-ext-claude-plugins = { version = "0.1.0", path = "extensions/carnot-ext-claude-plugins" }
+carnot-ext-memory = { version = "0.1.0", path = "extensions/carnot-ext-memory" }
 
 [profile.release]
 opt-level = 3

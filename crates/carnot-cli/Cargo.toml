@@ -2,9 +2,13 @@
 name = "carnot-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [lints]
 workspace = true
@@ -14,7 +18,7 @@ name = "carnot"
 path = "src/main.rs"
 
 [features]
-default = ["tui"]
+default = ["tui", "all-ext"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:similar"]
 ext-web = ["carnot/ext-web"]
 ext-lsp = ["carnot/ext-lsp"]

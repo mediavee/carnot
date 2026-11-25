@@ -142,6 +142,16 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Expected rolling prompt-cache lifetime in milliseconds for `model` under `ttl`.
+    /// Used by `carnot-agent` to avoid cold-cache pruning while the provider's cache is still warm
+    /// (e.g. OpenAI 24h extended retention in `Hybrid`/`Long` vs Anthropic 5m rolling tail in `Hybrid`).
+    fn rolling_cache_ttl_ms(&self, _model: &str, ttl: CacheTtl) -> u64 {
+        match ttl {
+            CacheTtl::Long => 3_610_000,
+            CacheTtl::Short | CacheTtl::Hybrid => 310_000,
+        }
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,

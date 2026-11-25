@@ -310,6 +310,8 @@ const MACOS_DENY_LITERALS: &[(&str, &str)] = &[
     ("CARGO_CREDS", ".cargo/credentials"),
     ("CARGO_CREDS_TOML", ".cargo/credentials.toml"),
     ("CARNOT_TOKEN", ".carnot/server.token"),
+    ("CARNOT_AUTH", ".carnot/auth.json"),
+    ("CARNOT_AUTH_LOCK", ".carnot/auth.json.lock"),
 ];
 
 /// Resolves all candidate home directories to protect in macOS Seatbelt so overriding `$HOME`
@@ -341,6 +343,27 @@ fn macos_protected_homes() -> Vec<PathBuf> {
         homes.push(PathBuf::from("/nonexistent"));
     }
     homes
+}
+
+/// Dynamic credential file paths driven by environment variables (`CARGO_HOME`, `CARNOT_AUTH_FILE`)
+/// that must stay unreadable inside both Seatbelt and `bwrap` even when placed outside `$HOME`.
+fn extra_sensitive_credential_files() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
+        && !cargo_home.is_empty()
+    {
+        let ch = PathBuf::from(cargo_home);
+        out.push(ch.join("credentials"));
+        out.push(ch.join("credentials.toml"));
+    }
+    if let Some(auth_file) = std::env::var_os("CARNOT_AUTH_FILE")
+        && !auth_file.is_empty()
+    {
+        let af = PathBuf::from(auth_file);
+        out.push(af.with_extension("json.lock"));
+        out.push(af);
+    }
+    out
 }
 
 fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Command {
@@ -376,6 +399,12 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
             c.arg("-D")
                 .arg(format!("{key}={}", home.join(rel).display()));
         }
+    }
+    for (e_idx, extra_cred) in extra_sensitive_credential_files().into_iter().enumerate() {
+        let key = format!("DENY_EXTRA_CRED_{e_idx}");
+        let resolved = extra_cred.canonicalize().unwrap_or(extra_cred);
+        profile.push_str(&format!("  (literal (param \"{key}\"))\n"));
+        c.arg("-D").arg(format!("{key}={}", resolved.display()));
     }
     profile.push_str(")\n");
     profile.push_str(
@@ -560,6 +589,8 @@ fn build_linux_bwrap_command(
             ".cargo/credentials.toml",
             ".cargo/credentials",
             ".carnot/server.token",
+            ".carnot/auth.json",
+            ".carnot/auth.json.lock",
             ".zshenv",
             ".zshrc",
             ".zsh_history",
@@ -571,6 +602,11 @@ fn build_linux_bwrap_command(
             if p.is_file() {
                 c.args(["--ro-bind", "/dev/null", &p.to_string_lossy()]);
             }
+        }
+    }
+    for extra_cred in extra_sensitive_credential_files() {
+        if extra_cred.is_file() {
+            c.args(["--ro-bind", "/dev/null", &extra_cred.to_string_lossy()]);
         }
     }
 
@@ -681,6 +717,12 @@ mod tests {
 
     #[tokio::test]
     async fn blocks_dot_git_config_tampering_under_seatbelt() {
+        let sb = detect_sandbox_backend();
+        // Landlock is allow-only (cannot carve `.git` out of a writable workspace_root);
+        // in-process tools still enforce `.git` write denial across all platforms.
+        if !sb.available || sb.backend == "landlock" {
+            return;
+        }
         let base = std::env::temp_dir().join(format!("carnot-git-ro-{}", uuid::Uuid::new_v4()));
         let ws = base.join("ws");
         std::fs::create_dir_all(&ws).expect("ws");
@@ -751,6 +793,9 @@ mod tests {
 
     #[tokio::test]
     async fn scrubs_github_token_and_ssh_auth_sock_and_zshenv() {
+        if !detect_sandbox_backend().available {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("carnot-sb-env-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let policy = SandboxPolicy::for_workspace(dir.clone(), true, false);

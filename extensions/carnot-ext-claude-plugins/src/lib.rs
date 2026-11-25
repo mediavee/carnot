@@ -588,6 +588,12 @@ impl ClaudePluginsModule {
         &self.plugins
     }
 
+    /// Root directories of all loaded plugins so `ToolRegistry` can permit read-only access
+    /// to advertised plugin `SKILL.md`, command, and agent files outside `workspace_root`.
+    pub fn plugin_roots(&self) -> Vec<PathBuf> {
+        self.plugins.iter().map(|p| p.root.clone()).collect()
+    }
+
     /// MCP server configurations contributed by loaded Claude Code plugins (`${CLAUDE_PLUGIN_ROOT}`
     /// already expanded), ready to merge into `CarnotBuilder::extra_mcp_servers`.
     pub fn mcp_servers(&self) -> &BTreeMap<String, McpServerConfig> {

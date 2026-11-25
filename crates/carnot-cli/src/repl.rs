@@ -443,7 +443,7 @@ pub async fn run_repl(
             "2",
             &format!(
                 "({model} · effort:{effort:?} · {sandbox_badge} · session:{})",
-                &sid[..8.min(sid.len())]
+                sid.chars().take(8).collect::<String>()
             )
         )
     );
@@ -515,20 +515,21 @@ pub async fn run_repl(
                     } else {
                         match ProviderRegistry::load_default(&provider_configs) {
                             Ok(reg) => {
-                                let prov_id = reg
-                                    .catalog()
-                                    .provider_for_model(rest)
-                                    .unwrap_or(&default_provider);
-                                match reg.build_provider(prov_id, Some(rest)) {
+                                let (prov_id, model_id) =
+                                    crate::resolve_model_spec_in_registry(&reg, rest, None)
+                                        .unwrap_or_else(|| {
+                                            (default_provider.clone(), rest.trim().to_string())
+                                        });
+                                match reg.build_provider(&prov_id, Some(&model_id)) {
                                     Ok(provider) => {
-                                        let cw = reg.context_window_for_model(rest);
-                                        let max_out = reg.max_output_tokens_for_model(rest);
+                                        let cw = reg.context_window_for_model(&model_id);
+                                        let max_out = reg.max_output_tokens_for_model(&model_id);
                                         match agent
-                                            .set_model(rest.to_string(), provider, cw, max_out)
+                                            .set_model(model_id.clone(), provider, cw, max_out)
                                             .await
                                         {
                                             Ok(()) => eprintln!(
-                                                "{} {rest} (provider={prov_id})",
+                                                "{} {model_id} (provider={prov_id})",
                                                 theme.paint("32", "switched model ->")
                                             ),
                                             Err(e) => eprintln!(

@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct PolicyGuardModule {
     denied_commands: Vec<Regex>,
     protected_path_fragments: Vec<String>,
+    workspace_root: Option<PathBuf>,
     redact_tool_outputs: bool,
     audit_log: Option<Mutex<PathBuf>>,
 }
@@ -43,9 +44,15 @@ impl PolicyGuardModule {
                 Regex::new(r"(?i)(curl|wget)\s+.*\|\s*(sh|bash|zsh)\b").expect("re"),
             ],
             protected_path_fragments: vec![".env".into(), "id_rsa".into(), "id_ed25519".into()],
+            workspace_root: None,
             redact_tool_outputs: true,
             audit_log: None,
         }
+    }
+
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
+        self
     }
 
     pub fn with_denied_command_pattern(
@@ -117,26 +124,47 @@ impl Module for PolicyGuardModule {
                 .or_else(|| input.get("path"))
                 .and_then(Value::as_str)
         {
-            let norm = fp.replace('\\', "/").to_ascii_lowercase();
-            let norm_trimmed = norm.trim_start_matches("./").trim_start_matches('/');
-            let file_name = std::path::Path::new(fp)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(fp)
-                .to_ascii_lowercase();
-            for frag in &self.protected_path_fragments {
-                let fl = frag.replace('\\', "/").to_ascii_lowercase();
-                let fl_dir = fl.trim_end_matches('/');
-                let is_dir_match = fl.ends_with('/')
-                    && (norm_trimmed == fl_dir
-                        || norm_trimmed.starts_with(&format!("{fl_dir}/"))
-                        || norm_trimmed.contains(&format!("/{fl_dir}/")));
-                let is_file_match = file_name == fl || file_name.starts_with(&format!("{fl}."));
-                if is_dir_match || is_file_match {
-                    deny_reason = Some(format!(
-                        "path `{fp}` is protected by PolicyGuard (`{frag}`)"
-                    ));
-                    break;
+            // Check both the raw path AND its canonicalized target (closes symlink bypasses like `ln -s .env x`).
+            let mut candidates: Vec<String> = vec![fp.to_string()];
+            let p = std::path::Path::new(fp);
+            let resolved_candidate = if p.is_absolute() {
+                p.to_path_buf()
+            } else if let Some(ref ws) = self.workspace_root {
+                ws.join(p)
+            } else {
+                p.to_path_buf()
+            };
+            if let Ok(canon) = std::fs::canonicalize(&resolved_candidate) {
+                let canon_str = canon.to_string_lossy().into_owned();
+                if canon_str != fp {
+                    candidates.push(canon_str);
+                }
+            } else if let Ok(target) = std::fs::read_link(&resolved_candidate) {
+                candidates.push(target.to_string_lossy().into_owned());
+            }
+
+            'outer: for cand in &candidates {
+                let norm = cand.replace('\\', "/").to_ascii_lowercase();
+                let norm_trimmed = norm.trim_start_matches("./").trim_start_matches('/');
+                let file_name = std::path::Path::new(cand)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(cand)
+                    .to_ascii_lowercase();
+                for frag in &self.protected_path_fragments {
+                    let fl = frag.replace('\\', "/").to_ascii_lowercase();
+                    let fl_dir = fl.trim_end_matches('/');
+                    let is_dir_match = fl.ends_with('/')
+                        && (norm_trimmed == fl_dir
+                            || norm_trimmed.starts_with(&format!("{fl_dir}/"))
+                            || norm_trimmed.contains(&format!("/{fl_dir}/")));
+                    let is_file_match = file_name == fl || file_name.starts_with(&format!("{fl}."));
+                    if is_dir_match || is_file_match {
+                        deny_reason = Some(format!(
+                            "path `{fp}` is protected by PolicyGuard (`{frag}`)"
+                        ));
+                        break 'outer;
+                    }
                 }
             }
         }

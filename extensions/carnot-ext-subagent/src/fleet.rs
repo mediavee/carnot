@@ -561,8 +561,10 @@ impl Fleet {
         let initially_running = self.snapshot_running_targets(targets);
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            // Register notified future BEFORE checking condition to guarantee ZERO missed wakeups!
+            // Pin and enable notified future BEFORE checking condition to guarantee ZERO missed wakeups!
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.wait_condition_met(targets, wait_all, &initially_running) {
                 return true;
             }
@@ -572,7 +574,7 @@ impl Fleet {
             }
             tokio::select! {
                 _ = cancel.cancelled() => return false,
-                _ = notified => {}
+                _ = &mut notified => {}
                 _ = tokio::time::sleep(remaining) => {
                     return self.wait_condition_met(targets, wait_all, &initially_running);
                 }

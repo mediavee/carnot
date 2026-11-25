@@ -641,7 +641,7 @@ impl ModelPricing {
         cache_write_1h_mult: 2.0,
     };
 
-    pub const GPT_6_2_SOL: Self = Self {
+    pub const GPT_5_4: Self = Self {
         input_per_mtok: 2.5,
         output_per_mtok: 10.0,
         cache_read_mult: 0.10,
@@ -649,7 +649,7 @@ impl ModelPricing {
         cache_write_1h_mult: 1.0,
     };
 
-    pub const GEMINI_4_NEON: Self = Self {
+    pub const GEMINI_3_PRO: Self = Self {
         input_per_mtok: 2.0,
         output_per_mtok: 12.0,
         cache_read_mult: 0.10,
@@ -691,16 +691,9 @@ impl ModelPricing {
             Self::SONNET_4_X
         } else if m.contains("sonnet") {
             Self::SONNET_5_5
-        } else if m.contains("gpt-6") {
-            Self::GPT_6_2_SOL
-        } else if m.contains("gpt-5") || m.contains("o3") || m.contains("o4") {
-            Self {
-                input_per_mtok: 2.50,
-                output_per_mtok: 10.0,
-                cache_read_mult: 0.10,
-                cache_write_5m_mult: 1.0,
-                cache_write_1h_mult: 1.0,
-            }
+        } else if m.contains("gpt-5") || m.contains("gpt-6") || m.contains("o3") || m.contains("o4")
+        {
+            Self::GPT_5_4
         } else if m.contains("deepseek") {
             Self {
                 input_per_mtok: 0.55,
@@ -711,9 +704,29 @@ impl ModelPricing {
             }
         } else if m.contains("grok") {
             Self {
-                input_per_mtok: 3.0,
-                output_per_mtok: 15.0,
+                input_per_mtok: 2.0,
+                output_per_mtok: 6.0,
                 cache_read_mult: 0.25,
+                cache_write_5m_mult: 1.0,
+                cache_write_1h_mult: 1.0,
+            }
+        } else if m.contains("muse") {
+            Self {
+                input_per_mtok: 1.25,
+                output_per_mtok: 4.25,
+                cache_read_mult: 0.12,
+                cache_write_5m_mult: 1.0,
+                cache_write_1h_mult: 1.0,
+            }
+        } else if m.contains("mistral")
+            || m.contains("devstral")
+            || m.contains("magistral")
+            || m.contains("codestral")
+        {
+            Self {
+                input_per_mtok: 0.70,
+                output_per_mtok: 2.10,
+                cache_read_mult: 0.10,
                 cache_write_5m_mult: 1.0,
                 cache_write_1h_mult: 1.0,
             }
@@ -726,7 +739,7 @@ impl ModelPricing {
                 cache_write_1h_mult: 1.0,
             }
         } else if m.contains("gemini") {
-            Self::GEMINI_4_NEON
+            Self::GEMINI_3_PRO
         } else {
             Self::OPUS_5_0
         }
@@ -777,7 +790,7 @@ impl ModelPricing {
     }
 
     #[inline]
-    pub fn thermal_mass_usd(&self, tokens: u64, remaining_turns: f64, ttl: CacheTtl) -> f64 {
+    pub fn cache_lifecycle_usd(&self, tokens: u64, remaining_turns: f64, ttl: CacheTtl) -> f64 {
         self.write_usd(tokens, ttl) + self.read_usd(tokens) * remaining_turns
     }
 }

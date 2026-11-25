@@ -261,7 +261,16 @@ impl SubagentTool {
                 live_provider_id.clone()
             };
 
-            if target_prov_name.eq_ignore_ascii_case(&live_provider_id) {
+            let has_model_routes = reg
+                .catalog()
+                .find_provider(&target_prov_name)
+                .map(|(_, e)| !e.model_routes.is_empty())
+                .unwrap_or(false);
+            let same_model = req_model.is_none() || req_model == Some(child_cfg.model.as_str());
+
+            if target_prov_name.eq_ignore_ascii_case(&live_provider_id)
+                && (same_model || !has_model_routes)
+            {
                 if let Some(m) = req_model {
                     child_cfg.model = m.to_string();
                     if let Some(cw) = reg.context_window_for_model(m) {
@@ -270,6 +279,11 @@ impl SubagentTool {
                     if let Some(mo) = reg.max_output_tokens_for_model(m) {
                         child_cfg.max_output_tokens = mo;
                     }
+                }
+                let safe_max_out =
+                    ((child_cfg.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+                if child_cfg.max_output_tokens > safe_max_out {
+                    child_cfg.max_output_tokens = safe_max_out;
                 }
                 (live_provider, live_provider_id)
             } else {
@@ -280,6 +294,11 @@ impl SubagentTool {
                 }
                 if let Some(mo) = target.max_output_tokens {
                     child_cfg.max_output_tokens = mo;
+                }
+                let safe_max_out =
+                    ((child_cfg.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+                if child_cfg.max_output_tokens > safe_max_out {
+                    child_cfg.max_output_tokens = safe_max_out;
                 }
                 (target.provider, target.provider_id)
             }
@@ -1484,7 +1503,11 @@ impl Module for SubagentModule {
                 let steer_notify = parent.steer_notify();
                 let fleet_notified = fleet.notify.notified();
                 let steer_notified = steer_notify.notified();
-                // Re-check after registering both notifiers to guarantee zero missed wakeups.
+                tokio::pin!(fleet_notified);
+                tokio::pin!(steer_notified);
+                // Register both waiters in Tokio's notify queues BEFORE checking conditions!
+                fleet_notified.as_mut().enable();
+                steer_notified.as_mut().enable();
                 if !fleet.has_unread_updates()
                     && fleet.has_running_workers()
                     && !parent.has_pending_steers().await
@@ -1493,10 +1516,10 @@ impl Module for SubagentModule {
                         _ = cancel.cancelled() => {
                             return Ok(BoundaryAction::Continue);
                         }
-                        _ = steer_notified => {
+                        _ = &mut steer_notified => {
                             return Ok(BoundaryAction::Continue);
                         }
-                        _ = fleet_notified => {}
+                        _ = &mut fleet_notified => {}
                         _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)) => {}
                     }
                     if cancel.is_cancelled() || parent.has_pending_steers().await {

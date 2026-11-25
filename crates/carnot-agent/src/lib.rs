@@ -364,7 +364,7 @@ impl Agent {
             session_dir,
             Some(config.workspace_root.clone()),
             config.model.clone(),
-            static_system_prompt().to_string(),
+            effective_static_system_prompt(&config),
             tool_specs,
             parent_messages,
             checkpoint_index,
@@ -722,6 +722,10 @@ impl Agent {
         if let Some(mo) = max_output_tokens {
             rt.max_output_tokens = mo;
         }
+        let safe_max_out = ((rt.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+        if rt.max_output_tokens > safe_max_out {
+            rt.max_output_tokens = safe_max_out;
+        }
         drop(rt);
         *self.last_prefix_state.lock().await = None;
         *self.last_prompt_context_tokens.lock().await = None;
@@ -931,6 +935,54 @@ impl Agent {
         Ok((effective_input, None))
     }
 
+    /// Unified tool gate used identically by BOTH eager mid-stream launches and Stage 1 execution.
+    /// For `CallDeferredTool`, unwraps and gates ONLY the real inner target tool so policies,
+    /// hooks, and host-RPC gates keyed on tool names can never be bypassed or double-gated.
+    async fn gate_tool_call(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        raw_input: &serde_json::Value,
+    ) -> (serde_json::Value, Option<String>) {
+        if tool_name == "CallDeferredTool" {
+            let mut wrapper_input = raw_input.clone();
+            if let Some(inner_name) = wrapper_input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
+                let inner_args = wrapper_input
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                match self
+                    .run_before_gates(call_id, &inner_name, &inner_args)
+                    .await
+                {
+                    Ok((rewritten, inner_denied)) => {
+                        if inner_denied.is_none()
+                            && let Some(obj) = wrapper_input.as_object_mut()
+                        {
+                            obj.insert("arguments".into(), rewritten);
+                        }
+                        (wrapper_input, inner_denied)
+                    }
+                    Err(e) => (wrapper_input, Some(format!("inner gate error: {e}"))),
+                }
+            } else {
+                (
+                    wrapper_input,
+                    Some("CallDeferredTool missing target tool `name`".into()),
+                )
+            }
+        } else {
+            match self.run_before_gates(call_id, tool_name, raw_input).await {
+                Ok(pair) => pair,
+                Err(e) => (raw_input.clone(), Some(format!("gate error: {e}"))),
+            }
+        }
+    }
+
     fn discard_eager_launches(&self, eager_launches: HashMap<String, EagerLaunch>) {
         // Abort speculative tasks AND invalidate their ReadTracker entries so next Read never returns
         // a false "unchanged" stub for outputs the model never saw.
@@ -974,8 +1026,6 @@ impl Agent {
             .await
     }
 
-    /// Continues an interrupted session turn without appending a new user message.
-    /// Returns `Ok(None)` if the session is empty or already settled on an assistant reply.
     async fn emit_terminal_error_events(&self, err: &CarnotError) {
         let metrics = self.metrics.lock().await.clone();
         if matches!(err, CarnotError::Cancelled) {
@@ -1139,10 +1189,12 @@ impl Agent {
         // zero LLM calls), replace oversized stale tool results outside the last 4 messages
         // with compact handle-preserving stubs before the cold cache rewrite.
         if self.config.modules.compaction {
-            let ttl_ms = match self.current_cache_ttl().await {
-                CacheTtl::Long => 3_610_000u64,
-                CacheTtl::Short | CacheTtl::Hybrid => 310_000u64,
-            };
+            let live_model = self.current_model().await;
+            let live_ttl = self.current_cache_ttl().await;
+            let ttl_ms = self
+                .current_provider()
+                .await
+                .rolling_cache_ttl_ms(&live_model, live_ttl);
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -1420,7 +1472,11 @@ impl Agent {
                             .map(|t| t.effects(&input))
                             .unwrap_or_else(ToolEffects::serial);
 
+                        // Never block SSE stream draining on interactive human permission prompts;
+                        // when a PermissionBroker is attached, defer gating & execution to Stage 1.
+                        let has_interactive_broker = self.permission_broker.lock().await.is_some();
                         let can_eager = self.config.modules.eager_read
+                            && !has_interactive_broker
                             && invalid_json.is_none()
                             && raw_eff.is_eager_safe()
                             && seen_stream_effects
@@ -1429,12 +1485,10 @@ impl Agent {
 
                         if can_eager {
                             if let Some(tool) = tool_opt {
-                                // Run `before_tool_call` gate BEFORE launching eager execution!
+                                // Run unified gate (unwrapping CallDeferredTool identically to Stage 1)
+                                // BEFORE launching eager execution!
                                 let (eff_input, denied) =
-                                    match self.run_before_gates(&id, &name, &input).await {
-                                        Ok(pair) => pair,
-                                        Err(e) => (input.clone(), Some(e.to_string())),
-                                    };
+                                    self.gate_tool_call(&id, &name, &input).await;
                                 let eff = tool.effects(&eff_input);
                                 let still_safe = denied.is_none()
                                     && eff.is_eager_safe()
@@ -1744,45 +1798,9 @@ impl Agent {
                         continue;
                     }
 
-                    // Gate the real tool directly (for `CallDeferredTool`, gate ONLY the inner
-                    // target tool so policies keyed on tool names aren't double-gated or blocked).
-                    let (effective_input, denied) = if tool_name == "CallDeferredTool" {
-                        let mut wrapper_input = raw_input.clone();
-                        if let Some(inner_name) = wrapper_input
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                        {
-                            let inner_args = wrapper_input
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or_else(|| serde_json::json!({}));
-                            match self
-                                .run_before_gates(call_id, &inner_name, &inner_args)
-                                .await
-                            {
-                                Ok((rewritten, inner_denied)) => {
-                                    if inner_denied.is_none()
-                                        && let Some(obj) = wrapper_input.as_object_mut()
-                                    {
-                                        obj.insert("arguments".into(), rewritten);
-                                    }
-                                    (wrapper_input, inner_denied)
-                                }
-                                Err(e) => (wrapper_input, Some(format!("inner gate error: {e}"))),
-                            }
-                        } else {
-                            (
-                                wrapper_input,
-                                Some("CallDeferredTool missing target tool `name`".into()),
-                            )
-                        }
-                    } else {
-                        match self.run_before_gates(call_id, tool_name, raw_input).await {
-                            Ok(pair) => pair,
-                            Err(e) => (raw_input.clone(), Some(format!("gate error: {e}"))),
-                        }
-                    };
+                    // Gate the real tool directly via unified `gate_tool_call`.
+                    let (effective_input, denied) =
+                        self.gate_tool_call(call_id, tool_name, raw_input).await;
                     if let Some(reason) = denied {
                         outputs[idx] = Some((
                             effective_input,

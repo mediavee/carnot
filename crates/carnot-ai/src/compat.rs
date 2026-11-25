@@ -324,8 +324,8 @@ pub fn format_tool_call_id(raw: &str, format: Option<&str>) -> String {
 /// Derives a collision-free per-session routing/cache key combining static `prefix_hash` + `session_id`.
 pub fn session_cache_key(prefix_hash: &str, session_id: &str) -> String {
     if session_id.is_empty() {
-        let end = prefix_hash.len().min(24);
-        return format!("carnot-{}", &prefix_hash[..end]);
+        let short: String = prefix_hash.chars().take(24).collect();
+        return format!("carnot-{short}");
     }
     let hex = fnv1a_hex(&[prefix_hash.as_bytes(), session_id.as_bytes()]);
     format!("carnot-{}", &hex[..24])

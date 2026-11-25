@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carnot-sdk"
+version = "0.1.0"
+description = "Zero-dependency async Python SDK and drop-in extension helper for Carnot"
+requires-python = ">=3.12"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["ai", "agent", "llm", "carnot", "json-rpc"]
+
+[project.urls]
+Repository = "https://github.com/mediavee/carnot"
+
+[tool.setuptools]
+py-modules = ["carnot_sdk"]

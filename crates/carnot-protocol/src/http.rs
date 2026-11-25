@@ -22,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 const REQUEST_READ_TIMEOUT_SECS: u64 = 15;
 const SSE_KEEPALIVE_SECS: u64 = 30;
 
@@ -40,8 +41,15 @@ pub async fn serve_http(agent: Arc<Agent>, addr: &str) -> Result<()> {
                 if let Some(parent) = tok_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = write_token_0600(&tok_path, &t);
-                tracing::info!(token_file = %tok_path.display(), "carnot HTTP Bearer token written (mode 0600)");
+                if let Err(e) = write_token_0600(&tok_path, &t) {
+                    tracing::warn!(
+                        token_file = %tok_path.display(),
+                        error = %e,
+                        "failed to write carnot HTTP Bearer token file"
+                    );
+                } else {
+                    tracing::info!(token_file = %tok_path.display(), "carnot HTTP Bearer token written (mode 0600)");
+                }
             }
             t
         }
@@ -55,16 +63,31 @@ pub async fn serve_http_with_token(agent: Arc<Agent>, addr: &str, token: String)
 
     let listener = TcpListener::bind(addr).await?;
     let expected_token = Arc::new(token);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let prompt_gate = Arc::new(tokio::sync::Mutex::new(()));
     tracing::info!(%addr, "carnot HTTP/SSE server listening (Bearer auth + CSRF protection enabled)");
     loop {
         tokio::select! {
             accept_res = listener.accept() => {
-                let (stream, _) = accept_res?;
+                let (stream, _) = match accept_res {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "HTTP listener accept error; continuing");
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let ag = agent.clone();
                 let br = broker.clone();
                 let tok = expected_token.clone();
+                let pgate = prompt_gate.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(ag, br, stream, &tok).await;
+                    let _permit = permit;
+                    let _ = handle_conn(ag, br, pgate, stream, &tok).await;
                 });
             }
             _ = shutdown_signal() => {
@@ -134,27 +157,48 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn is_valid_optional_port(rest: &str) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    rest.strip_prefix(':').is_some_and(|p| {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+    })
+}
+
 fn is_loopback_host(host: &str) -> bool {
-    let h = host.trim().to_ascii_lowercase();
-    let bare = if let Some(rest) = h.strip_prefix('[') {
-        rest.split(']').next().unwrap_or("")
-    } else {
-        h.split(':').next().unwrap_or("")
-    };
-    matches!(bare, "localhost" | "127.0.0.1" | "::1")
+    let h = host.trim();
+    if h.is_empty()
+        || h.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || b.is_ascii_control()
+                || matches!(b, b'@' | b'/' | b'?' | b'#')
+        })
+    {
+        return false;
+    }
+    let lower = h.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("[::1]") {
+        return is_valid_optional_port(rest);
+    }
+    if let Some(rest) = lower.strip_prefix("127.0.0.1") {
+        return is_valid_optional_port(rest);
+    }
+    if let Some(rest) = lower.strip_prefix("localhost") {
+        return is_valid_optional_port(rest);
+    }
+    false
 }
 
 fn is_allowed_origin(origin: &str) -> bool {
     let o = origin.trim();
-    if let Some(rest) = o
+    let Some(authority) = o
         .strip_prefix("http://")
         .or_else(|| o.strip_prefix("https://"))
-    {
-        let authority = rest.split('/').next().unwrap_or("");
-        is_loopback_host(authority)
-    } else {
-        false
-    }
+    else {
+        return false;
+    };
+    is_loopback_host(authority)
 }
 
 async fn read_bounded_line(
@@ -180,12 +224,15 @@ async fn read_bounded_line(
 async fn handle_conn(
     agent: Arc<Agent>,
     broker: Arc<ChannelInteractionBroker>,
+    prompt_gate: Arc<tokio::sync::Mutex<()>>,
     stream: TcpStream,
     expected_token: &str,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    // Read ONLY the request line and bounded headers BEFORE checking auth / Host / Origin.
+    // Never allocate or read the request body for unauthenticated or forbidden requests!
     let req_head = tokio::time::timeout(Duration::from_secs(REQUEST_READ_TIMEOUT_SECS), async {
         let Some(req_line) = read_bounded_line(&mut reader).await? else {
             return Ok(None);
@@ -196,18 +243,21 @@ async fn handle_conn(
         let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
 
         let mut content_len: usize = 0;
-        let mut content_len_err: Option<(u16, &'static str)> = None;
+        let mut header_err: Option<(u16, &'static str)> = None;
         let mut last_event_id: Option<u64> = None;
         let mut auth_header: Option<String> = None;
         let mut content_type: Option<String> = None;
         let mut origin: Option<String> = None;
         let mut host: Option<String> = None;
+        let mut saw_end_of_headers = false;
 
-        for _ in 0..MAX_HEADERS {
+        for _ in 0..=MAX_HEADERS {
             let Some(h) = read_bounded_line(&mut reader).await? else {
+                saw_end_of_headers = true;
                 break;
             };
             if h.trim().is_empty() {
+                saw_end_of_headers = true;
                 break;
             }
             if let Some((k, v)) = h.split_once(':') {
@@ -215,16 +265,16 @@ async fn handle_conn(
                 if k.eq_ignore_ascii_case("content-length") {
                     match val.parse::<usize>() {
                         Ok(n) if n > MAX_BODY_BYTES => {
-                            content_len_err = Some((413, "payload exceeds 8 MiB limit"));
+                            header_err = Some((413, "payload exceeds 8 MiB limit"));
                         }
                         Ok(n) => content_len = n,
                         Err(_) => {
-                            content_len_err = Some((400, "invalid Content-Length header"));
+                            header_err = Some((400, "invalid Content-Length header"));
                         }
                     }
                 } else if k.eq_ignore_ascii_case("transfer-encoding") {
                     if val.to_ascii_lowercase().contains("chunked") {
-                        content_len_err = Some((501, "chunked Transfer-Encoding is not supported"));
+                        header_err = Some((501, "chunked Transfer-Encoding is not supported"));
                     }
                 } else if k.eq_ignore_ascii_case("last-event-id") {
                     last_event_id = val.parse().ok();
@@ -239,22 +289,20 @@ async fn handle_conn(
                 }
             }
         }
-
-        let mut body = Vec::new();
-        if content_len_err.is_none() && content_len > 0 {
-            body.resize(content_len, 0u8);
-            reader.read_exact(&mut body).await?;
+        if !saw_end_of_headers {
+            header_err = Some((431, "too many request headers"));
         }
+
         Ok::<_, std::io::Error>(Some((
             method,
             path,
-            content_len_err,
+            content_len,
+            header_err,
             last_event_id,
             auth_header,
             content_type,
             origin,
             host,
-            body,
         )))
     })
     .await;
@@ -262,27 +310,36 @@ async fn handle_conn(
     let Ok(Ok(Some((
         method,
         path,
-        content_len_err,
+        content_len,
+        header_err,
         last_event_id,
         auth_header,
         content_type,
         origin,
         host,
-        body,
     )))) = req_head
     else {
         return Ok(());
     };
 
-    if let Some((status, msg)) = content_len_err {
+    if let Some((status, msg)) = header_err {
         return write_json(&mut write_half, status, &json!({"error": msg})).await;
     }
 
-    // Host & Origin anti-CSRF / anti-DNS-rebinding guards.
-    if let Some(ref h) = host
-        && !is_loopback_host(h)
-    {
-        return write_json(&mut write_half, 403, &json!({"error": "forbidden host"})).await;
+    // Host & Origin anti-CSRF / anti-DNS-rebinding guards (fail-closed: Host is required in HTTP/1.1).
+    match host {
+        Some(ref h) if is_loopback_host(h) => {}
+        Some(_) => {
+            return write_json(&mut write_half, 403, &json!({"error": "forbidden host"})).await;
+        }
+        None => {
+            return write_json(
+                &mut write_half,
+                400,
+                &json!({"error": "missing Host header"}),
+            )
+            .await;
+        }
     }
     if let Some(ref o) = origin
         && !is_allowed_origin(o)
@@ -299,7 +356,7 @@ async fn handle_conn(
         .await;
     }
 
-    // Require Bearer token on all `/v1/*` routes.
+    // Require Bearer token on all `/v1/*` routes BEFORE allocating or reading any request body.
     let authorized = auth_header
         .as_deref()
         .and_then(|h| {
@@ -313,7 +370,7 @@ async fn handle_conn(
     }
 
     // Enforce `application/json` on POST requests with a body (blocks `fetch(..., {mode:"no-cors"})` CSRF!)
-    if method == "POST" && !body.is_empty() {
+    if method == "POST" && content_len > 0 {
         let is_json = content_type
             .as_deref()
             .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
@@ -323,6 +380,24 @@ async fn handle_conn(
                 &mut write_half,
                 415,
                 &json!({"error": "Content-Type must be application/json"}),
+            )
+            .await;
+        }
+    }
+
+    let mut body = Vec::new();
+    if content_len > 0 {
+        body.resize(content_len, 0u8);
+        let read_res = tokio::time::timeout(
+            Duration::from_secs(REQUEST_READ_TIMEOUT_SECS),
+            reader.read_exact(&mut body),
+        )
+        .await;
+        if !matches!(read_res, Ok(Ok(_))) {
+            return write_json(
+                &mut write_half,
+                408,
+                &json!({"error": "request body timeout"}),
             )
             .await;
         }
@@ -514,7 +589,16 @@ async fn handle_conn(
             Err(e) => write_json(&mut write_half, 409, &json!({"error": e.to_string()})).await,
         },
         ("POST", "/v1/prompt") => {
+            let Ok(prompt_guard) = prompt_gate.try_lock_owned() else {
+                return write_json(
+                    &mut write_half,
+                    409,
+                    &json!({"error": "agent run already in progress; use /v1/steer or /v1/abort"}),
+                )
+                .await;
+            };
             if agent.is_busy() {
+                drop(prompt_guard);
                 return write_json(
                     &mut write_half,
                     409,
@@ -591,6 +675,7 @@ async fn handle_conn(
                 let mut ev_stream = agent.subscribe_from(start_seq);
                 let ag_run = agent.clone();
                 let run_task = tokio::spawn(async move {
+                    let _prompt_guard = prompt_guard;
                     if image_blocks.is_empty() {
                         ag_run.prompt(prompt).await
                     } else {
@@ -654,9 +739,11 @@ async fn write_json(
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
         409 => "Conflict",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
         _ => "Internal Server Error",
     };
@@ -705,13 +792,15 @@ mod tests {
         let ag_bg = Arc::clone(&agent);
         let br_bg = Arc::clone(&broker);
         let tok_bg = Arc::clone(&tok);
+        let pgate_bg = Arc::new(tokio::sync::Mutex::new(()));
         let srv = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let a = Arc::clone(&ag_bg);
                 let b = Arc::clone(&br_bg);
                 let t = Arc::clone(&tok_bg);
+                let pg = Arc::clone(&pgate_bg);
                 tokio::spawn(async move {
-                    let _ = handle_conn(a, b, stream, &t).await;
+                    let _ = handle_conn(a, b, pg, stream, &t).await;
                 });
             }
         });
@@ -723,15 +812,41 @@ mod tests {
             "expected 401, got: {r401}"
         );
 
-        // 2. Non-loopback Host -> 403 Forbidden (DNS rebinding guard)
-        let r403 = send_raw(
-            addr,
-            "GET /v1/status HTTP/1.1\r\nHost: evil.example.com\r\nAuthorization: Bearer secret-test-token\r\n\r\n",
-        )
-        .await;
+        // 2. Non-loopback Host & spoofed loopback authorities -> 403 Forbidden (DNS rebinding / CSRF guard)
+        for bad_host in [
+            "evil.example.com",
+            "127.0.0.1:80@evil.com",
+            "[::1]evil.com",
+            "localhost.evil.com",
+        ] {
+            let r403 = send_raw(
+                addr,
+                &format!(
+                    "GET /v1/status HTTP/1.1\r\nHost: {bad_host}\r\nAuthorization: Bearer secret-test-token\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                r403.starts_with("HTTP/1.1 403"),
+                "expected 403 for Host `{bad_host}`, got: {r403}"
+            );
+        }
+        assert!(!is_allowed_origin("http://127.0.0.1:80@evil.com"));
+        assert!(!is_allowed_origin("http://[::1]evil.com"));
+        assert!(is_allowed_origin("http://127.0.0.1:7744"));
+        assert!(is_allowed_origin("http://[::1]:7744"));
+        assert!(is_allowed_origin("https://localhost"));
+
+        // 2b. >MAX_HEADERS -> 431 Request Header Fields Too Large
+        let mut many_hdrs = String::from("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        for i in 0..70 {
+            many_hdrs.push_str(&format!("X-Pad-{i}: v\r\n"));
+        }
+        many_hdrs.push_str("\r\n");
+        let r431 = send_raw(addr, &many_hdrs).await;
         assert!(
-            r403.starts_with("HTTP/1.1 403"),
-            "expected 403, got: {r403}"
+            r431.starts_with("HTTP/1.1 431"),
+            "expected 431 for >64 headers, got: {r431}"
         );
 
         // 3. /health returns 200 OK without auth, and /v1/metrics returns 200 OK with valid Bearer

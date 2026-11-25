@@ -215,6 +215,7 @@ async fn state_payload(agent: &Agent) -> Value {
     let effort_preserves_cache = agent.effort_preserves_cache().await;
     let ph = agent.prefix_hash().await;
     let met = agent.metrics().await;
+    let ttl = agent.current_cache_ttl().await;
     let pending_queue = agent.pending_queue_len().await;
     let (active_tools, deferred_tools) = agent.tool_names();
     json!({
@@ -224,6 +225,8 @@ async fn state_payload(agent: &Agent) -> Value {
         "model": model,
         "effort": effort,
         "effort_preserves_cache": effort_preserves_cache,
+        "cache_ttl": ttl.as_str(),
+        "prefix_retention_rate": met.prefix_retention_rate(),
         "prefix_hash": ph,
         "latest_seq": agent.latest_event_seq(),
         "busy": agent.is_busy(),
@@ -314,13 +317,14 @@ async fn serve_rpc_loop(
     let run_active = Arc::new(Mutex::new(false));
     let shutting_down = Arc::new(AtomicBool::new(false));
     let mut terminated_by_signal = false;
+    #[cfg(unix)]
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
     loop {
         let next_line = {
             #[cfg(unix)]
             {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
                 tokio::select! {
                     line = lines.next_line() => line?,
                     _ = async {
@@ -501,6 +505,7 @@ async fn serve_rpc_loop(
             let ag = agent.clone();
             let out = stdout.clone();
             let active_lock = run_active.clone();
+            let stop_flag = shutting_down.clone();
             bg_tasks.push(tokio::spawn(async move {
                 let reply = match ag.continue_run().await {
                     Ok(Some(o)) => json!({"jsonrpc": "2.0", "id": id, "result": {
@@ -523,11 +528,16 @@ async fn serve_rpc_loop(
                 loop {
                     let next = {
                         let mut guard = active_lock.lock().await;
-                        match ag.take_pending_wakeup().await {
-                            Some(msg) => Some(msg),
-                            None => {
-                                *guard = false;
-                                None
+                        if stop_flag.load(Ordering::Acquire) {
+                            *guard = false;
+                            None
+                        } else {
+                            match ag.take_pending_wakeup().await {
+                                Some(msg) => Some(msg),
+                                None => {
+                                    *guard = false;
+                                    None
+                                }
                             }
                         }
                     };
@@ -892,8 +902,8 @@ async fn serve_rpc_loop(
         write_frame(&stdout, &reply).await?;
     }
 
+    shutting_down.store(true, Ordering::Release);
     if let Some(ref br) = bridge {
-        shutting_down.store(true, Ordering::Release);
         br.fail_all(if terminated_by_signal {
             "carnot received termination signal"
         } else {
@@ -902,11 +912,34 @@ async fn serve_rpc_loop(
         .await;
         agent.abort().await;
     } else if terminated_by_signal {
-        shutting_down.store(true, Ordering::Release);
         agent.abort().await;
     }
     for task in bg_tasks {
-        let _ = task.await;
+        #[cfg(unix)]
+        {
+            tokio::pin!(task);
+            tokio::select! {
+                _ = &mut task => {}
+                _ = async {
+                    if let Some(ref mut s) = sigterm {
+                        s.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    agent.abort().await;
+                    let _ = task.await;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    agent.abort().await;
+                    let _ = task.await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = task.await;
+        }
     }
     ev_task.abort();
     Ok(())

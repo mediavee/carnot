@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::process::Command;
 
-/// Hidden argv[1] sentinel recognized by `try_handle_landlock_exec_arg()` before Tokio starts.
+/// Hidden `argv[1]` sentinel recognized by `try_handle_landlock_exec_arg()` before Tokio starts.
 pub const LANDLOCK_EXEC_ARG: &str = "__carnot-landlock-exec";
 
 static LANDLOCK_HELPER: OnceLock<PathBuf> = OnceLock::new();
@@ -201,13 +201,37 @@ fn enforce_landlock(spec: &LandlockSpec) -> std::result::Result<(), String> {
         .map_err(|e| format!("scope: {e}"))?;
 
     let mut ro_paths: Vec<PathBuf> = [
-        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt", "/proc", "/dev", "/tmp",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/opt",
+        "/proc/self",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/stat",
+        "/proc/uptime",
+        "/proc/version",
+        "/proc/sys",
+        "/dev",
+        "/tmp",
     ]
     .into_iter()
     .map(PathBuf::from)
     .collect();
 
-    for env_k in ["CARGO_HOME", "RUSTUP_HOME", "GOPATH", "VIRTUAL_ENV"] {
+    // Expose only non-credential subdirectories/config of CARGO_HOME (never `credentials*`!)
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
+        && !cargo_home.is_empty()
+    {
+        let ch = PathBuf::from(cargo_home);
+        for sub in ["bin", "registry", "git", "config.toml", "config"] {
+            ro_paths.push(ch.join(sub));
+        }
+    }
+    for env_k in ["RUSTUP_HOME", "GOPATH", "VIRTUAL_ENV"] {
         if let Some(v) = std::env::var_os(env_k)
             && !v.is_empty()
         {

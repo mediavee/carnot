@@ -255,7 +255,7 @@ struct Cli {
     #[arg(long)]
     policy_guard: bool,
 
-    /// Explicitly disable OS kernel sandbox (fail-closed by default)
+    /// Explicitly disable OS kernel sandbox AND workspace filesystem confinement (fail-closed by default)
     #[arg(long)]
     no_sandbox: bool,
 
@@ -330,7 +330,7 @@ enum Commands {
     AuditPrefix,
     /// Production environment & readiness healthcheck (auth status without secrets, sandbox, MCP, skills)
     Doctor,
-    /// List active modules and canonical LID tool schemas
+    /// List active modules and canonical core tool schemas
     Modules,
     /// List registered wire-protocol adapters & data-driven providers from providers.json
     Providers,
@@ -550,6 +550,9 @@ fn main() {
     .expect("tokio runtime");
 
     let exit_code = rt.block_on(async_main(cli, cwd));
+    // All async cleanup (MCP shutdown, session flush, abort) has already finished inside `async_main`;
+    // detach any blocking `tokio::io::stdin()` reader thread so SIGTERM shutdown never hangs on drop.
+    rt.shutdown_background();
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -572,6 +575,13 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 return run_auth_cmd(&cli, action).await;
             }
             Commands::Serve { addr } => {
+                if let Ok(sock) = addr.parse::<std::net::SocketAddr>()
+                    && !sock.ip().is_loopback()
+                {
+                    eprintln!(
+                        "warning: binding carnot HTTP server to non-loopback address `{addr}`; ensure network isolation (Host/Origin checks only allow loopback)."
+                    );
+                }
                 let (agent, mcp) = match build_agent(&cli, cwd).await {
                     Ok(pair) => pair,
                     Err(e) => {
@@ -719,7 +729,7 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 }
                 Ok(None) => {
                     eprintln!(
-                        "usage: carnot [-p \"<prompt>\" | --prompt-file <path>] [--image <path>] [-c] | carnot doctor | carnot audit-prefix | carnot providers | carnot modules | carnot --mode acp|rpc | carnot serve | carnot mcp list"
+                        "usage: carnot [-p \"<prompt>\" | --prompt-file <path>] [--image <path>] [-c] | carnot doctor | carnot audit-prefix | carnot providers | carnot models [--all] | carnot auth login|status | carnot modules | carnot --mode acp|rpc | carnot serve | carnot mcp list"
                     );
                     mcp.shutdown_all().await;
                     return 2;
@@ -943,8 +953,15 @@ impl Cli {
                 format!("invalid effort `{e}` (expected low|medium|high|xhigh|max)")
             })?);
         }
-        if self.cache_ttl.is_none() {
-            self.cache_ttl = cfg.cache_ttl.clone();
+        if self.cache_ttl.is_none()
+            && let Some(ref ttl) = cfg.cache_ttl
+        {
+            if CacheTtl::parse(ttl).is_none() {
+                return Err(format!(
+                    "invalid cache_ttl `{ttl}` (expected short|hybrid|long, or 5m|1h|24h)"
+                ));
+            }
+            self.cache_ttl = Some(ttl.clone());
         }
         if self.profile.is_none()
             && let Some(ref p) = cfg.profile
@@ -1134,11 +1151,30 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
     };
 
     let sb = detect_sandbox_backend();
-    let sandbox_backend = match sb.detail {
-        Some(detail) => {
-            json!({ "backend": sb.backend, "available": sb.available, "detail": detail })
-        }
-        None => json!({ "backend": sb.backend, "available": sb.available }),
+    let landlock_warn = (sb.backend == "landlock").then_some(
+        "Landlock is additive allow-only and cannot make `<workspace>/.git` read-only for Bash commands (in-process Edit/Write still block `.git`); install `bwrap` on Linux for strict `.git` RO isolation.",
+    );
+    let sandbox_backend = match (sb.detail, landlock_warn) {
+        (Some(detail), Some(warning)) => json!({
+            "backend": sb.backend,
+            "available": sb.available,
+            "detail": detail,
+            "warning": warning,
+        }),
+        (Some(detail), None) => json!({
+            "backend": sb.backend,
+            "available": sb.available,
+            "detail": detail,
+        }),
+        (None, Some(warning)) => json!({
+            "backend": sb.backend,
+            "available": sb.available,
+            "warning": warning,
+        }),
+        (None, None) => json!({
+            "backend": sb.backend,
+            "available": sb.available,
+        }),
     };
 
     let mcp_cfgs = load_mcp_configs(cwd, &cli.mcp_configs, cli.trust_workspace_mcp);
@@ -1255,14 +1291,16 @@ impl AcpHost for CliAcpHost {
 
     fn resolve_model(&self, model_id: &str) -> carnot::Result<ResolvedAcpModel> {
         let reg = ProviderRegistry::load_default(&self.cli.provider_configs)?;
-        let fallback_prov = self.cli.resolved_provider(Some(&reg));
-        let prov_id = reg
-            .catalog()
-            .provider_for_model(model_id)
-            .unwrap_or(&fallback_prov);
-        let provider = reg.build_provider(prov_id, Some(model_id))?;
-        let context_window = reg.context_window_for_model(model_id);
-        let max_output_tokens = reg.max_output_tokens_for_model(model_id);
+        let (prov_id, resolved_id) = resolve_model_spec_in_registry(&reg, model_id, None)
+            .unwrap_or_else(|| {
+                (
+                    self.cli.resolved_provider(Some(&reg)),
+                    model_id.trim().to_string(),
+                )
+            });
+        let provider = reg.build_provider(&prov_id, Some(&resolved_id))?;
+        let context_window = reg.context_window_for_model(&resolved_id);
+        let max_output_tokens = reg.max_output_tokens_for_model(&resolved_id);
         Ok(ResolvedAcpModel {
             provider,
             context_window,
@@ -1346,7 +1384,7 @@ fn list_rpc_models(reg: &ProviderRegistry, include_unconfigured: bool) -> Vec<Rp
         .collect()
 }
 
-fn resolve_model_spec_in_registry(
+pub(crate) fn resolve_model_spec_in_registry(
     reg: &ProviderRegistry,
     reference: &str,
     provider_override: Option<&str>,
@@ -1379,14 +1417,20 @@ fn resolve_model_spec_in_registry(
     {
         return Some((found.provider.clone(), found.id.clone()));
     }
-    // 2. Bare exact id match
-    if wanted_prov.is_none()
-        && let Some(found) = all_models.iter().find(|m| m.id == raw_model)
-    {
-        return Some((found.provider.clone(), found.id.clone()));
+    // 2. Bare exact id match (prefer configured providers over unconfigured ones!)
+    if wanted_prov.is_none() {
+        if let Some(found) = all_models
+            .iter()
+            .find(|m| m.configured && m.id == raw_model)
+        {
+            return Some((found.provider.clone(), found.id.clone()));
+        }
+        if let Some(found) = all_models.iter().find(|m| m.id == raw_model) {
+            return Some((found.provider.clone(), found.id.clone()));
+        }
     }
-    // 3. Family alias resolution (e.g. `anthropic/sonnet` or `opus` -> newest version in catalog)
-    let mut best: Option<(Vec<u64>, String, String)> = None;
+    // 3. Family alias resolution (e.g. `anthropic/sonnet` or `opus` -> newest version; prefer configured!)
+    let mut best: Option<(bool, Vec<u64>, String, String)> = None;
     for m in &all_models {
         if let Some(ref wp) = wanted_prov
             && m.provider != *wp
@@ -1394,13 +1438,16 @@ fn resolve_model_spec_in_registry(
             continue;
         }
         if let Some(ver) = family_version_tuple(&m.id, raw_model) {
-            let better = best.as_ref().map(|(bv, _, _)| ver > *bv).unwrap_or(true);
+            let better = best
+                .as_ref()
+                .map(|(bcfg, bv, _, _)| (m.configured, &ver) > (*bcfg, bv))
+                .unwrap_or(true);
             if better {
-                best = Some((ver, m.provider.clone(), m.id.clone()));
+                best = Some((m.configured, ver, m.provider.clone(), m.id.clone()));
             }
         }
     }
-    if let Some((_, prov, id)) = best {
+    if let Some((_, _, prov, id)) = best {
         return Some((prov, id));
     }
     // 4. Fallback: explicit provider + literal model id (for arbitrary/new models not in catalog)
@@ -1479,7 +1526,13 @@ async fn build_agent_full(
     extra_modules: Vec<Arc<dyn carnot::Module>>,
     system_prompt_append: Option<String>,
 ) -> carnot::Result<(Arc<carnot::Agent>, Arc<McpManager>)> {
-    let ttl = CacheTtl::parse(cli.effective_cache_ttl()).unwrap_or(CacheTtl::Hybrid);
+    let raw_ttl = cli.effective_cache_ttl();
+    let ttl = CacheTtl::parse(raw_ttl).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid --cache-ttl `{raw_ttl}` (expected short|hybrid|long, or 5m|1h|24h)"),
+        )
+    })?;
     let reg_opt = ProviderRegistry::load_default(&cli.provider_configs).ok();
     let default_provider = cli.resolved_provider(reg_opt.as_ref());
     let (effective_provider, effective_model) = if let Some(ref m) = cli.model {

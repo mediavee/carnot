@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 const API_ID: &str = "openai-completions";
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const HTTP_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
+static SYNTHETIC_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct OpenAiCompletionsAdapter;
@@ -392,6 +393,20 @@ impl Provider for OpenAiProvider {
         &self.spec.provider_id
     }
 
+    fn rolling_cache_ttl_ms(&self, model: &str, ttl: CacheTtl) -> u64 {
+        let compat = self.spec.effective_compat(model);
+        if compat.supports_prompt_cache_retention.unwrap_or(false)
+            && matches!(ttl, CacheTtl::Hybrid | CacheTtl::Long)
+        {
+            86_410_000
+        } else {
+            match ttl {
+                CacheTtl::Long => 3_610_000,
+                CacheTtl::Short | CacheTtl::Hybrid => 310_000,
+            }
+        }
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,
@@ -449,122 +464,126 @@ impl Provider for OpenAiProvider {
                 let mut usage = Usage::default();
                 let mut stop_reason = StopReason::EndTurn;
                 let mut saw_done_or_finish = false;
+                let mut stream_eof = false;
 
                 'stream_loop: loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
-                            return;
-                        }
-                        chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => {
-                            let Ok(chunk_opt) = chunk else {
-                                let _ = tx.send(StreamEvent::Error { message: "stream idle timeout (120s)".into(), retryable: true }).await;
+                    if !stream_eof {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
                                 return;
-                            };
-                            let Some(chunk) = chunk_opt else { break 'stream_loop };
-                            let Ok(bytes) = chunk else {
-                                let _ = tx.send(StreamEvent::Error { message: "stream read error".into(), retryable: true }).await;
-                                return;
-                            };
-                            raw_buf.extend_from_slice(&bytes);
-                            while let Some(pos) = raw_buf.iter().position(|&b| b == b'\n') {
-                                let line_bytes: Vec<u8> = raw_buf.drain(..=pos).collect();
-                                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
-                                let Some(data) = line.strip_prefix("data:") else { continue };
-                                let data = data.trim();
-                                if data == "[DONE]" {
-                                    saw_done_or_finish = true;
-                                    break 'stream_loop;
-                                }
-                                let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-                                if let Some(err) = v.get("error") {
-                                    let err_str = err.to_string();
-                                    if is_context_overflow(None, &err_str) {
-                                        let _ = tx.send(StreamEvent::ContextOverflow(err_str)).await;
+                            }
+                            chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => {
+                                let Ok(chunk_opt) = chunk else {
+                                    let _ = tx.send(StreamEvent::Error { message: "stream idle timeout (300s)".into(), retryable: true }).await;
+                                    return;
+                                };
+                                match chunk_opt {
+                                    Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
+                                    Some(Err(_)) => {
+                                        let _ = tx.send(StreamEvent::Error { message: "stream read error".into(), retryable: true }).await;
                                         return;
                                     }
-                                    let err_type = err
-                                        .get("type")
-                                        .or_else(|| err.get("code"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("");
-                                    let retryable = !matches!(
-                                        err_type,
-                                        "invalid_request_error"
-                                            | "authentication_error"
-                                            | "permission_error"
-                                            | "context_length_exceeded"
-                                            | "insufficient_quota"
-                                    );
-                                    let _ = tx.send(StreamEvent::Error {
-                                        message: err_str,
-                                        retryable,
-                                    }).await;
-                                    return;
-                                }
-                                if let Some(u) = v.get("usage")
-                                    && u.is_object()
-                                {
-                                    apply_usage_map(u, &usage_map, &mut usage);
-                                }
-                                if let Some(choice) = v.pointer("/choices/0") {
-                                    if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
-                                        saw_done_or_finish = true;
-                                        stop_reason = match fr {
-                                            "tool_calls" => StopReason::ToolUse,
-                                            "length" => StopReason::MaxTokens,
-                                            "content_filter" => StopReason::Refusal,
-                                            _ => StopReason::EndTurn,
-                                        };
+                                    None => {
+                                        stream_eof = true;
+                                        if raw_buf.is_empty() {
+                                            break 'stream_loop;
+                                        }
+                                        raw_buf.push(b'\n');
                                     }
-                                    if let Some(delta) = choice.get("delta") {
-                                        if let Some(r) = delta
-                                            .get("reasoning_content")
-                                            .or_else(|| delta.get("reasoning"))
-                                            .and_then(Value::as_str)
-                                            && !r.is_empty()
-                                        {
-                                            reasoning_acc.push_str(r);
+                                }
+                            }
+                        }
+                    } else {
+                        break 'stream_loop;
+                    }
+                    while let Some(pos) = raw_buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = raw_buf.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                        let Some(data) = line.strip_prefix("data:") else {
+                            continue;
+                        };
+                        let data = data.trim();
+                        if data == "[DONE]" {
+                            saw_done_or_finish = true;
+                            break 'stream_loop;
+                        }
+                        let Ok(v) = serde_json::from_str::<Value>(data) else {
+                            continue;
+                        };
+                        if let Some(err) = v.get("error") {
+                            let err_str = err.to_string();
+                            if is_context_overflow(None, &err_str) {
+                                let _ = tx.send(StreamEvent::ContextOverflow(err_str)).await;
+                                return;
+                            }
+                            let err_type = err
+                                .get("type")
+                                .or_else(|| err.get("code"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let retryable = !matches!(
+                                err_type,
+                                "invalid_request_error"
+                                    | "authentication_error"
+                                    | "permission_error"
+                                    | "context_length_exceeded"
+                                    | "insufficient_quota"
+                            );
+                            let _ = tx
+                                .send(StreamEvent::Error {
+                                    message: err_str,
+                                    retryable,
+                                })
+                                .await;
+                            return;
+                        }
+                        if let Some(u) = v.get("usage")
+                            && u.is_object()
+                        {
+                            apply_usage_map(u, &usage_map, &mut usage);
+                        }
+                        if let Some(choice) = v.pointer("/choices/0") {
+                            if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+                                saw_done_or_finish = true;
+                                stop_reason = match fr {
+                                    "tool_calls" => StopReason::ToolUse,
+                                    "length" => StopReason::MaxTokens,
+                                    "content_filter" => StopReason::Refusal,
+                                    _ => StopReason::EndTurn,
+                                };
+                            }
+                            if let Some(delta) = choice.get("delta") {
+                                if let Some(r) = delta
+                                    .get("reasoning_content")
+                                    .or_else(|| delta.get("reasoning"))
+                                    .and_then(Value::as_str)
+                                    && !r.is_empty()
+                                {
+                                    reasoning_acc.push_str(r);
+                                    let _ =
+                                        tx.send(StreamEvent::ThinkingDelta(r.to_string())).await;
+                                }
+                                if let Some(content) = delta.get("content") {
+                                    if let Some(t) = content.as_str() {
+                                        if !t.is_empty() {
+                                            text_acc.push_str(t);
                                             let _ = tx
-                                                .send(StreamEvent::ThinkingDelta(r.to_string()))
+                                                .send(StreamEvent::TextDelta(t.to_string()))
                                                 .await;
                                         }
-                                        if let Some(content) = delta.get("content") {
-                                            if let Some(t) = content.as_str() {
-                                                if !t.is_empty() {
-                                                    text_acc.push_str(t);
-                                                    let _ = tx
-                                                        .send(StreamEvent::TextDelta(t.to_string()))
-                                                        .await;
-                                                }
-                                            } else if let Some(parts) = content.as_array() {
-                                                // Structured content blocks (e.g. `type: "thinking"` + `type: "text"`).
-                                                for part in parts {
-                                                    match part.get("type").and_then(Value::as_str) {
-                                                        Some("thinking") => {
-                                                            if let Some(inner) = part
-                                                                .get("thinking")
-                                                                .and_then(Value::as_array)
-                                                            {
-                                                                for item in inner {
-                                                                    if let Some(rt) = item
-                                                                        .get("text")
-                                                                        .and_then(Value::as_str)
-                                                                        && !rt.is_empty()
-                                                                    {
-                                                                        reasoning_acc.push_str(rt);
-                                                                        let _ = tx
-                                                                            .send(
-                                                                                StreamEvent::ThinkingDelta(
-                                                                                    rt.to_string(),
-                                                                                ),
-                                                                            )
-                                                                            .await;
-                                                                    }
-                                                                }
-                                                            } else if let Some(rt) = part
-                                                                .get("thinking")
-                                                                .or_else(|| part.get("text"))
+                                    } else if let Some(parts) = content.as_array() {
+                                        // Structured content blocks (e.g. `type: "thinking"` + `type: "text"`).
+                                        for part in parts {
+                                            match part.get("type").and_then(Value::as_str) {
+                                                Some("thinking") => {
+                                                    if let Some(inner) = part
+                                                        .get("thinking")
+                                                        .and_then(Value::as_array)
+                                                    {
+                                                        for item in inner {
+                                                            if let Some(rt) = item
+                                                                .get("text")
                                                                 .and_then(Value::as_str)
                                                                 && !rt.is_empty()
                                                             {
@@ -578,43 +597,81 @@ impl Provider for OpenAiProvider {
                                                                     .await;
                                                             }
                                                         }
-                                                        Some("text") => {
-                                                            if let Some(t) = part
-                                                                .get("text")
-                                                                .and_then(Value::as_str)
-                                                                && !t.is_empty()
-                                                            {
-                                                                text_acc.push_str(t);
-                                                                let _ = tx
-                                                                    .send(StreamEvent::TextDelta(
-                                                                        t.to_string(),
-                                                                    ))
-                                                                    .await;
-                                                            }
-                                                        }
-                                                        _ => {}
+                                                    } else if let Some(rt) = part
+                                                        .get("thinking")
+                                                        .or_else(|| part.get("text"))
+                                                        .and_then(Value::as_str)
+                                                        && !rt.is_empty()
+                                                    {
+                                                        reasoning_acc.push_str(rt);
+                                                        let _ = tx
+                                                            .send(StreamEvent::ThinkingDelta(
+                                                                rt.to_string(),
+                                                            ))
+                                                            .await;
                                                     }
                                                 }
+                                                Some("text") => {
+                                                    if let Some(t) =
+                                                        part.get("text").and_then(Value::as_str)
+                                                        && !t.is_empty()
+                                                    {
+                                                        text_acc.push_str(t);
+                                                        let _ = tx
+                                                            .send(StreamEvent::TextDelta(
+                                                                t.to_string(),
+                                                            ))
+                                                            .await;
+                                                    }
+                                                }
+                                                _ => {}
                                             }
                                         }
-                                        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                                            for tc in tcs {
-                                                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                                                let entry = tool_calls.entry(idx).or_insert_with(|| {
-                                                    (String::new(), String::new(), String::new())
-                                                });
-                                                if let Some(id) = tc.get("id").and_then(Value::as_str)
-                                                    && !id.is_empty()
+                                    }
+                                }
+                                if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array)
+                                {
+                                    for (pos_in_chunk, tc) in tcs.iter().enumerate() {
+                                        let idx = match tc.get("index").and_then(Value::as_u64) {
+                                            Some(i) => i as usize,
+                                            None => {
+                                                if tc
+                                                    .get("id")
+                                                    .and_then(Value::as_str)
+                                                    .is_some_and(|s| !s.is_empty())
                                                 {
-                                                    entry.0 = id.to_string();
-                                                }
-                                                if let Some(n) = tc.pointer("/function/name").and_then(Value::as_str) {
-                                                    entry.1.push_str(n);
-                                                }
-                                                if let Some(a) = tc.pointer("/function/arguments").and_then(Value::as_str) {
-                                                    entry.2.push_str(a);
+                                                    tool_calls
+                                                        .keys()
+                                                        .next_back()
+                                                        .map(|k| k + 1)
+                                                        .unwrap_or(0)
+                                                } else {
+                                                    tool_calls
+                                                        .keys()
+                                                        .next_back()
+                                                        .copied()
+                                                        .unwrap_or(pos_in_chunk)
                                                 }
                                             }
+                                        };
+                                        let entry = tool_calls.entry(idx).or_insert_with(|| {
+                                            (String::new(), String::new(), String::new())
+                                        });
+                                        if let Some(id) = tc.get("id").and_then(Value::as_str)
+                                            && !id.is_empty()
+                                        {
+                                            entry.0 = id.to_string();
+                                        }
+                                        if let Some(n) =
+                                            tc.pointer("/function/name").and_then(Value::as_str)
+                                        {
+                                            entry.1.push_str(n);
+                                        }
+                                        if let Some(a) = tc
+                                            .pointer("/function/arguments")
+                                            .and_then(Value::as_str)
+                                        {
+                                            entry.2.push_str(a);
                                         }
                                     }
                                 }
@@ -633,6 +690,10 @@ impl Provider for OpenAiProvider {
                     return;
                 }
 
+                if !tool_calls.is_empty() && stop_reason == StopReason::EndTurn {
+                    stop_reason = StopReason::ToolUse;
+                }
+
                 let mut blocks = Vec::new();
                 if !reasoning_acc.is_empty() {
                     blocks.push(ContentBlock::Thinking {
@@ -644,7 +705,15 @@ impl Provider for OpenAiProvider {
                 if !text_acc.is_empty() {
                     blocks.push(ContentBlock::Text { text: text_acc });
                 }
-                for (_, (id, name, args)) in tool_calls {
+                for (_, (raw_id, name, args)) in tool_calls {
+                    let id = if raw_id.is_empty() {
+                        format!(
+                            "call_oai_{}",
+                            SYNTHETIC_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        )
+                    } else {
+                        raw_id
+                    };
                     let trimmed = args.trim();
                     let (input, invalid_json) = if trimmed.is_empty() {
                         (json!({}), None)

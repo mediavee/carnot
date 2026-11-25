@@ -1,7 +1,8 @@
 //! Multiplexed Legacy HTTP+SSE MCP (`2024-11-05`) transport actor.
 
 use super::{
-    ProgressCallback, RpcErrorPayload, TransportError, build_mcp_http_client, find_sse_delim,
+    MAX_WIRE_MESSAGE_BYTES, ProgressCallback, RpcErrorPayload, TransportError,
+    build_mcp_http_client, find_sse_delim,
 };
 use crate::config::HttpServerConfig;
 use carnot_core::{CarnotError, Result};
@@ -123,6 +124,12 @@ impl LegacySseActor {
                 let Some(Ok(chunk)) = next_chunk else {
                     break;
                 };
+                if buf.len().saturating_add(chunk.len()) > MAX_WIRE_MESSAGE_BYTES {
+                    tracing::warn!(
+                        "MCP legacy SSE buffer exceeded MAX_WIRE_MESSAGE_BYTES; closing stream"
+                    );
+                    break;
+                }
                 buf.extend_from_slice(&chunk);
                 while let Some((pos, delim_len)) = find_sse_delim(&buf) {
                     let frame_bytes = buf[..pos].to_vec();
@@ -144,10 +151,14 @@ impl LegacySseActor {
                     }
                     if event_name == "endpoint" {
                         if let Some(tx) = ep_tx.take() {
-                            let resolved = base_bg
-                                .join(&data)
-                                .map(|u| u.to_string())
-                                .map_err(|e| format!("invalid SSE endpoint `{data}`: {e}"));
+                            let resolved = match base_bg.join(&data) {
+                                Ok(u) if u.origin() == base_bg.origin() => Ok(u.to_string()),
+                                Ok(u) => Err(format!(
+                                    "refusing cross-origin SSE endpoint `{u}` (expected origin `{}`)",
+                                    base_bg.origin().ascii_serialization()
+                                )),
+                                Err(e) => Err(format!("invalid SSE endpoint `{data}`: {e}")),
+                            };
                             let _ = tx.send(resolved);
                         }
                         continue;

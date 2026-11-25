@@ -537,11 +537,13 @@ impl Tool for LspQueryTool {
                     }
                 }
             };
+            let notified = conn.diag_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let uri = conn.sync_document(&path, lang, &content).await;
 
             if action == "diagnostics" {
-                let notified = conn.diag_notify.notified();
-                let _ = tokio::time::timeout(Duration::from_millis(800), notified).await;
+                let _ = tokio::time::timeout(Duration::from_millis(800), &mut notified).await;
                 let diags = conn.current_diagnostics(&uri);
                 if diags.is_empty() {
                     return Ok(ToolOutput::ok_text(format!(
@@ -725,6 +727,9 @@ impl Module for LspDiagnosticsModule {
             let Ok(content) = tokio::fs::read_to_string(&path).await else {
                 return Ok(());
             };
+            let notified = conn.diag_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let uri = conn.sync_document(&path, lang, &content).await;
 
             if !is_edit {
@@ -737,8 +742,8 @@ impl Module for LspDiagnosticsModule {
                 return Ok(());
             }
 
-            let notified = conn.diag_notify.notified();
-            let _ = tokio::time::timeout(Duration::from_millis(self.diag_wait_ms), notified).await;
+            let _ =
+                tokio::time::timeout(Duration::from_millis(self.diag_wait_ms), &mut notified).await;
             let after_diags = conn.current_diagnostics(&uri);
             let lines: Vec<&str> = content.lines().collect();
             let prev_fps = self

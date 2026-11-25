@@ -1276,8 +1276,9 @@ fn list_recent_sessions(session_dir: &Path, fallback_cwd: &Path, limit: usize) -
             .and_then(|h| h.workspace_root.as_ref())
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| fallback_cwd.display().to_string());
+        let short_stem: String = stem.chars().take(8).collect();
         let title = match header {
-            Some(ref h) => format!("Carnot ({}) {}", h.model, &stem[..8.min(stem.len())]),
+            Some(ref h) => format!("Carnot ({}) {short_stem}", h.model),
             None => format!("Carnot session {stem}"),
         };
         out.push(json!({

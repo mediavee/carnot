@@ -4,29 +4,76 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Dry-run version label (e.g. 0.1.0-rc1; does not publish a GitHub Release)"
+        required: false
+        default: "0.1.0-dryrun"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  verify:
+    name: Verify version & test suite
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "${TAG_VER}" != "${CARGO_VER}" ]; then
+            echo "Tag version (${TAG_VER}) does not match Cargo.toml (${CARGO_VER})" >&2
+            exit 1
+          fi
+      - name: Run full workspace test suite
+        run: cargo test --workspace --all-features --quiet
+
   build:
     name: Build (${{ matrix.target }})
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             cross_arm64: false
-          - os: ubuntu-24.04
+            musl: false
+            native_test: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            cross_arm64: false
+            musl: true
+            native_test: true
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             cross_arm64: true
+            musl: false
+            native_test: false
           - os: macos-latest
             target: aarch64-apple-darwin
             cross_arm64: false
+            musl: false
+            native_test: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross_arm64: false
+            musl: false
+            native_test: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -34,28 +81,44 @@ jobs:
       - name: Install ARM64 Linux cross-compiler
         if: matrix.cross_arm64
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-      - name: Build & package release archive
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build, smoke-test & package release archive
         env:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="${{ github.event.inputs.version || '0.1.0-dryrun' }}"
+          fi
           ARCHIVE="carnot-${VER}-${{ matrix.target }}.tar.gz"
           cargo build --release --target ${{ matrix.target }} --bin carnot --features all-ext
           mkdir -p staging
           cp "target/${{ matrix.target }}/release/carnot" staging/carnot
+          cp LICENSE-MIT LICENSE-APACHE README.md staging/
           chmod 0755 staging/carnot
-          tar -C staging -czf "${ARCHIVE}" carnot
+          if [ "${{ matrix.native_test }}" = "true" ]; then
+            ./staging/carnot --version
+            ./staging/carnot audit-prefix
+          fi
+          tar -C staging -czf "${ARCHIVE}" carnot LICENSE-MIT LICENSE-APACHE README.md
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
           path: carnot-*.tar.gz
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
         with:

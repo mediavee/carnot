@@ -2,6 +2,7 @@
 name = "carnot-ext"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Extension traits, policy guardrails, warm-fork worktrees, and drop-in host for Carnot"

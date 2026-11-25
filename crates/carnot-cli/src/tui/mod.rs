@@ -156,14 +156,30 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(
+        if let Err(e) = execute!(
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
-        )?;
+        ) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let terminal = match Terminal::new(backend) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = disable_raw_mode();
+                let mut out = io::stdout();
+                let _ = execute!(
+                    out,
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
+                return Err(e);
+            }
+        };
 
         // Ensure panics also restore the terminal cleanly
         let prev_hook = std::panic::take_hook();
@@ -854,21 +870,26 @@ impl TuiApp {
         });
     }
 
-    async fn switch_model(&mut self, model_id: &str) {
+    async fn switch_model(&mut self, model_spec: &str, provider_override: Option<&str>) {
         match ProviderRegistry::load_default(&self.launch.provider_configs) {
             Ok(reg) => {
-                let prov_id = reg
-                    .catalog()
-                    .provider_for_model(model_id)
-                    .unwrap_or(&self.launch.default_provider)
-                    .to_string();
-                match reg.build_provider(&prov_id, Some(model_id)) {
+                let (prov_id, model_id) =
+                    crate::resolve_model_spec_in_registry(&reg, model_spec, provider_override)
+                        .unwrap_or_else(|| {
+                            (
+                                provider_override
+                                    .unwrap_or(&self.launch.default_provider)
+                                    .to_string(),
+                                model_spec.trim().to_string(),
+                            )
+                        });
+                match reg.build_provider(&prov_id, Some(&model_id)) {
                     Ok(provider) => {
-                        let cw = reg.context_window_for_model(model_id);
-                        let max_out = reg.max_output_tokens_for_model(model_id);
+                        let cw = reg.context_window_for_model(&model_id);
+                        let max_out = reg.max_output_tokens_for_model(&model_id);
                         match self
                             .agent
-                            .set_model(model_id.to_string(), provider, cw, max_out)
+                            .set_model(model_id.clone(), provider, cw, max_out)
                             .await
                         {
                             Ok(()) => {
@@ -919,8 +940,10 @@ impl TuiApp {
             }
             "help" | "h" => {
                 let body = [
-                    "  /model [id]         Open model picker (^P) or switch live",
+                    "  /model [id]         Open model picker (^P) or switch live (e.g. opencode/gpt-5.4)",
                     "  /effort [level]     low | medium | high | xhigh | max",
+                    "  /cache [tier]       Inspect prefix retention or set short | hybrid | long",
+                    "  /fleet              Show active & settled background subagent workers",
                     "  /thinking           Toggle reasoning stream (^T)",
                     "  /approve [on|off]   Toggle interactive tool approvals",
                     "  /tools              List active & deferred tools",
@@ -944,7 +967,7 @@ impl TuiApp {
                 if rest.is_empty() {
                     self.open_model_picker();
                 } else {
-                    self.switch_model(rest).await;
+                    self.switch_model(rest, None).await;
                 }
             }
             "effort" => {
@@ -1207,9 +1230,10 @@ impl TuiApp {
                         let detail = path
                             .as_deref()
                             .map(|p| format!("  Saved branch: {}", shorten_path(p)));
+                        let short_id: String = new_id.chars().take(8).collect();
                         self.push_notice(
                             NoticeKind::Success,
-                            format!("Forked session → {}", &new_id[..8.min(new_id.len())]),
+                            format!("Forked session → {short_id}"),
                             detail,
                         );
                     }
@@ -1487,8 +1511,10 @@ impl TuiApp {
                 }
                 KeyCode::Tab => {
                     let chosen = slash[self.slash_selected.min(slash.len() - 1)];
-                    let needs_arg =
-                        matches!(chosen.name, "model" | "effort" | "approve" | "compact");
+                    let needs_arg = matches!(
+                        chosen.name,
+                        "model" | "effort" | "cache" | "approve" | "compact"
+                    );
                     if needs_arg {
                         self.editor.set_text(&format!("/{} ", chosen.name));
                     } else {
@@ -1717,12 +1743,12 @@ impl TuiApp {
                 self.model_picker = Some(picker);
             }
             KeyCode::Enter => {
-                let chosen_id = picker
+                let chosen = picker
                     .filtered()
                     .get(picker.selected.min(count.saturating_sub(1)))
-                    .map(|m| m.id.clone());
-                if let Some(id) = chosen_id {
-                    self.switch_model(&id).await;
+                    .map(|m| (m.id.clone(), m.provider.clone()));
+                if let Some((id, prov)) = chosen {
+                    self.switch_model(&id, Some(&prov)).await;
                 }
             }
             KeyCode::Backspace => {
@@ -2018,7 +2044,7 @@ impl TuiApp {
             right_parts.push(format!("⎇ {br}"));
         }
         right_parts.push(self.workspace_short.clone());
-        right_parts.push(self.session_id[..8.min(self.session_id.len())].to_string());
+        right_parts.push(self.session_id.chars().take(8).collect());
         let right_str = format!("{} ", right_parts.join(" · "));
 
         let left_w: usize = left.iter().map(|s| display_width(&s.content)).sum();
@@ -2720,8 +2746,8 @@ fn parse_git_head(head: &str) -> Option<String> {
     let trimmed = head.trim();
     if let Some(r) = trimmed.strip_prefix("ref: refs/heads/") {
         Some(r.to_string())
-    } else if trimmed.len() >= 7 {
-        Some(trimmed[..7].to_string())
+    } else if trimmed.chars().count() >= 7 {
+        Some(trimmed.chars().take(7).collect())
     } else {
         None
     }

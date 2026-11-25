@@ -44,11 +44,28 @@ impl Provider for ResilientProvider {
             .unwrap_or(false)
     }
 
+    fn web_capabilities(&self, model: &str) -> carnot_core::ProviderWebCapabilities {
+        self.providers
+            .first()
+            .map(|p| p.web_capabilities(model))
+            .unwrap_or_default()
+    }
+
     fn effort_preserves_cache(&self, model: &str) -> bool {
         self.providers
             .first()
             .map(|p| p.effort_preserves_cache(model))
             .unwrap_or(false)
+    }
+
+    fn rolling_cache_ttl_ms(&self, model: &str, ttl: carnot_core::CacheTtl) -> u64 {
+        self.providers
+            .first()
+            .map(|p| p.rolling_cache_ttl_ms(model, ttl))
+            .unwrap_or(match ttl {
+                carnot_core::CacheTtl::Long => 3_610_000,
+                carnot_core::CacheTtl::Short | carnot_core::CacheTtl::Hybrid => 310_000,
+            })
     }
 
     fn stream(

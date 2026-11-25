@@ -997,7 +997,7 @@
       "order": 40,
       "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 6.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 500000,
-      "max_output_tokens": 500000
+      "max_output_tokens": 65536
     },
     "grok-4.6": {
       "provider": "grok",
@@ -1005,7 +1005,7 @@
       "order": 41,
       "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 6.0, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 500000,
-      "max_output_tokens": 500000
+      "max_output_tokens": 65536
     },
     "grok-4.5": {
       "provider": "grok",
@@ -1013,7 +1013,7 @@
       "order": 42,
       "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 6.0, "cache_read_mult": 0.15, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 500000,
-      "max_output_tokens": 500000
+      "max_output_tokens": 65536
     },
     "grok-4.3": {
       "provider": "grok",
@@ -1117,7 +1117,7 @@
       "order": 54,
       "pricing": { "input_per_mtok": 0.10, "output_per_mtok": 0.50, "cache_read_mult": 0.04, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 1048576,
-      "max_output_tokens": 524288,
+      "max_output_tokens": 65536,
       "supports_effort": true
     },
     "gemini-2.5-pro": {
@@ -1221,17 +1221,17 @@
     "kimi-k3.1-pro": {
       "pricing": { "input_per_mtok": 2.0, "output_per_mtok": 10.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 1048576,
-      "max_output_tokens": 1048576
+      "max_output_tokens": 65536
     },
     "kimi-k3": {
       "pricing": { "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 1048576,
-      "max_output_tokens": 1048576
+      "max_output_tokens": 65536
     },
     "kimi-k2.7-code": {
       "pricing": { "input_per_mtok": 0.95, "output_per_mtok": 4.0, "cache_read_mult": 0.20, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 262144,
-      "max_output_tokens": 262144
+      "max_output_tokens": 65536
     },
     "kimi-k2.5": {
       "pricing": { "input_per_mtok": 0.60, "output_per_mtok": 2.50, "cache_read_mult": 0.25, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
@@ -1284,7 +1284,7 @@
       "order": 60,
       "pricing": { "input_per_mtok": 0.70, "output_per_mtok": 2.10, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 1048576,
-      "max_output_tokens": 262144
+      "max_output_tokens": 65536
     },
     "mistral-large-4": {
       "provider": "mistral",
@@ -1292,7 +1292,7 @@
       "order": 61,
       "pricing": { "input_per_mtok": 0.70, "output_per_mtok": 2.10, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 1048576,
-      "max_output_tokens": 262144
+      "max_output_tokens": 65536
     },
     "mistral-medium-latest": {
       "provider": "mistral",
@@ -1300,7 +1300,7 @@
       "order": 62,
       "pricing": { "input_per_mtok": 1.50, "output_per_mtok": 7.50, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 262144,
-      "max_output_tokens": 262144
+      "max_output_tokens": 65536
     },
     "mistral-medium-2604": {
       "provider": "mistral",
@@ -1308,7 +1308,7 @@
       "order": 63,
       "pricing": { "input_per_mtok": 1.50, "output_per_mtok": 7.50, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 262144,
-      "max_output_tokens": 262144
+      "max_output_tokens": 65536
     },
     "magistral-medium-latest": {
       "provider": "mistral",
@@ -1316,7 +1316,7 @@
       "order": 64,
       "pricing": { "input_per_mtok": 1.50, "output_per_mtok": 7.50, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 262144,
-      "max_output_tokens": 262144
+      "max_output_tokens": 65536
     },
     "devstral-medium-latest": {
       "provider": "mistral",
@@ -1332,7 +1332,7 @@
       "order": 66,
       "pricing": { "input_per_mtok": 0.15, "output_per_mtok": 0.60, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 262144,
-      "max_output_tokens": 256000
+      "max_output_tokens": 65536
     },
     "mistral-small-2603": {
       "provider": "mistral",
@@ -1340,7 +1340,7 @@
       "order": 67,
       "pricing": { "input_per_mtok": 0.15, "output_per_mtok": 0.60, "cache_read_mult": 0.10, "cache_write_5m_mult": 1.0, "cache_write_1h_mult": 1.0 },
       "context_window": 262144,
-      "max_output_tokens": 256000
+      "max_output_tokens": 65536
     },
     "codestral-latest": {
       "provider": "mistral",

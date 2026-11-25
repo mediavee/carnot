@@ -345,12 +345,38 @@ struct HookExecResult {
 }
 
 fn expand_allowed_env(raw: &str, allowed: &[String]) -> String {
-    let mut out = raw.to_string();
-    for var in allowed {
-        let val = std::env::var(var).unwrap_or_default();
-        out = out
-            .replace(&format!("${{{var}}}"), &val)
-            .replace(&format!("${var}"), &val);
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'{'
+                && let Some(end_rel) = raw[i + 2..].find('}')
+            {
+                let name = &raw[i + 2..i + 2 + end_rel];
+                if allowed.iter().any(|a| a == name) {
+                    out.push_str(&std::env::var(name).unwrap_or_default());
+                    i += 2 + end_rel + 1;
+                    continue;
+                }
+            } else if bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_' {
+                let mut end = i + 2;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let name = &raw[i + 1..end];
+                if allowed.iter().any(|a| a == name) {
+                    out.push_str(&std::env::var(name).unwrap_or_default());
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }

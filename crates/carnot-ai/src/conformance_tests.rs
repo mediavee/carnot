@@ -1500,4 +1500,35 @@ async fn conformance_grok_4_7_responses_sticky_conv_header_and_muse_meta_respons
             .as_deref(),
         Some("anthropic-messages")
     );
+
+    // 3. ResilientProvider MUST delegate web_capabilities() and rolling_cache_ttl_ms()!
+    let anth_raw: Arc<dyn Provider> = Arc::new(AnthropicProvider::from_spec(spec_for(
+        &catalog,
+        "anthropic",
+        "http://127.0.0.1:9".into(),
+    )));
+    let anth_resilient = crate::retry::ResilientProvider::new(vec![anth_raw]);
+    assert_eq!(
+        anth_resilient.web_capabilities("claude-sonnet-5-5"),
+        carnot_core::ProviderWebCapabilities {
+            native_search: true,
+            native_fetch: true,
+        }
+    );
+    assert_eq!(
+        anth_resilient.rolling_cache_ttl_ms("claude-sonnet-5-5", CacheTtl::Hybrid),
+        310_000
+    );
+
+    let oai_raw: Arc<dyn Provider> = Arc::new(OpenAiResponsesProvider::from_spec(spec_for(
+        &catalog,
+        "openai-responses",
+        "http://127.0.0.1:9".into(),
+    )));
+    let oai_resilient = crate::retry::ResilientProvider::new(vec![oai_raw]);
+    assert_eq!(
+        oai_resilient.rolling_cache_ttl_ms("gpt-5.4", CacheTtl::Hybrid),
+        86_410_000,
+        "OpenAI 24h prompt_cache_retention must not be cold-pruned after 5m"
+    );
 }

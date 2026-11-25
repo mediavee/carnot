@@ -6,7 +6,8 @@ Carnot is built with `#![forbid(unsafe_code)]` across every core crate and offic
 
 1. **OS Kernel Sandbox (`carnot-sandbox` — fail-closed by default)**
    - Every `Bash` command runs inside macOS Seatbelt (`sandbox-exec`), Linux `bwrap` (`bubblewrap`), or — when `bwrap` is unavailable or blocked by container seccomp (`CLONE_NEWUSER` denied) — safe Linux Landlock (ABI v1–v6, including in-kernel TCP restrictions on ABI v4+ and signal/socket scoping on ABI v6+).
-   - Network is disabled by default (`--allow-network` required for outbound access), writes are confined to the workspace, `.git/config` / `.git/hooks` are protected, and credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, etc.) are blocked.
+   - Network is disabled by default (`--allow-network` required for outbound access), writes are confined to the workspace, and credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.carnot/auth.json`, `~/.carnot/server.token`, `$CARGO_HOME/credentials*`, `$CARNOT_AUTH_FILE`, etc.) are blocked.
+   - macOS Seatbelt and Linux `bwrap` mount/lock `<workspace>/.git` read-only. Because Linux Landlock is strictly additive (allow-only) and cannot carve out read-only subtrees beneath a writable root, the Landlock fallback cannot make `<workspace>/.git` read-only for `Bash` commands (and binds `/proc/self` to the trampoline PID); prefer `bwrap` on Linux when strict `.git` isolation is required (`carnot doctor` warns whenever Landlock fallback is active). In-process `Edit`/`Write` tools always reject `.git` writes regardless of sandbox backend.
    - Provider API keys and sensitive env vars (discovered dynamically from `providers.json`) are scrubbed from child environments.
 
 2. **Filesystem Confinement (`carnot-tools`)**
@@ -27,7 +28,7 @@ Carnot is built with `#![forbid(unsafe_code)]` across every core crate and offic
    - When enabled, `PolicyGuardModule` is always ordered **last** in the `before_tool_call` chain so no earlier extension or hook can bypass it via `RewriteInput`.
 
 7. **Embedded HTTP/SSE Server (`carnot serve`)**
-   - Requires constant-time Bearer token auth (`CARNOT_HTTP_TOKEN` or auto-generated 256-bit `0600` token), enforces localhost `Host`/`Origin` CSRF checks and `Content-Type: application/json`, and bounds headers, body size, and read timeouts.
+   - Requires constant-time Bearer token auth (`CARNOT_HTTP_TOKEN` or auto-generated high-entropy random `0600` token), enforces strict localhost `Host`/`Origin` CSRF checks and `Content-Type: application/json`, rejects unauthenticated requests before body allocation, and bounds concurrent connections, headers, body size, and read timeouts.
 
 ## Reporting a Vulnerability
 

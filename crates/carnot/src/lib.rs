@@ -473,6 +473,11 @@ impl CarnotBuilder {
         if let Some(plugin_cfg) = self.claude_plugins_config.take() {
             let plugin_mod = ClaudePluginsModule::load(&self.config.workspace_root, &plugin_cfg)?;
             if !plugin_mod.is_empty() {
+                for root in plugin_mod.plugin_roots() {
+                    if !self.config.skills_dirs.iter().any(|d| d == &root) {
+                        self.config.skills_dirs.push(root);
+                    }
+                }
                 cfgs.extend(plugin_mod.mcp_servers().clone());
                 self.extra_modules.push(Arc::new(plugin_mod));
             }
@@ -520,6 +525,12 @@ impl CarnotBuilder {
         if let Some(max_out) = registry.max_output_tokens_for_model(&self.config.model) {
             self.config.max_output_tokens = max_out;
         }
+        // Guard against providers rejecting `input_tokens + max_tokens > context_window`:
+        // cap default max_output_tokens to at most half the context window.
+        let safe_max_out = ((self.config.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+        if self.config.max_output_tokens > safe_max_out {
+            self.config.max_output_tokens = safe_max_out;
+        }
         if self.config.scrubbed_env_vars.is_empty() {
             self.config.scrubbed_env_vars = registry.catalog().secret_env_vars();
         }
@@ -548,9 +559,11 @@ impl CarnotBuilder {
 
         let mut modules: Vec<Arc<dyn Module>> = Vec::new();
         let sw = &self.config.modules;
-        let policy_mod: Option<Arc<dyn Module>> = self
-            .policy_guard
-            .then(|| Arc::new(PolicyGuardModule::new()) as Arc<dyn Module>);
+        let policy_mod: Option<Arc<dyn Module>> = self.policy_guard.then(|| {
+            Arc::new(
+                PolicyGuardModule::new().with_workspace_root(self.config.workspace_root.clone()),
+            ) as Arc<dyn Module>
+        });
 
         if sw.exec_microskills {
             modules.push(Arc::new(ExecMicroSkillsModule::new()));
