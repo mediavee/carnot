@@ -211,7 +211,7 @@ struct BackgroundJob {
     started: Instant,
     output: Mutex<BoundedOutput>,
     progress: Mutex<ProgressSlot>,
-    pty: Option<Mutex<PtyHandle>>,
+    pty: Option<Mutex<Option<PtyHandle>>>,
     exit_rx: watch::Receiver<Option<i32>>,
     cancel: CancellationToken,
 }
@@ -268,11 +268,23 @@ impl BackgroundJob {
         let mut guard = pty_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
+        let Some(ref mut handle) = *guard else {
+            return Err("PTY job has already exited; stdin is closed".into());
+        };
+        handle
             .writer
             .write_all(data.as_bytes())
-            .and_then(|()| guard.writer.flush())
+            .and_then(|()| handle.writer.flush())
             .map_err(|e| format!("failed to write to PTY stdin: {e}"))
+    }
+
+    fn close_pty(&self) {
+        if let Some(ref pty_lock) = self.pty {
+            let _ = pty_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
     }
 }
 
@@ -581,10 +593,10 @@ impl BashTool {
             started: Instant::now(),
             output: Mutex::new(BoundedOutput::default()),
             progress: Mutex::new(ProgressSlot::new(progress)),
-            pty: Some(Mutex::new(PtyHandle {
+            pty: Some(Mutex::new(Some(PtyHandle {
                 writer,
                 _master: pair.master,
-            })),
+            }))),
             exit_rx: exit_rx.clone(),
             cancel: job_cancel.clone(),
         });
@@ -646,6 +658,8 @@ impl BashTool {
             {
                 read_abort.abort();
             }
+            // Drop PTY master + writer immediately on exit so no stale fd/reader lingers.
+            job_bg.close_pty();
             job_bg.flush_progress();
             let _ = exit_tx.send(Some(exit));
         });
@@ -1258,6 +1272,37 @@ mod tests {
             .expect("timeout run");
         assert!(out.is_error, "timeout must mark error");
         assert_eq!(out.details["exit_code"], 124, "timeout exit code 124");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pty_mode_works_under_macos_seatbelt_sandbox() {
+        let dir =
+            std::env::temp_dir().join(format!("carnot-bash-pty-sb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut cfg = carnot_core::CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = true;
+        cfg.modules.sandbox_network = false;
+
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let reg = crate::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let bash = reg.get("Bash").expect("Bash");
+
+        let out = bash
+            .execute(
+                json!({"command": "test -t 1 && echo SEATBELT_PTY_OK", "pty": true}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("sandboxed pty run");
+        assert!(!out.is_error, "sandboxed PTY failed: {}", out.text_only());
+        assert!(
+            out.text_only().contains("SEATBELT_PTY_OK"),
+            "expected sandboxed PTY output, got: {}",
+            out.text_only()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

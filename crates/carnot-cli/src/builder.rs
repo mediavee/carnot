@@ -180,7 +180,8 @@ pub(crate) async fn build_agent_full(
             .exclude_tools
             .iter()
             .any(|t| t.eq_ignore_ascii_case("bash"));
-        let has_mcp = !cli.no_mcp && has_configured_mcp_servers(&cwd, cli.trust_workspace_mcp);
+        let has_mcp = !extra_mcp.is_empty()
+            || (!cli.no_mcp && has_configured_mcp_servers(&cwd, cli.trust_workspace_mcp));
         // Defer `CodeMode` behind `ToolSearch` in default standalone Bash-only sessions so plain
         // shell/SWE sessions pay 0 eager prefix tokens; load eagerly when `--codemode`, MCP
         // servers, or `--exclude-tool Bash` are active.

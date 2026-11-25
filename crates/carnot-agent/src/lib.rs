@@ -17,6 +17,7 @@ mod session_ops;
 mod tests;
 pub mod tool_search;
 mod turn;
+mod turn_tools;
 
 use crate::compaction::hydrate_anchors_from_session;
 use crate::context::{
