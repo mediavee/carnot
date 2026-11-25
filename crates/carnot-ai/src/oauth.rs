@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -167,7 +167,7 @@ impl std::fmt::Debug for OAuthStoredToken {
             .field("scope", &self.scope)
             .field("token_url", &self.token_url)
             .field("updated_at_epoch_secs", &self.updated_at_epoch_secs)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -185,7 +185,12 @@ impl OAuthStoredToken {
 
     pub fn seconds_until_expiry(&self) -> Option<i64> {
         let exp = self.expires_at_epoch_secs?;
-        Some((exp as i64) - (now_epoch_secs() as i64))
+        let now = now_epoch_secs();
+        if exp >= now {
+            Some(i64::try_from(exp - now).unwrap_or(i64::MAX))
+        } else {
+            Some(-i64::try_from(now - exp).unwrap_or(i64::MAX))
+        }
     }
 
     pub fn can_refresh(&self, oauth_cfg: Option<&OAuthConfig>) -> bool {
@@ -193,8 +198,7 @@ impl OAuthStoredToken {
             .refresh_token
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .is_none()
+            .is_none_or(str::is_empty)
         {
             return false;
         }
@@ -449,8 +453,9 @@ impl AuthStore {
 type ManagerRegistry = std::sync::Mutex<HashMap<(PathBuf, String), Arc<OAuthTokenManager>>>;
 
 fn shared_manager_registry() -> &'static ManagerRegistry {
-    static REGISTRY: OnceLock<ManagerRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    static REGISTRY: LazyLock<ManagerRegistry> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    &REGISTRY
 }
 
 /// Thread-safe, process-wide single-flight OAuth token manager attached to `ResolvedAuth::OAuth`.
@@ -467,7 +472,7 @@ impl std::fmt::Debug for OAuthTokenManager {
         f.debug_struct("OAuthTokenManager")
             .field("profile", &self.profile)
             .field("store", &self.store.path())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -500,7 +505,7 @@ impl OAuthTokenManager {
         let key = (store.path().to_path_buf(), profile.clone());
         let mut reg = shared_manager_registry()
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = reg.get(&key) {
             return Arc::clone(existing);
         }
@@ -513,7 +518,7 @@ impl OAuthTokenManager {
     pub fn evict(store_path: &Path, profile: &str) {
         let mut reg = shared_manager_registry()
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reg.remove(&(store_path.to_path_buf(), profile.to_string()));
     }
 
@@ -547,7 +552,7 @@ impl OAuthTokenManager {
         let disk_tok = tokio::task::spawn_blocking(move || store_clone.get(&profile_clone))
             .await
             .ok()
-            .and_then(|r| r.ok())
+            .and_then(std::result::Result::ok)
             .flatten();
 
         if let Some(disk_tok) = disk_tok {
@@ -646,22 +651,86 @@ pub enum OAuthPrompt {
 }
 
 /// Pure safe Rust FIPS 180-4 SHA-256 (zero unsafe, zero external crates).
+#[expect(
+    clippy::many_single_char_names,
+    reason = "FIPS 180-4 SHA-256 working variables are canonically named a..h"
+)]
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
     ];
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
     ];
 
     let bit_len = (data.len() as u64).wrapping_mul(8);
@@ -752,8 +821,7 @@ pub fn generate_oauth_state() -> String {
 pub fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Attempts to open a URL in the user's default browser (best-effort; never fatal).
@@ -1018,14 +1086,13 @@ where
     let client_id = cfg
         .resolve_client_id(opts.client_id_override.as_deref())
         .ok_or_else(|| {
-            let hint = cfg
-                .client_id_env
-                .as_deref()
-                .map(|e| format!(" (set `{e}` or pass `--client-id`)"))
-                .unwrap_or_else(|| {
+            let hint = cfg.client_id_env.as_deref().map_or_else(
+                || {
                     " (pass `--client-id` or set `oauth.client_id` in ~/.carnot/providers.json)"
                         .into()
-                });
+                },
+                |e| format!(" (set `{e}` or pass `--client-id`)"),
+            );
             oauth_err(
                 "oauth",
                 format!(
@@ -1434,7 +1501,7 @@ async fn exchange_refresh_token(
         .client_id
         .clone()
         .or_else(|| oauth_cfg.and_then(|c| c.resolve_client_id(None)));
-    let client_secret = oauth_cfg.and_then(|c| c.resolve_client_secret());
+    let client_secret = oauth_cfg.and_then(OAuthConfig::resolve_client_secret);
 
     let mut form: Vec<(String, String)> = vec![
         ("grant_type".into(), "refresh_token".into()),
@@ -1772,7 +1839,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
     }
 
     #[test]

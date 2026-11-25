@@ -181,11 +181,11 @@ fn glob_to_regex(glob: &str) -> Option<Regex> {
         return None;
     }
     let mut rx = String::with_capacity(g.len() * 2 + 4);
-    if !g.contains('/') {
+    if g.contains('/') {
+        rx.push('^');
+    } else {
         // Basename glob like `*.rs`: match end of path or after `/`
         rx.push_str("(?:^|/)");
-    } else {
-        rx.push('^');
     }
     let chars: Vec<char> = g.chars().collect();
     let mut i = 0;
@@ -639,7 +639,7 @@ impl HooksModule {
 }
 
 impl Module for HooksModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "hooks"
     }
 

@@ -1,7 +1,9 @@
 use crate::store::{CasHandle, CasStore};
 use carnot_core::Result;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::borrow::Cow;
+use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 /// Result of shaping a text tool output (never called on image blocks).
 #[derive(Debug, Clone)]
@@ -13,21 +15,23 @@ pub struct ShapedOutput {
     pub compressor: Option<&'static str>,
 }
 
-fn ansi_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)")
-            .expect("valid ANSI regex")
-    })
-}
+static ANSI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)")
+        .expect("valid ANSI regex")
+});
 
 /// Cleans terminal noise (ANSI escapes, carriage-return progress overwrites, consecutive duplicate
 /// lines) while preserving every diagnostic/failure line intact.
 pub fn clean_terminal_noise(raw: &str) -> String {
-    let stripped = ansi_regex().replace_all(raw, "");
-    let mut cleaned_lines: Vec<String> = Vec::new();
-    let mut prev_line: Option<String> = None;
+    let stripped: Cow<'_, str> = if raw.contains('\x1B') {
+        ANSI_REGEX.replace_all(raw, "")
+    } else {
+        Cow::Borrowed(raw)
+    };
+    let mut out = String::with_capacity(stripped.len());
+    let mut prev_line: Option<&str> = None;
     let mut repeat_count: usize = 0;
+    let mut first = true;
 
     for raw_line in stripped.split('\n') {
         let resolved = raw_line
@@ -35,22 +39,26 @@ pub fn clean_terminal_noise(raw: &str) -> String {
             .rsplit('\r')
             .next()
             .unwrap_or("");
-        if let Some(ref p) = prev_line {
+        if let Some(p) = prev_line {
             if p == resolved && !resolved.trim().is_empty() {
                 repeat_count += 1;
                 continue;
             } else if repeat_count > 0 {
-                cleaned_lines.push(format!("  [... repeated {repeat_count} more times]"));
+                let _ = write!(out, "\n  [... repeated {repeat_count} more times]");
                 repeat_count = 0;
             }
         }
-        prev_line = Some(resolved.to_string());
-        cleaned_lines.push(resolved.to_string());
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(resolved);
+        prev_line = Some(resolved);
     }
     if repeat_count > 0 {
-        cleaned_lines.push(format!("  [... repeated {repeat_count} more times]"));
+        let _ = write!(out, "\n  [... repeated {repeat_count} more times]");
     }
-    cleaned_lines.join("\n")
+    out
 }
 
 fn clip_line(line: &str, max_bytes: usize) -> &str {
@@ -465,12 +473,14 @@ fn compress_tsc_or_eslint(cleaned: &str, kind: CommandKind) -> Option<(String, &
                 let is_bare_file_header = !trim.is_empty()
                     && !line.starts_with(' ')
                     && !trim.contains(' ')
-                    && (trim.ends_with(".ts")
-                        || trim.ends_with(".tsx")
-                        || trim.ends_with(".js")
-                        || trim.ends_with(".jsx")
-                        || trim.ends_with(".mjs")
-                        || trim.ends_with(".cjs"));
+                    && std::path::Path::new(trim).extension().is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("ts")
+                            || ext.eq_ignore_ascii_case("tsx")
+                            || ext.eq_ignore_ascii_case("js")
+                            || ext.eq_ignore_ascii_case("jsx")
+                            || ext.eq_ignore_ascii_case("mjs")
+                            || ext.eq_ignore_ascii_case("cjs")
+                    });
                 trim.contains(" error ")
                     || trim.contains(" warning ")
                     || trim.starts_with('✖')
@@ -586,9 +596,7 @@ pub fn shape_command_output_with_redaction(
     };
 
     // 1. Try specialized deterministic semantic compressor when command is known & output is sizable
-    let kind = command
-        .map(classify_command)
-        .unwrap_or(CommandKind::Generic);
+    let kind = command.map_or(CommandKind::Generic, classify_command);
     if cleaned.len() > 1_200 {
         let compressed_opt = match kind {
             CommandKind::Cargo => compress_cargo(&cleaned),
@@ -614,10 +622,11 @@ pub fn shape_command_output_with_redaction(
                     "\n[... compressed diagnostics truncated; inspect full CAS handle ...]",
                 );
             }
-            comp_text.push_str(&format!(
+            let _ = write!(
+                comp_text,
                 "\n[full raw output: {} ({} lines, {} bytes, compressor={comp_name})]",
                 handle.rel_path, handle.lines, handle.bytes
-            ));
+            );
             let shaped_bytes = comp_text.len();
             return Ok(ShapedOutput {
                 text: comp_text,
@@ -700,7 +709,7 @@ pub fn shape_command_output_with_redaction(
 
     let omitted = tail_start.saturating_sub(head_end);
     if omitted > 0 {
-        preview.push_str(&format!("\n... [{omitted} lines omitted] ..."));
+        let _ = write!(preview, "\n... [{omitted} lines omitted] ...");
     }
     if !diag_buf.is_empty() {
         preview.push_str("\n[key diagnostics]\n");
@@ -712,10 +721,11 @@ pub fn shape_command_output_with_redaction(
     }
 
     if let Some(ref h) = handle {
-        preview.push_str(&format!(
+        let _ = write!(
+            preview,
             "\n[full output: {} ({} lines, {} bytes) — use Read(offset, limit) or Grep]",
             h.rel_path, h.lines, h.bytes
-        ));
+        );
     }
 
     let shaped_bytes = preview.len();
@@ -751,7 +761,7 @@ mod tests {
             if i == 150 {
                 big.push_str("error: src/auth.rs:42 invalid token signature\n");
             } else {
-                big.push_str(&format!("info line {i}: normal log output padding text\n"));
+                let _ = writeln!(big, "info line {i}: normal log output padding text");
             }
         }
         let shaped = shape_text_output(&big, Some(&store), 4096, 1400).expect("shape");
@@ -768,10 +778,10 @@ mod tests {
         let store = CasStore::open(&dir).expect("cas");
         let mut log = String::new();
         for i in 0..60 {
-            log.push_str(&format!("   Compiling crate_{i} v0.1.{i}\n"));
+            let _ = writeln!(log, "   Compiling crate_{i} v0.1.{i}");
         }
         for i in 0..120 {
-            log.push_str(&format!("test module::case_{i} ... ok\n"));
+            let _ = writeln!(log, "test module::case_{i} ... ok");
         }
         log.push_str("test module::auth_check ... FAILED\n\nfailures:\n\n---- module::auth_check stdout ----\nthread 'module::auth_check' panicked at src/auth.rs:88:9:\nassertion `left == right` failed\n  left: 401\n right: 200\n\nfailures:\n    module::auth_check\n\ntest result: FAILED. 120 passed; 1 failed; 0 ignored\n");
 

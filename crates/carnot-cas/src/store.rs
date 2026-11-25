@@ -64,8 +64,7 @@ impl CasStore {
         let already_existed = local_root.is_dir();
         let probe_nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let probe = local_root.join(format!(
             ".carnot-probe-{}-{probe_nonce}",
             std::process::id()
@@ -105,8 +104,7 @@ impl CasStore {
 
     pub fn root(&self) -> &Path {
         self.resolve_location()
-            .map(|l| l.root.as_path())
-            .unwrap_or_else(|_| self.workspace_root.as_path())
+            .map_or_else(|_| self.workspace_root.as_path(), |l| l.root.as_path())
     }
 
     /// Stores raw bytes atomically (`tmp + sync_all + rename`) under their full 256-bit BLAKE3 key.
@@ -117,6 +115,10 @@ impl CasStore {
         let file_name = format!("{hash}.log");
         let path = loc.root.join(&file_name);
         let rel_path = format!("{}/{file_name}", loc.display_prefix);
+        #[expect(
+            clippy::naive_bytecount,
+            reason = "LLVM auto-vectorizes in release; avoids extra crate dependency"
+        )]
         let lines = bytes.iter().filter(|&&b| b == b'\n').count()
             + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
 
@@ -138,8 +140,7 @@ impl CasStore {
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .map_or(0, |d| d.as_nanos())
         ));
         {
             let mut f = fs::File::create(&tmp)?;
@@ -191,15 +192,14 @@ impl CasStore {
 
     /// Removes handle blobs older than `max_age` (hygiene for logs that may contain secrets).
     pub fn gc_older_than(&self, max_age: Duration) -> Result<usize> {
-        let dir = match self.location.get() {
-            Some(loc) => loc.root.clone(),
-            None => {
-                let local = self.workspace_root.join(".carnot").join("h");
-                if local.is_dir() {
-                    local
-                } else {
-                    return Ok(0);
-                }
+        let dir = if let Some(loc) = self.location.get() {
+            loc.root.clone()
+        } else {
+            let local = self.workspace_root.join(".carnot").join("h");
+            if local.is_dir() {
+                local
+            } else {
+                return Ok(0);
             }
         };
         gc_dir_older_than(&dir, max_age)

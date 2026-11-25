@@ -79,7 +79,7 @@ impl ContentOrigin {
 ///
 /// Images are modeled as an explicit variant so CAS text-spill logic NEVER converts
 /// image payloads into file handles. `Opaque` preserves provider-specific blocks such as
-/// `redacted_thinking`, OpenAI encrypted reasoning items, or server tool results verbatim
+/// `redacted_thinking`, `OpenAI` encrypted reasoning items, or server tool results verbatim
 /// when replaying to the same `(api, provider, model)` origin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -87,7 +87,7 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
-    /// Signed thinking block bound to its exact preceding prefix (Anthropic / Gemini / DeepSeek).
+    /// Signed thinking block bound to its exact preceding prefix (Anthropic / Gemini / `DeepSeek`).
     Thinking {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,7 +99,7 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
-        /// Set when streaming produced malformed JSON; the agent returns an error tool_result
+        /// Set when streaming produced malformed JSON; the agent returns an error `tool_result`
         /// instead of silently executing `{}`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invalid_json: Option<String>,
@@ -135,8 +135,7 @@ impl ContentBlock {
             Self::Opaque { raw, .. } => raw
                 .get("type")
                 .and_then(serde_json::Value::as_str)
-                .map(|t| t == "redacted_thinking" || t == "thinking" || t == "reasoning")
-                .unwrap_or(false),
+                .is_some_and(|t| t == "redacted_thinking" || t == "thinking" || t == "reasoning"),
             _ => false,
         }
     }
@@ -228,6 +227,7 @@ impl Message {
 
     /// Returns a clone with all `Thinking`, `redacted_thinking`, and heavy `Image` blocks stripped
     /// (used on compaction so old screenshots aren't re-billed every turn and signatures stay valid).
+    #[must_use]
     pub fn without_thinking(&self) -> Self {
         Self {
             role: self.role,
@@ -311,11 +311,11 @@ pub struct ToolSpec {
 pub fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
     match v {
         serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
             let mut out = serde_json::Map::with_capacity(map.len());
             for k in keys {
-                out.insert(k.clone(), canonicalize_json(&map[k]));
+                out.insert(k.to_string(), canonicalize_json(&map[k]));
             }
             serde_json::Value::Object(out)
         }
@@ -455,6 +455,7 @@ impl ToolOutput {
         }
     }
 
+    #[must_use]
     pub fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = details;
         self
@@ -483,12 +484,12 @@ impl ToolOutput {
 /// Provider-agnostic prompt-cache retention policy.
 ///
 /// Each provider maps these tiers to its native caching primitives:
-/// - **Anthropic / OpenRouter Claude:** `Short` = `5m` everywhere (1.25× write), `Hybrid` = `1h`
+/// - **Anthropic / `OpenRouter` Claude:** `Short` = `5m` everywhere (1.25× write), `Hybrid` = `1h`
 ///   on static prefix + Turn-1 and `5m` on rolling conversation turns, `Long` = `1h` everywhere
 ///   (2.0× write, ideal for interactive sessions with >5 min human pauses).
-/// - **OpenAI / OpenAI Responses:** `Short` = default in-memory retention, `Hybrid` / `Long` =
+/// - **`OpenAI` / `OpenAI` Responses:** `Short` = default in-memory retention, `Hybrid` / `Long` =
 ///   extended `24h` retention (`prompt_cache_retention: "24h"`) with stable `prompt_cache_key`.
-/// - **Gemini / DeepSeek / Grok / local:** automatic server-side prefix caching.
+/// - **Gemini / `DeepSeek` / Grok / local:** automatic server-side prefix caching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheTtl {
@@ -524,6 +525,7 @@ impl CacheTtl {
 
     /// Retention tier applied to static prefix breakpoints (system prompt, tools, Turn-1 anchor).
     #[inline]
+    #[must_use]
     pub fn static_prefix_tier(self) -> Self {
         match self {
             Self::Short => Self::Short,
@@ -533,6 +535,7 @@ impl CacheTtl {
 
     /// Retention tier applied to rolling conversation breakpoints.
     #[inline]
+    #[must_use]
     pub fn conversation_tier(self) -> Self {
         match self {
             Self::Short | Self::Hybrid => Self::Short,
@@ -541,7 +544,7 @@ impl CacheTtl {
     }
 }
 
-/// Reasoning effort setting passed via Anthropic `output_config.effort` / OpenAI `reasoning_effort`.
+/// Reasoning effort setting passed via Anthropic `output_config.effort` / `OpenAI` `reasoning_effort`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -553,7 +556,7 @@ pub enum ReasoningEffort {
     Max,
 }
 
-/// Exact per-model pricing table ($/MTok) with cache-efficiency helpers.
+/// Exact per-model pricing table ($/`MTok`) with cache-efficiency helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub input_per_mtok: f64,
@@ -606,7 +609,7 @@ impl ModelPricing {
         cache_write_1h_mult: 2.0,
     };
 
-    /// Pricing for `claude-haiku-4-5` ($1/$5 per MTok).
+    /// Pricing for `claude-haiku-4-5` ($1/$5 per `MTok`).
     pub const HAIKU_4_5: Self = Self {
         input_per_mtok: 1.0,
         output_per_mtok: 5.0,
@@ -623,7 +626,7 @@ impl ModelPricing {
         cache_write_1h_mult: 2.0,
     };
 
-    /// Pricing for `claude-fable-5` / `claude-fable-5-1` ($10/$50 per MTok).
+    /// Pricing for `claude-fable-5` / `claude-fable-5-1` ($10/$50 per `MTok`).
     pub const FABLE_5_0: Self = Self {
         input_per_mtok: 10.0,
         output_per_mtok: 50.0,
@@ -632,7 +635,7 @@ impl ModelPricing {
         cache_write_1h_mult: 2.0,
     };
 
-    /// Pricing for `claude-mythos-*` ($8/$40 per MTok).
+    /// Pricing for `claude-mythos-*` ($8/$40 per `MTok`).
     pub const MYTHOS: Self = Self {
         input_per_mtok: 8.0,
         output_per_mtok: 40.0,
@@ -746,6 +749,7 @@ impl ModelPricing {
     }
 
     /// Resolves effective pricing tier accounting for Haiku 5.5 >100K long-context tier ($0.50/$2.50).
+    #[must_use]
     pub fn for_context_tokens(self, total_context_tokens: u64) -> Self {
         if (self.input_per_mtok - Self::HAIKU_5_5.input_per_mtok).abs() < 1e-9
             && total_context_tokens > 100_000
@@ -824,6 +828,7 @@ impl ContextBreakdown {
 
     /// Scales the five category counts proportionally so their sum equals `target_total` exactly
     /// using the largest-remainder method.
+    #[must_use]
     pub fn scaled_to(&self, target_total: u64) -> Self {
         let raw = [
             self.system,
@@ -861,7 +866,7 @@ impl ContextBreakdown {
         }
 
         let mut leftover = target_total.saturating_sub(assigned);
-        remainders.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        remainders.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         for &(_, idx) in &remainders {
             if leftover == 0 {
                 break;
@@ -1158,7 +1163,7 @@ pub struct UserQuestionAnswer {
     pub text: Option<String>,
 }
 
-/// Complete stop reason taxonomy (Anthropic Opus/Sonnet 5.5 + OpenAI).
+/// Complete stop reason taxonomy (Anthropic Opus/Sonnet 5.5 + `OpenAI`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -1239,10 +1244,10 @@ impl Default for ModuleSwitches {
 /// Provider-native server-side web tool capabilities (populated declaratively from `providers.json`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderWebCapabilities {
-    /// Provider supports native server-side web search (Anthropic `web_search`, OpenAI Responses
+    /// Provider supports native server-side web search (Anthropic `web_search`, `OpenAI` Responses
     /// `web_search`, Gemini `googleSearch`).
     pub native_search: bool,
-    /// Provider supports native server-side URL fetch (Anthropic `web_fetch`, OpenAI Responses
+    /// Provider supports native server-side URL fetch (Anthropic `web_fetch`, `OpenAI` Responses
     /// `web_search`, Gemini `urlContext`).
     pub native_fetch: bool,
 }
@@ -1269,7 +1274,7 @@ pub struct NativeWebConfig {
     /// Optional hostname blocklist (no scheme, e.g. `example.com`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_domains: Vec<String>,
-    /// Optional search context size hint (`"low"`, `"medium"`, `"high"` — OpenAI Responses).
+    /// Optional search context size hint (`"low"`, `"medium"`, `"high"` — `OpenAI` Responses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_context_size: Option<String>,
 }
@@ -1333,7 +1338,7 @@ pub struct CarnotConfig {
     /// Explicit provider catalog JSON override paths (`providers.json`).
     #[serde(default)]
     pub provider_config_paths: Vec<PathBuf>,
-    /// Must be explicitly opted-in to execute workspace-local `.mcp.json` (blocks MCPoison RCE).
+    /// Must be explicitly opted-in to execute workspace-local `.mcp.json` (blocks `MCPoison` RCE).
     #[serde(default)]
     pub trust_workspace_mcp: bool,
     /// Explicit drop-in file extension paths (`--ext <file>`) to load via JSON-RPC stdio (`carnot-ext/1`).
@@ -1379,6 +1384,10 @@ fn default_max_tokens_continuations() -> u8 {
     4
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default attribute requires fn() -> Option<u64>"
+)]
 fn default_soft_compaction_tokens() -> Option<u64> {
     Some(220_000)
 }
@@ -1393,9 +1402,10 @@ fn default_compaction_tail_budget_tokens() -> u64 {
 
 impl CarnotConfig {
     pub fn new(workspace_root: PathBuf) -> Self {
-        let session_dir = std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".carnot").join("sessions"))
-            .unwrap_or_else(|| workspace_root.join(".carnot").join("sessions"));
+        let session_dir = std::env::var_os("HOME").map_or_else(
+            || workspace_root.join(".carnot").join("sessions"),
+            |h| PathBuf::from(h).join(".carnot").join("sessions"),
+        );
         Self {
             workspace_root,
             extra_writable_roots: Vec::new(),

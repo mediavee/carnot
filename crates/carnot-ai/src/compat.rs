@@ -1,5 +1,5 @@
 //! Shared wire-protocol compatibility helpers (RFC 7396 JSON merge patch, Retry-After parsing,
-//! declarative UsageMap extraction, cross-provider origin matching, and Gemini schema sanitizer).
+//! declarative `UsageMap` extraction, cross-provider origin matching, and Gemini schema sanitizer).
 //!
 //! ZERO provider names or URLs live in this module.
 
@@ -86,7 +86,6 @@ pub fn is_retryable_status(status: u16) -> bool {
 /// Exhaustive multi-provider context-window overflow classifier (covers HTTP 413, combined
 /// input+output ceilings, and 20+ gateway/provider messages while excluding TPM/rate-limit errors).
 pub fn is_context_overflow(status: Option<u16>, body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
     // Never misclassify rate-limit / TPM throttling as context overflow (would trigger destructive compaction!)
     const NON_OVERFLOW: &[&str] = &[
         "rate limit",
@@ -98,12 +97,6 @@ pub fn is_context_overflow(status: Option<u16>, body: &str) -> bool {
         "please wait",
         "quota exceeded",
     ];
-    if NON_OVERFLOW.iter().any(|p| lower.contains(p)) {
-        return false;
-    }
-    if status == Some(413) {
-        return true;
-    }
     const PATTERNS: &[&str] = &[
         "context_length_exceeded",
         "context_window_exceeded",
@@ -129,6 +122,13 @@ pub fn is_context_overflow(status: Option<u16>, body: &str) -> bool {
         "context length",
         "sequence length",
     ];
+    let lower = body.to_ascii_lowercase();
+    if NON_OVERFLOW.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+    if status == Some(413) {
+        return true;
+    }
     PATTERNS.iter().any(|p| lower.contains(p))
 }
 
@@ -165,7 +165,7 @@ pub fn repair_json(raw: &str) -> Option<Value> {
                         i += 2;
                     }
                     'u' if i + 5 < chars.len()
-                        && chars[i + 2..i + 6].iter().all(|c| c.is_ascii_hexdigit()) =>
+                        && chars[i + 2..i + 6].iter().all(char::is_ascii_hexdigit) =>
                     {
                         for &c in &chars[i..i + 6] {
                             fixed.push(c);
@@ -470,7 +470,7 @@ pub fn sanitize_gemini_schema(schema: &Value) -> Value {
                 let mut new_props = Map::new();
                 // Deterministic key order for byte-identical prefix cache!
                 let mut keys: Vec<&String> = props.keys().collect();
-                keys.sort();
+                keys.sort_unstable();
                 for k in keys {
                     prop_keys.insert(k.clone());
                     new_props.insert(k.clone(), sanitize_gemini_schema(&props[k]));

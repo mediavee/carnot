@@ -128,9 +128,7 @@ fn load_repo_instructions(root: &Path) -> Option<String> {
     let skills_dir = root.join(".carnot").join("skills");
     if budget > 0
         && skills_dir.is_dir()
-        && !fs::symlink_metadata(&skills_dir)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(true)
+        && !fs::symlink_metadata(&skills_dir).map_or(true, |m| m.file_type().is_symlink())
         && let Ok(rd) = fs::read_dir(&skills_dir)
     {
         let mut skill_files: Vec<_> = rd
@@ -224,11 +222,7 @@ pub fn discover_agent_skills(root: &Path, extra_dirs: &[PathBuf]) -> Vec<(String
         if !dir.is_dir() {
             continue;
         }
-        if !is_explicit
-            && fs::symlink_metadata(&dir)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(true)
-        {
+        if !is_explicit && fs::symlink_metadata(&dir).map_or(true, |m| m.file_type().is_symlink()) {
             continue;
         }
         let Ok(rd) = fs::read_dir(&dir) else {
@@ -242,7 +236,7 @@ pub fn discover_agent_skills(root: &Path, extra_dirs: &[PathBuf]) -> Vec<(String
                 continue;
             }
             let canon = fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
-            if !seen_paths.insert(canon.clone()) {
+            if !seen_paths.insert(canon) {
                 continue;
             }
             let content = if is_explicit {
@@ -419,7 +413,7 @@ fn fast_git_branch(root: &Path) -> Option<String> {
 }
 
 impl Module for ExecMicroSkillsModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "exec_microskills"
     }
 

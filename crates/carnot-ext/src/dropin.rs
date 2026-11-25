@@ -137,10 +137,7 @@ fn scan_extensions_dir(dir: &Path, source: &str, out: &mut BTreeMap<String, Drop
     if !dir.is_dir() {
         return;
     }
-    if std::fs::symlink_metadata(dir)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -262,7 +259,7 @@ impl std::fmt::Debug for ExtConn {
         f.debug_struct("ExtConn")
             .field("ext_name", &self.ext_name)
             .field("closed", &self.closed.load(Ordering::Relaxed))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -321,7 +318,7 @@ impl ExtConn {
                         if let Some(id) = v.get("id").and_then(Value::as_u64)
                             && let Some(tx) = pending_r
                                 .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .remove(&id)
                         {
                             let res = if let Some(err) = v.get("error") {
@@ -338,7 +335,9 @@ impl ExtConn {
                 }
             }
             closed_r.store(true, Ordering::Release);
-            let mut map = pending_r.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = pending_r
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (_, tx) in map.drain() {
                 let _ = tx.send(Err(CarnotError::Extension {
                     extension: name_r.clone(),
@@ -387,7 +386,7 @@ impl ExtConn {
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, tx);
 
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
@@ -398,7 +397,7 @@ impl ExtConn {
             self.closed.store(true, Ordering::Release);
             self.pending
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
             return Err(CarnotError::Extension {
                 extension: self.ext_name.clone(),
@@ -409,7 +408,7 @@ impl ExtConn {
         let timed = async {
             match cancel {
                 Some(tok) => tokio::select! {
-                    _ = tok.cancelled() => Err(CarnotError::Cancelled),
+                    () = tok.cancelled() => Err(CarnotError::Cancelled),
                     r = tokio::time::timeout(self.timeout, rx) => match r {
                         Ok(Ok(val)) => val,
                         Ok(Err(_)) => Err(CarnotError::Extension {
@@ -443,7 +442,7 @@ impl ExtConn {
         if timed.is_err() {
             self.pending
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
         }
         timed
@@ -538,8 +537,7 @@ impl Tool for DropinTool {
                     let text = val
                         .get("text")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| val.to_string());
+                        .map_or_else(|| val.to_string(), str::to_string);
                     let is_error = val
                         .get("is_error")
                         .and_then(Value::as_bool)

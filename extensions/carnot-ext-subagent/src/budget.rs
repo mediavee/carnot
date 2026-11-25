@@ -9,12 +9,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 #[derive(Debug)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "_micros unit suffix on every monetary field prevents USD/micro-dollar unit confusion"
+)]
 pub struct FleetBudget {
     /// Worker-only spend in micro-dollars (fallback when no parent counter is attached).
     worker_spent_micros: AtomicU64,
     /// Shared monotonic total cost counter owned by the parent coordinator `Agent`.
     parent_total_micros: OnceLock<Arc<AtomicU64>>,
-    /// Optional hard fleet USD limit in micro-dollars (1 USD = 1_000_000 micros). `0` = unlimited.
+    /// Optional hard fleet USD limit in micro-dollars (1 USD = `1_000_000` micros). `0` = unlimited.
     limit_micros: u64,
 }
 
@@ -22,8 +26,7 @@ impl FleetBudget {
     pub fn new(limit_usd: Option<f64>) -> Self {
         let limit_micros = limit_usd
             .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| (v * 1_000_000.0).round() as u64)
-            .unwrap_or(0);
+            .map_or(0, |v| (v * 1_000_000.0).round() as u64);
         Self {
             worker_spent_micros: AtomicU64::new(0),
             parent_total_micros: OnceLock::new(),

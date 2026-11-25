@@ -1,4 +1,4 @@
-//! Declarative OpenAI Chat Completions wire protocol adapter (`api = "openai-completions"`).
+//! Declarative `OpenAI` Chat Completions wire protocol adapter (`api = "openai-completions"`).
 //!
 //! Zero hardcoded provider names, hostnames, or `detect_compat` URL heuristics!
 //! Driven 100% by `CompatFlags`, `UsageMap`, `headers`, and `body_patch` from `providers.json`.
@@ -10,7 +10,7 @@
 //!   with `origin`, and replays `reasoning_content` on assistant messages when configured.
 //! - Declarative `max_tokens_field` (`max_completion_tokens` vs `max_tokens`), `developer` role,
 //!   `reasoning_effort` vs `reasoning: { effort }`, `prompt_cache_key`, `session_id_header`, `body_patch`.
-//! - Accurate declarative `UsageMap` (handles OpenAI, xAI, DeepSeek top-level cache hit, OpenRouter).
+//! - Accurate declarative `UsageMap` (handles `OpenAI`, xAI, `DeepSeek` top-level cache hit, `OpenRouter`).
 //! - `Retry-After` parsing, retries on `408|429|500|502|503|504|529`, and non-retryable stream error classification.
 
 use crate::catalog::{ProviderCatalog, ResolvedAuth, ResolvedProviderSpec};
@@ -24,7 +24,7 @@ use carnot_core::{
     CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ReasoningEffort, Result, Role,
     StopReason, ToolResultBlock, Usage,
 };
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -65,7 +65,10 @@ impl OpenAiProvider {
         Self::with_base_url(api_key, base_url, "openai".into())
     }
 
-    pub fn with_base_url(api_key: String, base_url: String, provider_label: String) -> Self {
+    pub fn with_base_url(api_key: String, mut base_url: String, provider_label: String) -> Self {
+        while base_url.ends_with('/') {
+            base_url.pop();
+        }
         let catalog = ProviderCatalog::embedded().unwrap_or_default();
         let entry = catalog
             .find_provider(&provider_label)
@@ -73,7 +76,7 @@ impl OpenAiProvider {
         let spec = ResolvedProviderSpec {
             provider_id: provider_label,
             api: API_ID.into(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             fallback_base_urls: Vec::new(),
             project_id: None,
             auth: ResolvedAuth::Bearer {
@@ -147,7 +150,7 @@ impl OpenAiProvider {
                             for tb in content {
                                 match tb {
                                     ToolResultBlock::Text { text } => {
-                                        text_parts.push(text.as_str())
+                                        text_parts.push(text.as_str());
                                     }
                                     ToolResultBlock::Image {
                                         media_type,
@@ -467,36 +470,35 @@ impl Provider for OpenAiProvider {
                 let mut stream_eof = false;
 
                 'stream_loop: loop {
-                    if !stream_eof {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
+                    if stream_eof {
+                        break 'stream_loop;
+                    }
+                    tokio::select! {
+                        () = cancel.cancelled() => {
+                            let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
+                            return;
+                        }
+                        chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => {
+                            let Ok(chunk_opt) = chunk else {
+                                let _ = tx.send(StreamEvent::Error { message: "stream idle timeout (300s)".into(), retryable: true }).await;
                                 return;
-                            }
-                            chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => {
-                                let Ok(chunk_opt) = chunk else {
-                                    let _ = tx.send(StreamEvent::Error { message: "stream idle timeout (300s)".into(), retryable: true }).await;
+                            };
+                            match chunk_opt {
+                                Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
+                                Some(Err(_)) => {
+                                    let _ = tx.send(StreamEvent::Error { message: "stream read error".into(), retryable: true }).await;
                                     return;
-                                };
-                                match chunk_opt {
-                                    Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
-                                    Some(Err(_)) => {
-                                        let _ = tx.send(StreamEvent::Error { message: "stream read error".into(), retryable: true }).await;
-                                        return;
+                                }
+                                None => {
+                                    stream_eof = true;
+                                    if raw_buf.is_empty() {
+                                        break 'stream_loop;
                                     }
-                                    None => {
-                                        stream_eof = true;
-                                        if raw_buf.is_empty() {
-                                            break 'stream_loop;
-                                        }
-                                        raw_buf.push(b'\n');
-                                    }
+                                    raw_buf.push(b'\n');
                                 }
                             }
                         }
-                    } else {
-                        break 'stream_loop;
-                    }
+                    };
                     while let Some(pos) = raw_buf.iter().position(|&b| b == b'\n') {
                         let line_bytes: Vec<u8> = raw_buf.drain(..=pos).collect();
                         let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
@@ -643,8 +645,7 @@ impl Provider for OpenAiProvider {
                                                     tool_calls
                                                         .keys()
                                                         .next_back()
-                                                        .map(|k| k + 1)
-                                                        .unwrap_or(0)
+                                                        .map_or(0, |k| k + 1)
                                                 } else {
                                                     tool_calls
                                                         .keys()
@@ -722,8 +723,7 @@ impl Provider for OpenAiProvider {
                     } else {
                         let err = serde_json::from_str::<Value>(trimmed)
                             .err()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "invalid JSON".into());
+                            .map_or_else(|| "invalid JSON".into(), |e| e.to_string());
                         (
                             json!({}),
                             Some(format!("malformed tool JSON ({err}): {trimmed}")),
@@ -791,7 +791,7 @@ fn cache_control_value(ttl_1h: bool) -> Value {
 
 /// Attaches `cache_control` to the final text/part of a Chat Completions message, converting plain
 /// string `content` into multipart `[{"type":"text","text":...,"cache_control":...}]` as required
-/// by OpenRouter / Anthropic-compatible gateways. Returns `false` if message has no cacheable text.
+/// by `OpenRouter` / Anthropic-compatible gateways. Returns `false` if message has no cacheable text.
 fn attach_cache_control_to_message(msg: &mut Value, cc: &Value) -> bool {
     let Some(obj) = msg.as_object_mut() else {
         return false;

@@ -215,7 +215,7 @@ impl Agent {
             effective_static_system_prompt(&config),
             tool_specs,
         )?;
-        Self::from_session(
+        Ok(Self::from_session(
             config,
             provider,
             tools,
@@ -223,7 +223,7 @@ impl Agent {
             session,
             false,
             question_broker,
-        )
+        ))
     }
 
     /// Resumes an existing crash-safe JSONL v2 session from disk (`carnot --resume` & ACP `session/load`).
@@ -252,7 +252,7 @@ impl Agent {
         let mut session = SessionStore::load(session_path)?;
         let _ = session.repair_dangling_tool_uses()?;
         let already_started = !session.active_messages().is_empty();
-        Self::from_session(
+        Ok(Self::from_session(
             config,
             provider,
             tools,
@@ -260,7 +260,7 @@ impl Agent {
             session,
             already_started,
             question_broker,
-        )
+        ))
     }
 
     /// Forks a saved JSONL v2 session from disk into a brand-new session (`carnot --resume <id> --fork`),
@@ -293,7 +293,7 @@ impl Agent {
         let mut forked = original.fork(session_dir)?;
         let _ = forked.repair_dangling_tool_uses()?;
         let already_started = !forked.active_messages().is_empty();
-        Self::from_session(
+        Ok(Self::from_session(
             config,
             provider,
             tools,
@@ -301,7 +301,7 @@ impl Agent {
             forked,
             already_started,
             question_broker,
-        )
+        ))
     }
 
     /// Creates a new `Agent` initialized from a parent conversation snapshot (zero-copy `Arc<Message>`
@@ -327,9 +327,12 @@ impl Agent {
         )
     }
 
-    /// Creates a forked `Agent` that also inherits the parent's `cache_key_id` so OpenAI
+    /// Creates a forked `Agent` that also inherits the parent's `cache_key_id` so `OpenAI`
     /// `prompt_cache_key` shards stay hot on the forked branch.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "forked agent constructor preserves explicit arguments aligned with Agent::new"
+    )]
     pub fn new_forked_with_cache_key(
         config: CarnotConfig,
         provider: Arc<dyn Provider>,
@@ -371,7 +374,7 @@ impl Agent {
             inherited_cache_key_id,
         )?;
         let already_started = !session.active_messages().is_empty();
-        Self::from_session(
+        Ok(Self::from_session(
             config,
             provider,
             tools,
@@ -379,7 +382,7 @@ impl Agent {
             session,
             already_started,
             question_broker,
-        )
+        ))
     }
 
     fn from_session(
@@ -390,7 +393,7 @@ impl Agent {
         mut session: SessionStore,
         turn1_already_injected: bool,
         question_broker: SharedQuestionBroker,
-    ) -> Result<Self> {
+    ) -> Self {
         let (hydrated_goal, hydrated_followups) =
             hydrate_anchors_from_session(session.active_messages());
         let events = Arc::new(EventLog::new());
@@ -407,8 +410,7 @@ impl Agent {
             &live_wire_tools,
         ) && live_hash != session.prefix_hash
         {
-            let old_hash = session.prefix_hash.clone();
-            session.prefix_hash = live_hash.clone();
+            let old_hash = std::mem::replace(&mut session.prefix_hash, live_hash.clone());
             events.push(AgentEvent::PrefixAudit {
                 prefix_hash: live_hash,
                 stable: false,
@@ -433,7 +435,7 @@ impl Agent {
             max_output_tokens: config.max_output_tokens,
         };
 
-        Ok(Self {
+        Self {
             config,
             runtime: Mutex::new(runtime),
             tools: Arc::new(tools),
@@ -456,7 +458,7 @@ impl Agent {
             deferred_server_descriptions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             last_prefix_state: Mutex::new(None),
             last_prompt_context_tokens: Mutex::new(None),
-        })
+        }
     }
 
     /// Attaches one-line MCP server descriptions displayed in the Turn-1 `[available-deferred-tools]`
@@ -645,8 +647,8 @@ impl Agent {
                 eager.push(s.name);
             }
         }
-        eager.sort();
-        deferred.sort();
+        eager.sort_unstable();
+        deferred.sort_unstable();
         (eager, deferred)
     }
 
@@ -722,7 +724,7 @@ impl Agent {
         if let Some(mo) = max_output_tokens {
             rt.max_output_tokens = mo;
         }
-        let safe_max_out = ((rt.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+        let safe_max_out = ((rt.context_window / 2).max(4096)).min(u64::from(u32::MAX)) as u32;
         if rt.max_output_tokens > safe_max_out {
             rt.max_output_tokens = safe_max_out;
         }
@@ -834,7 +836,7 @@ impl Agent {
     async fn effective_config_and_provider(&self) -> (CarnotConfig, Arc<dyn Provider>) {
         let rt = self.runtime.lock().await;
         let mut cfg = self.config.clone();
-        cfg.model = rt.model.clone();
+        cfg.model.clone_from(&rt.model);
         cfg.effort = rt.effort;
         cfg.cache_ttl = rt.cache_ttl;
         cfg.context_window = rt.context_window;
@@ -1197,14 +1199,12 @@ impl Agent {
                 .rolling_cache_ttl_ms(&live_model, live_ttl);
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_millis() as u64);
             let reclaimed = {
                 let mut s = self.session.lock().await;
                 let cache_expired = s
                     .last_activity_unix_ms()
-                    .map(|last| now_ms.saturating_sub(last) >= ttl_ms)
-                    .unwrap_or(false);
+                    .is_some_and(|last| now_ms.saturating_sub(last) >= ttl_ms);
                 if cache_expired && s.active_messages().len() >= 8 {
                     s.prune_cold_tool_results(4, 2_000, 24_000)?
                 } else {
@@ -1290,9 +1290,9 @@ impl Agent {
                     (s.effective_context_tokens(), s.active_messages().len())
                 };
                 let current_turns = self.metrics.lock().await.turns;
-                let cooldown_ok = last_compaction_turn
-                    .map(|t| current_turns.saturating_sub(t) >= eff_cfg.compaction_cooldown_turns)
-                    .unwrap_or(true);
+                let cooldown_ok = last_compaction_turn.is_none_or(|t| {
+                    current_turns.saturating_sub(t) >= eff_cfg.compaction_cooldown_turns
+                });
                 let trigger = effective_proactive_trigger(&eff_cfg);
                 if trigger > 0 && msg_count >= 10 && cooldown_ok && pre_est >= trigger {
                     last_compaction_turn = Some(current_turns);
@@ -1469,8 +1469,7 @@ impl Agent {
                         let tool_opt = self.tools.get(&name);
                         let raw_eff = tool_opt
                             .as_ref()
-                            .map(|t| t.effects(&input))
-                            .unwrap_or_else(ToolEffects::serial);
+                            .map_or_else(ToolEffects::serial, |t| t.effects(&input));
 
                         // Never block SSE stream draining on interactive human permission prompts;
                         // when a PermissionBroker is attached, defer gating & execution to Stage 1.
@@ -1580,8 +1579,8 @@ impl Agent {
                         "retrying transient mid-stream provider error"
                     );
                     tokio::select! {
-                        _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
-                        _ = tokio::time::sleep(delay) => {}
+                        () = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                        () = tokio::time::sleep(delay) => {}
                     }
                     continue;
                 }
@@ -1812,8 +1811,7 @@ impl Agent {
                     let effects = self
                         .tools
                         .get(tool_name)
-                        .map(|t| t.effects(&effective_input))
-                        .unwrap_or_else(ToolEffects::serial);
+                        .map_or_else(ToolEffects::serial, |t| t.effects(&effective_input));
                     pending_calls.push(ScheduledCall {
                         orig_idx: idx,
                         call_id: call_id.clone(),
@@ -1982,7 +1980,9 @@ impl Agent {
                 }
             } else {
                 consecutive_pause_turns = 0;
-                if !had_tools {
+                if had_tools {
+                    idle_turn_streak = 0;
+                } else {
                     idle_turn_streak += 1;
                     if self.config.idle_turn_circuit_breaker > 0
                         && idle_turn_streak >= self.config.idle_turn_circuit_breaker
@@ -1992,8 +1992,6 @@ impl Agent {
                         ));
                         should_halt = true;
                     }
-                } else {
-                    idle_turn_streak = 0;
                 }
             }
 
@@ -2408,6 +2406,7 @@ mod tests {
     use carnot_ai::faux::{FauxProvider, ScriptedTurn};
     use carnot_cas::CasStore;
     use serde_json::json;
+    use std::fmt::Write as _;
 
     #[tokio::test]
     async fn follow_up_waits_for_turn_settle_and_runs_in_fifo_order() {
@@ -2447,9 +2446,13 @@ mod tests {
     fn repetition_guard_catches_degenerate_loops_only() {
         let loop_text = "This is a stuck repeated line in output.\n".repeat(20);
         assert!(is_repetition_dominated(&loop_text));
-        let normal_text = (0..30)
-            .map(|i| format!("Unique diagnostic line number {i} with distinct payload {i:#x}\n"))
-            .collect::<String>();
+        let mut normal_text = String::with_capacity(30 * 64);
+        for i in 0..30 {
+            let _ = writeln!(
+                normal_text,
+                "Unique diagnostic line number {i} with distinct payload {i:#x}"
+            );
+        }
         assert!(!is_repetition_dominated(&normal_text));
     }
 

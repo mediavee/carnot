@@ -285,7 +285,9 @@ async fn serve_rpc_loop(
     register_reply_id: Option<Value>,
 ) -> Result<()> {
     let broker = ChannelInteractionBroker::new(Arc::clone(&agent));
-    agent.set_question_broker(broker.clone()).await;
+    agent
+        .set_question_broker(Arc::clone(&broker) as Arc<dyn carnot_ext::UserQuestionBroker>)
+        .await;
 
     // Reply to `host/register` now that the Agent is fully constructed with frozen prefix & tools.
     if let Some(reg_id) = register_reply_id {
@@ -299,7 +301,7 @@ async fn serve_rpc_loop(
 
     // Stream live events losslessly from the ring-buffered EventLog (`method: "event"`).
     let mut ev_stream = agent.subscribe();
-    let out_ev = stdout.clone();
+    let out_ev = Arc::clone(&stdout);
     let ev_task = tokio::spawn(async move {
         loop {
             let env = ev_stream.next().await;
@@ -327,7 +329,7 @@ async fn serve_rpc_loop(
             {
                 tokio::select! {
                     line = lines.next_line() => line?,
-                    _ = async {
+                    () = async {
                         if let Some(ref mut s) = sigterm {
                             s.recv().await;
                         } else {
@@ -433,10 +435,10 @@ async fn serve_rpc_loop(
 
             let ack_only = params.get("ack").and_then(Value::as_bool).unwrap_or(false);
             let blocks = build_prompt_blocks(&params);
-            let ag = agent.clone();
-            let out = stdout.clone();
-            let active_lock = run_active.clone();
-            let stop_flag = shutting_down.clone();
+            let ag = Arc::clone(&agent);
+            let out = Arc::clone(&stdout);
+            let active_lock = Arc::clone(&run_active);
+            let stop_flag = Arc::clone(&shutting_down);
             if ack_only {
                 let ack = json!({"jsonrpc": "2.0", "id": id, "result": {"accepted": true}});
                 write_frame(&stdout, &ack).await?;
@@ -467,14 +469,11 @@ async fn serve_rpc_loop(
                         if stop_flag.load(Ordering::Acquire) {
                             *guard = false;
                             None
+                        } else if let Some(msg) = ag.take_pending_wakeup().await {
+                            Some(msg)
                         } else {
-                            match ag.take_pending_wakeup().await {
-                                Some(msg) => Some(msg),
-                                None => {
-                                    *guard = false;
-                                    None
-                                }
-                            }
+                            *guard = false;
+                            None
                         }
                     };
                     let Some(followup) = next else {
@@ -502,10 +501,10 @@ async fn serve_rpc_loop(
             *active = true;
             drop(active);
 
-            let ag = agent.clone();
-            let out = stdout.clone();
-            let active_lock = run_active.clone();
-            let stop_flag = shutting_down.clone();
+            let ag = Arc::clone(&agent);
+            let out = Arc::clone(&stdout);
+            let active_lock = Arc::clone(&run_active);
+            let stop_flag = Arc::clone(&shutting_down);
             bg_tasks.push(tokio::spawn(async move {
                 let reply = match ag.continue_run().await {
                     Ok(Some(o)) => json!({"jsonrpc": "2.0", "id": id, "result": {
@@ -531,14 +530,11 @@ async fn serve_rpc_loop(
                         if stop_flag.load(Ordering::Acquire) {
                             *guard = false;
                             None
+                        } else if let Some(msg) = ag.take_pending_wakeup().await {
+                            Some(msg)
                         } else {
-                            match ag.take_pending_wakeup().await {
-                                Some(msg) => Some(msg),
-                                None => {
-                                    *guard = false;
-                                    None
-                                }
-                            }
+                            *guard = false;
+                            None
                         }
                     };
                     let Some(followup) = next else {
@@ -560,8 +556,8 @@ async fn serve_rpc_loop(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string);
-            let ag = agent.clone();
-            let out = stdout.clone();
+            let ag = Arc::clone(&agent);
+            let out = Arc::clone(&stdout);
             // Spawn so `before_compact` host callbacks never deadlock on stdin!
             bg_tasks.push(tokio::spawn(async move {
                 let reply = match ag.compact_now_with_focus(focus.as_deref()).await {
@@ -848,7 +844,11 @@ async fn serve_rpc_loop(
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
                 if require {
-                    agent.set_permission_broker(broker.clone()).await;
+                    agent
+                        .set_permission_broker(
+                            Arc::clone(&broker) as Arc<dyn carnot_ext::PermissionBroker>
+                        )
+                        .await;
                 } else {
                     agent.clear_permission_broker().await;
                 }
@@ -920,7 +920,7 @@ async fn serve_rpc_loop(
             tokio::pin!(task);
             tokio::select! {
                 _ = &mut task => {}
-                _ = async {
+                () = async {
                     if let Some(ref mut s) = sigterm {
                         s.recv().await;
                     } else {

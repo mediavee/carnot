@@ -1,11 +1,11 @@
 //! Multi-provider Conformance Test Matrix:
 //! Verifies ALL 6 wire protocol adapters (`anthropic-messages`, `openai-completions`,
 //! `openai-responses`, `google-generative`, `google-cloudcode`, `subprocess-jsonl`) on:
-//!   1. Plain text streaming & exact usage accounting (including DeepSeek top-level cache hit)
+//!   1. Plain text streaming & exact usage accounting (including `DeepSeek` top-level cache hit)
 //!   2. Parallel tool calls + malformed tool JSON preservation
 //!   3. Multimodal user images & tool-result image bridge
 //!   4. Thinking & `thoughtSignature` / `encrypted_content` 2-turn replay
-//!   5. Cross-provider origin sanitization (Anthropic -> Gemini -> OpenAI -> Responses zero 400s!)
+//!   5. Cross-provider origin sanitization (Anthropic -> Gemini -> `OpenAI` -> Responses zero 400s!)
 //!   6. 429 + `Retry-After` header propagation & non-retryable stream error classification
 //!   7. Cloud Code daily -> prod fallback on 404 + Gemini schema sanitizer
 //!   8. Persistent `subprocess-jsonl` child process across multiple turns + cancellation
@@ -26,6 +26,7 @@ use carnot_core::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -93,7 +94,7 @@ async fn spawn_mock_http(responses: Vec<MockHttpResponse>) -> (String, CapturedR
                 resp_body.len()
             );
             for (k, v) in extra_hdrs {
-                raw.push_str(&format!("{k}: {v}\r\n"));
+                let _ = write!(raw, "{k}: {v}\r\n");
             }
             raw.push_str("\r\n");
             raw.push_str(&resp_body);
@@ -134,7 +135,7 @@ fn sample_request(model: &str, messages: Vec<Message>) -> ProviderRequest {
         effort: ReasoningEffort::High,
         max_output_tokens: 4096,
         skip_tail_cache_write: false,
-        native_web: Default::default(),
+        native_web: carnot_core::NativeWebConfig::default(),
         ephemeral_tail_notes: Vec::new(),
     }
 }
@@ -662,7 +663,7 @@ async fn conformance_google_gemini_and_antigravity_cloudcode_fallback_and_though
         params
             .get("required")
             .and_then(Value::as_array)
-            .map(|a| a.len()),
+            .map(std::vec::Vec::len),
         Some(1)
     );
     assert!(prod_reqs[0].2.contains("skip_thought_signature_validator"));
@@ -721,8 +722,8 @@ for line in sys.stdin:
         betas: Vec::new(),
         cache_diagnosis_beta: None,
         native_tool_search: false,
-        compat: Default::default(),
-        usage_map: Default::default(),
+        compat: crate::catalog::CompatFlags::default(),
+        usage_map: crate::catalog::UsageMap::default(),
         body_patch: None,
         subprocess: Some(SubprocessProviderConfig {
             command: "python3".into(),
@@ -757,6 +758,30 @@ for line in sys.stdin:
 
 #[test]
 fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
+    fn scan_dir_recursive(dir: &std::path::Path, forbidden: &[&str]) {
+        for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir_recursive(&path, forbidden);
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            if path.file_name().and_then(|s| s.to_str()) == Some("conformance_tests.rs") {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).expect("read rs");
+            for needle in forbidden {
+                assert!(
+                    !content.contains(needle),
+                    "ZERO-HARDCODE VIOLATION: `{needle}` found in {} — must live in catalog/providers.json!",
+                    path.display()
+                );
+            }
+        }
+    }
+
     // Contract: zero provider-specific hostnames or match-arm hardcoding in Rust source.
     let forbidden = [
         "api.x.ai",
@@ -793,30 +818,6 @@ fn ci_gate_zero_hardcoded_providers_outside_data_catalog() {
         .join("..")
         .join("carnot")
         .join("src");
-
-    fn scan_dir_recursive(dir: &std::path::Path, forbidden: &[&str]) {
-        for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                scan_dir_recursive(&path, forbidden);
-                continue;
-            }
-            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
-                continue;
-            }
-            if path.file_name().and_then(|s| s.to_str()) == Some("conformance_tests.rs") {
-                continue;
-            }
-            let content = std::fs::read_to_string(&path).expect("read rs");
-            for needle in forbidden {
-                assert!(
-                    !content.contains(needle),
-                    "ZERO-HARDCODE VIOLATION: `{needle}` found in {} — must live in catalog/providers.json!",
-                    path.display()
-                );
-            }
-        }
-    }
 
     for dir in [ai_src, facade_src] {
         scan_dir_recursive(&dir, &forbidden);
@@ -1087,8 +1088,8 @@ async fn conformance_oauth_reactive_401_refresh_and_query_params() {
         betas: Vec::new(),
         cache_diagnosis_beta: None,
         native_tool_search: false,
-        compat: Default::default(),
-        usage_map: Default::default(),
+        compat: crate::catalog::CompatFlags::default(),
+        usage_map: crate::catalog::UsageMap::default(),
         body_patch: None,
         subprocess: None,
         catalog_models: BTreeMap::new(),

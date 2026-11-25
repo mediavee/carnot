@@ -22,8 +22,9 @@ pub use landlock::{
 };
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use tokio::process::Command;
 
 /// Safe environment variables preserved across `env_clear()`.
@@ -57,9 +58,7 @@ pub struct SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn for_workspace(workspace_root: PathBuf, enabled: bool, allow_network: bool) -> Self {
-        let canonical_ws = workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.clone());
+        let canonical_ws = workspace_root.canonicalize().unwrap_or(workspace_root);
         let frozen_git_write_dirs = resolve_verified_linked_git_dirs(&canonical_ws);
         Self {
             enabled,
@@ -71,6 +70,7 @@ impl SandboxPolicy {
         }
     }
 
+    #[must_use]
     pub fn with_extra_writable_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.extra_writable_roots = roots
             .into_iter()
@@ -79,6 +79,7 @@ impl SandboxPolicy {
         self
     }
 
+    #[must_use]
     pub fn with_scrubbed_env_vars(mut self, vars: Vec<String>) -> Self {
         self.scrubbed_env_vars = vars;
         self
@@ -389,13 +390,13 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
     for (h_idx, home) in homes.iter().enumerate() {
         for (tag, rel) in MACOS_DENY_SUBPATHS {
             let key = format!("DENY_{tag}_{h_idx}");
-            profile.push_str(&format!("  (subpath (param \"{key}\"))\n"));
+            let _ = writeln!(profile, "  (subpath (param \"{key}\"))");
             c.arg("-D")
                 .arg(format!("{key}={}", home.join(rel).display()));
         }
         for (tag, rel) in MACOS_DENY_LITERALS {
             let key = format!("DENY_{tag}_{h_idx}");
-            profile.push_str(&format!("  (literal (param \"{key}\"))\n"));
+            let _ = writeln!(profile, "  (literal (param \"{key}\"))");
             c.arg("-D")
                 .arg(format!("{key}={}", home.join(rel).display()));
         }
@@ -403,7 +404,7 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
     for (e_idx, extra_cred) in extra_sensitive_credential_files().into_iter().enumerate() {
         let key = format!("DENY_EXTRA_CRED_{e_idx}");
         let resolved = extra_cred.canonicalize().unwrap_or(extra_cred);
-        profile.push_str(&format!("  (literal (param \"{key}\"))\n"));
+        let _ = writeln!(profile, "  (literal (param \"{key}\"))");
         c.arg("-D").arg(format!("{key}={}", resolved.display()));
     }
     profile.push_str(")\n");
@@ -424,16 +425,12 @@ fn build_macos_seatbelt_command(policy: &SandboxPolicy, shell_cmd: &str) -> Comm
 
     for (idx, gdir) in policy.frozen_git_write_dirs.iter().enumerate() {
         let key = format!("GITW_{idx}");
-        profile.push_str(&format!(
-            "(allow file-write* (subpath (param \"{key}\")))\n"
-        ));
+        let _ = writeln!(profile, "(allow file-write* (subpath (param \"{key}\")))");
         c.arg("-D").arg(format!("{key}={}", gdir.display()));
     }
     for (idx, root) in policy.extra_writable_roots.iter().enumerate() {
         let key = format!("EXTRA_{idx}");
-        profile.push_str(&format!(
-            "(allow file-write* (subpath (param \"{key}\")))\n"
-        ));
+        let _ = writeln!(profile, "(allow file-write* (subpath (param \"{key}\")))");
         c.arg("-D").arg(format!("{key}={}", root.display()));
     }
 
@@ -467,29 +464,26 @@ fn resolve_bwrap_binary() -> Option<PathBuf> {
 /// Probes once whether `bwrap --unshare-all` actually succeeds on this host (false inside standard
 /// Docker containers where seccomp blocks `CLONE_NEWUSER`, triggering automatic Landlock fallback).
 fn working_bwrap_binary() -> Option<&'static Path> {
-    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            let bin = resolve_bwrap_binary()?;
-            let ok = std::process::Command::new(&bin)
-                .args([
-                    "--unshare-all",
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    resolve_shell_binary(),
-                    "-c",
-                    "true",
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            ok.then_some(bin)
-        })
-        .as_deref()
+    static CACHED: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+        let bin = resolve_bwrap_binary()?;
+        let ok = std::process::Command::new(&bin)
+            .args([
+                "--unshare-all",
+                "--ro-bind",
+                "/",
+                "/",
+                resolve_shell_binary(),
+                "-c",
+                "true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        ok.then_some(bin)
+    });
+    CACHED.as_deref()
 }
 
 fn build_linux_bwrap_command(
@@ -782,7 +776,7 @@ mod tests {
         )
         .expect("commondir");
 
-        let policy = SandboxPolicy::for_workspace(ws.clone(), true, false);
+        let policy = SandboxPolicy::for_workspace(ws, true, false);
         assert!(
             policy.frozen_git_write_dirs.is_empty(),
             "forged worktree commondir must be rejected"
@@ -863,10 +857,7 @@ mod tests {
 
         let mut extra = BTreeMap::new();
         extra.insert("HOME".to_string(), fake_home.display().to_string());
-        let cmd_str = format!(
-            "cat {:?} >/dev/null 2>&1 && echo READABLE || echo BLOCKED",
-            target
-        );
+        let cmd_str = format!("cat {target:?} >/dev/null 2>&1 && echo READABLE || echo BLOCKED");
         let out = build_sandboxed_shell(&policy, &cmd_str, &extra)
             .expect("cmd")
             .output()
@@ -875,9 +866,7 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "BLOCKED",
-            "Seatbelt must still block {:?} even when HOME is overridden to {:?}",
-            target,
-            fake_home
+            "Seatbelt must still block {target:?} even when HOME is overridden to {fake_home:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

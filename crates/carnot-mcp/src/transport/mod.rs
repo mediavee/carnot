@@ -245,10 +245,9 @@ impl McpClient {
             server_name.clone(),
             cache_key.clone(),
             cfg,
-            workspace_root,
-            list_changed.clone(),
-        )
-        .await?;
+            &workspace_root,
+            Arc::clone(&list_changed),
+        )?;
         let timeout = Duration::from_millis(cfg.timeout_ms.clamp(1_000, 600_000));
         let has_hint = hint_era.as_ref().map(|(e, _)| *e);
         let (init_era, init_ver) = hint_era.unwrap_or((
@@ -305,7 +304,7 @@ impl McpClient {
                 server_name.clone(),
                 cfg,
                 enforce_ssrf,
-                list_changed.clone(),
+                Arc::clone(&list_changed),
             )
             .await?;
             let client = Self {
@@ -334,7 +333,7 @@ impl McpClient {
             cache_key.clone(),
             cfg,
             enforce_ssrf,
-            list_changed.clone(),
+            Arc::clone(&list_changed),
         )?;
         let has_hint = hint_era.as_ref().map(|(e, _)| *e);
         let (init_era, init_ver) = hint_era.unwrap_or((
@@ -367,15 +366,13 @@ impl McpClient {
     pub fn protocol_era(&self) -> ProtocolEra {
         self.proto
             .lock()
-            .map(|p| p.era)
-            .unwrap_or(ProtocolEra::Modern20260728)
+            .map_or(ProtocolEra::Modern20260728, |p| p.era)
     }
 
     pub fn protocol_version(&self) -> String {
         self.proto
             .lock()
-            .map(|p| p.version.clone())
-            .unwrap_or_else(|_| MCP_PROTOCOL_VERSION.to_string())
+            .map_or_else(|_| MCP_PROTOCOL_VERSION.to_string(), |p| p.version.clone())
     }
 
     /// Returns the first non-empty line of server instructions/description returned during handshake.
@@ -470,8 +467,7 @@ impl McpClient {
         let already = self
             .proto
             .lock()
-            .map(|p| p.era == ProtocolEra::Legacy20251125 && p.legacy_initialized)
-            .unwrap_or(false);
+            .is_ok_and(|p| p.era == ProtocolEra::Legacy20251125 && p.legacy_initialized);
         if already {
             return Ok(());
         }
@@ -645,8 +641,10 @@ impl McpClient {
         let task_id = initial.task_id;
         let max_wait = initial
             .ttl_ms
-            .map(Duration::from_millis)
-            .unwrap_or(self.timeout.max(Duration::from_secs(300)))
+            .map_or(
+                self.timeout.max(Duration::from_secs(300)),
+                Duration::from_millis,
+            )
             .min(Duration::from_secs(600));
         let deadline = tokio::time::Instant::now() + max_wait;
         let mut interval_ms = initial.poll_interval_ms.unwrap_or(50).clamp(50, 5_000);
@@ -672,7 +670,7 @@ impl McpClient {
                 });
             }
             tokio::select! {
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     let _ = self.request_with_negotiation(
                         "tasks/cancel",
                         json!({ "taskId": task_id }),
@@ -682,7 +680,7 @@ impl McpClient {
                     ).await;
                     return Err(CarnotError::Cancelled);
                 }
-                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                () = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
             }
             let res = self
                 .request_with_negotiation(
@@ -708,7 +706,7 @@ impl McpClient {
                 .and_then(Value::as_str)
                 .unwrap_or("completed");
             match status {
-                "working" | "queued" | "pending" => continue,
+                "working" | "queued" | "pending" => {}
                 "input_required" => {
                     // Handle task input_required via `tasks/update`.
                     input_rounds += 1;
@@ -754,8 +752,7 @@ impl McpClient {
                     let msg = res
                         .get("error")
                         .or_else(|| task_obj.get("statusMessage"))
-                        .map(Value::to_string)
-                        .unwrap_or_else(|| "MCP async task failed".into());
+                        .map_or_else(|| "MCP async task failed".into(), Value::to_string);
                     return Ok(json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
@@ -781,7 +778,10 @@ impl McpClient {
         on_progress: Option<ProgressCallback>,
     ) -> Result<Value> {
         let (era, ver) = {
-            let p = self.proto.lock().unwrap_or_else(|e| e.into_inner());
+            let p = self
+                .proto
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (p.era, p.version.clone())
         };
         let mut wire_params = params.clone();
@@ -805,14 +805,13 @@ impl McpClient {
         match first {
             Ok(v) => Ok(v),
             // Case 0: `-32020 HeaderMismatch` -> invalidate stale cached tool schemas.
-            Err(TransportError::Rpc(ref e)) if e.code == ERR_HEADER_MISMATCH => {
-                crate::cache::invalidate_cached_schema(&self.cache_key);
-                Err(TransportError::Rpc(e.clone()).into_carnot(&self.server_name))
-            }
-            Err(TransportError::HttpStatus {
-                rpc_error: Some(ref e),
-                ..
-            }) if e.code == ERR_HEADER_MISMATCH => {
+            Err(
+                TransportError::Rpc(ref e)
+                | TransportError::HttpStatus {
+                    rpc_error: Some(ref e),
+                    ..
+                },
+            ) if e.code == ERR_HEADER_MISMATCH => {
                 crate::cache::invalidate_cached_schema(&self.cache_key);
                 Err(TransportError::Rpc(e.clone()).into_carnot(&self.server_name))
             }
@@ -984,7 +983,10 @@ impl McpClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal transport dispatcher forwards per-call wire parameters across stdio/http/sse"
+    )]
     async fn send_wire(
         &self,
         method: &str,
@@ -1022,7 +1024,10 @@ impl McpClient {
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let (era, ver) = {
-            let p = self.proto.lock().unwrap_or_else(|e| e.into_inner());
+            let p = self
+                .proto
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (p.era, p.version.clone())
         };
         match &self.inner {
@@ -1190,8 +1195,7 @@ fn parse_rpc_error(err_val: &Value) -> RpcErrorPayload {
         message: err_val
             .get("message")
             .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| err_val.to_string()),
+            .map_or_else(|| err_val.to_string(), str::to_string),
         data: err_val.get("data").cloned(),
     }
 }

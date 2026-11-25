@@ -73,7 +73,7 @@ impl std::fmt::Debug for HostRpcBridge {
         f.debug_struct("HostRpcBridge")
             .field("timeout_ms", &self.timeout.as_millis())
             .field("closed", &self.closed.load(Ordering::Acquire))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -200,7 +200,7 @@ impl HostRpcBridge {
         }
 
         let outcome = tokio::select! {
-            _ = cancel.cancelled() => Err(CarnotError::Cancelled),
+            () = cancel.cancelled() => Err(CarnotError::Cancelled),
             res = tokio::time::timeout(self.timeout, rx) => match res {
                 Ok(Ok(inner)) => {
                     guard.disarm();
@@ -235,8 +235,7 @@ impl HostRpcBridge {
             let msg = err
                 .get("message")
                 .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .unwrap_or_else(|| err.to_string());
+                .map_or_else(|| err.to_string(), ToString::to_string);
             Err(CarnotError::Extension {
                 extension: "host-rpc".into(),
                 message: msg,
@@ -479,31 +478,28 @@ impl HostRpcModule {
                 .and_then(Value::as_str)
                 .unwrap_or("deny")
                 .to_ascii_lowercase();
-            match decision.as_str() {
-                "allow" => {
-                    if let Some(updated) = val.get("updated_input")
-                        && !updated.is_null()
-                    {
-                        Ok(ToolGateDecision::RewriteInput(updated.clone()))
-                    } else {
-                        Ok(ToolGateDecision::Allow)
-                    }
+            if decision.as_str() == "allow" {
+                if let Some(updated) = val.get("updated_input")
+                    && !updated.is_null()
+                {
+                    Ok(ToolGateDecision::RewriteInput(updated.clone()))
+                } else {
+                    Ok(ToolGateDecision::Allow)
                 }
-                _ => {
-                    let reason = val
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("blocked by host gate")
-                        .to_string();
-                    Ok(ToolGateDecision::Deny { reason })
-                }
+            } else {
+                let reason = val
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("blocked by host gate")
+                    .to_string();
+                Ok(ToolGateDecision::Deny { reason })
             }
         })
     }
 }
 
 impl Module for HostRpcModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "host_rpc"
     }
 
@@ -555,9 +551,8 @@ impl Module for HostRpcModule {
             if !self.has_hook("select_effort") {
                 return Ok(None);
             }
-            let val = match self.bridge.call("host/select_effort", json!({})).await {
-                Ok(v) => v,
-                Err(_) => return Ok(None),
+            let Ok(val) = self.bridge.call("host/select_effort", json!({})).await else {
+                return Ok(None);
             };
             Ok(val
                 .get("effort")

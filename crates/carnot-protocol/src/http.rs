@@ -59,7 +59,9 @@ pub async fn serve_http(agent: Arc<Agent>, addr: &str) -> Result<()> {
 
 pub async fn serve_http_with_token(agent: Arc<Agent>, addr: &str, token: String) -> Result<()> {
     let broker = ChannelInteractionBroker::new(Arc::clone(&agent));
-    agent.set_question_broker(broker.clone()).await;
+    agent
+        .set_question_broker(Arc::clone(&broker) as Arc<dyn carnot_ext::UserQuestionBroker>)
+        .await;
 
     let listener = TcpListener::bind(addr).await?;
     let expected_token = Arc::new(token);
@@ -77,20 +79,20 @@ pub async fn serve_http_with_token(agent: Arc<Agent>, addr: &str, token: String)
                         continue;
                     }
                 };
-                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
                     drop(stream);
                     continue;
                 };
-                let ag = agent.clone();
-                let br = broker.clone();
-                let tok = expected_token.clone();
-                let pgate = prompt_gate.clone();
+                let ag = Arc::clone(&agent);
+                let br = Arc::clone(&broker);
+                let tok = Arc::clone(&expected_token);
+                let pgate = Arc::clone(&prompt_gate);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _ = handle_conn(ag, br, pgate, stream, &tok).await;
                 });
             }
-            _ = shutdown_signal() => {
+            () = shutdown_signal() => {
                 tracing::info!("carnot HTTP/SSE server shutting down gracefully");
                 agent.abort().await;
                 break;
@@ -107,7 +109,7 @@ async fn shutdown_signal() {
         let mut sigterm = signal(SignalKind::terminate()).ok();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
-            _ = async {
+            () = async {
                 if let Some(ref mut s) = sigterm {
                     s.recv().await;
                 } else {
@@ -363,8 +365,7 @@ async fn handle_conn(
             h.strip_prefix("Bearer ")
                 .or_else(|| h.strip_prefix("bearer "))
         })
-        .map(|tok| constant_time_eq(tok.trim().as_bytes(), expected_token.as_bytes()))
-        .unwrap_or(false);
+        .is_some_and(|tok| constant_time_eq(tok.trim().as_bytes(), expected_token.as_bytes()));
     if !authorized {
         return write_json(&mut write_half, 401, &json!({"error": "unauthorized"})).await;
     }
@@ -373,8 +374,7 @@ async fn handle_conn(
     if method == "POST" && content_len > 0 {
         let is_json = content_type
             .as_deref()
-            .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
-            .unwrap_or(false);
+            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/json"));
         if !is_json {
             return write_json(
                 &mut write_half,
@@ -460,27 +460,22 @@ async fn handle_conn(
 
             let mut ev_stream = agent.subscribe_from(last_event_id.unwrap_or(0));
             loop {
-                match tokio::time::timeout(
-                    Duration::from_secs(SSE_KEEPALIVE_SECS),
-                    ev_stream.next(),
-                )
-                .await
+                if let Ok(env) =
+                    tokio::time::timeout(Duration::from_secs(SSE_KEEPALIVE_SECS), ev_stream.next())
+                        .await
                 {
-                    Ok(env) => {
-                        if let Ok(line) = serde_json::to_string(&env) {
-                            let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
-                            if write_half.write_all(frame.as_bytes()).await.is_err() {
-                                break;
-                            }
-                            let _ = write_half.flush().await;
-                        }
-                    }
-                    Err(_) => {
-                        if write_half.write_all(b": keepalive\n\n").await.is_err() {
+                    if let Ok(line) = serde_json::to_string(&env) {
+                        let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
+                        if write_half.write_all(frame.as_bytes()).await.is_err() {
                             break;
                         }
                         let _ = write_half.flush().await;
                     }
+                } else {
+                    if write_half.write_all(b": keepalive\n\n").await.is_err() {
+                        break;
+                    }
+                    let _ = write_half.flush().await;
                 }
             }
             Ok(())
@@ -638,7 +633,59 @@ async fn handle_conn(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            if !stream_sse {
+            if stream_sse {
+                let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                write_half.write_all(hdr.as_bytes()).await?;
+                write_half.flush().await?;
+
+                let start_seq = agent.latest_event_seq();
+                let mut ev_stream = agent.subscribe_from(start_seq);
+                let ag_run = Arc::clone(&agent);
+                let run_task = tokio::spawn(async move {
+                    let _prompt_guard = prompt_guard;
+                    if image_blocks.is_empty() {
+                        ag_run.prompt(prompt).await
+                    } else {
+                        let mut blocks = Vec::with_capacity(1 + image_blocks.len());
+                        if !prompt.is_empty() {
+                            blocks.push(ContentBlock::Text { text: prompt });
+                        }
+                        blocks.extend(image_blocks);
+                        ag_run.prompt_blocks(blocks).await
+                    }
+                });
+
+                loop {
+                    if let Ok(env) = tokio::time::timeout(
+                        Duration::from_secs(SSE_KEEPALIVE_SECS),
+                        ev_stream.next(),
+                    )
+                    .await
+                    {
+                        let is_done = matches!(
+                            env.event,
+                            AgentEvent::RunSettled { .. } | AgentEvent::Error { .. }
+                        );
+                        if let Ok(line) = serde_json::to_string(&env) {
+                            let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
+                            if write_half.write_all(frame.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
+                        if is_done {
+                            break;
+                        }
+                    } else {
+                        if write_half.write_all(b": keepalive\n\n").await.is_err() {
+                            break;
+                        }
+                        let _ = write_half.flush().await;
+                    }
+                }
+                let _ = run_task.await;
+                Ok(())
+            } else {
                 let res = if image_blocks.is_empty() {
                     agent.prompt(prompt).await
                 } else {
@@ -666,61 +713,6 @@ async fn handle_conn(
                         write_json(&mut write_half, 500, &json!({"error": e.to_string()})).await
                     }
                 }
-            } else {
-                let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-                write_half.write_all(hdr.as_bytes()).await?;
-                write_half.flush().await?;
-
-                let start_seq = agent.latest_event_seq();
-                let mut ev_stream = agent.subscribe_from(start_seq);
-                let ag_run = agent.clone();
-                let run_task = tokio::spawn(async move {
-                    let _prompt_guard = prompt_guard;
-                    if image_blocks.is_empty() {
-                        ag_run.prompt(prompt).await
-                    } else {
-                        let mut blocks = Vec::with_capacity(1 + image_blocks.len());
-                        if !prompt.is_empty() {
-                            blocks.push(ContentBlock::Text { text: prompt });
-                        }
-                        blocks.extend(image_blocks);
-                        ag_run.prompt_blocks(blocks).await
-                    }
-                });
-
-                loop {
-                    match tokio::time::timeout(
-                        Duration::from_secs(SSE_KEEPALIVE_SECS),
-                        ev_stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(env) => {
-                            let is_done = matches!(
-                                env.event,
-                                AgentEvent::RunSettled { .. } | AgentEvent::Error { .. }
-                            );
-                            if let Ok(line) = serde_json::to_string(&env) {
-                                let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
-                                if write_half.write_all(frame.as_bytes()).await.is_err() {
-                                    break;
-                                }
-                                let _ = write_half.flush().await;
-                            }
-                            if is_done {
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            if write_half.write_all(b": keepalive\n\n").await.is_err() {
-                                break;
-                            }
-                            let _ = write_half.flush().await;
-                        }
-                    }
-                }
-                let _ = run_task.await;
-                Ok(())
             }
         }
         _ => write_json(&mut write_half, 404, &json!({"error": "not found"})).await,
@@ -763,6 +755,7 @@ mod tests {
     use carnot_cas::CasStore;
     use carnot_core::CarnotConfig;
     use carnot_tools::ToolRegistry;
+    use std::fmt::Write as _;
 
     async fn send_raw(addr: std::net::SocketAddr, req: &str) -> String {
         let mut s = TcpStream::connect(addr).await.expect("connect");
@@ -840,7 +833,7 @@ mod tests {
         // 2b. >MAX_HEADERS -> 431 Request Header Fields Too Large
         let mut many_hdrs = String::from("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n");
         for i in 0..70 {
-            many_hdrs.push_str(&format!("X-Pad-{i}: v\r\n"));
+            let _ = write!(many_hdrs, "X-Pad-{i}: v\r\n");
         }
         many_hdrs.push_str("\r\n");
         let r431 = send_raw(addr, &many_hdrs).await;

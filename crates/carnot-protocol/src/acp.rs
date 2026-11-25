@@ -588,7 +588,7 @@ async fn serve_acp_stdio_inner(
             }
             let prompt_blocks = extract_acp_prompt_blocks(&params);
             let prompt_text_only = prompt_blocks_text(&prompt_blocks);
-            let out = stdout.clone();
+            let out = Arc::clone(&stdout);
             prompt_tasks.push(tokio::spawn(async move {
                 // Handle `/compact [focus]` slash command natively inside ACP!
                 let trimmed = prompt_text_only.trim();
@@ -664,8 +664,8 @@ async fn serve_acp_stdio_inner(
                 }
 
                 let mut ev_stream = ag.subscribe();
-                let out_writer = out.clone();
-                let ag_obs = ag.clone();
+                let out_writer = Arc::clone(&out);
+                let ag_obs = Arc::clone(&ag);
                 let sid_obs = sid.clone();
                 let pump = tokio::spawn(async move {
                     loop {
@@ -875,10 +875,10 @@ async fn serve_acp_stdio_inner(
                 let active_ag = if let Some(ref h) = host {
                     let prev_ag = sessions.get(&default_sid).cloned();
                     let target_cwd = req_cwd.unwrap_or_else(|| {
-                        prev_ag
-                            .as_ref()
-                            .map(|a| a.config.workspace_root.clone())
-                            .unwrap_or_else(|| default_workspace_root.clone())
+                        prev_ag.as_ref().map_or_else(
+                            || default_workspace_root.clone(),
+                            |a| a.config.workspace_root.clone(),
+                        )
                     });
                     let (cur_model, cur_effort) = match prev_ag {
                         Some(ref a) => (
@@ -1274,8 +1274,10 @@ fn list_recent_sessions(session_dir: &Path, fallback_cwd: &Path, limit: usize) -
         let cwd = header
             .as_ref()
             .and_then(|h| h.workspace_root.as_ref())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| fallback_cwd.display().to_string());
+            .map_or_else(
+                || fallback_cwd.display().to_string(),
+                |p| p.display().to_string(),
+            );
         let short_stem: String = stem.chars().take(8).collect();
         let title = match header {
             Some(ref h) => format!("Carnot ({}) {short_stem}", h.model),

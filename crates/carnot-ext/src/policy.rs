@@ -16,8 +16,19 @@ use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static DEFAULT_DENIED_COMMANDS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    vec![
+        Regex::new(r"(?i)\brm\s+-[a-z]*(r[a-z]*f|f[a-z]*r)[a-z]*\s+/(\*|\s|$)")
+            .expect("static rm-rf deny regex must compile"),
+        Regex::new(r"(?i)\bgit\s+push\s+.*(--force|-f\b|--force-with-lease)")
+            .expect("static force-push deny regex must compile"),
+        Regex::new(r"(?i)(curl|wget)\s+.*\|\s*(sh|bash|zsh)\b")
+            .expect("static pipe-to-shell deny regex must compile"),
+    ]
+});
 
 #[derive(Debug)]
 pub struct PolicyGuardModule {
@@ -37,12 +48,7 @@ impl Default for PolicyGuardModule {
 impl PolicyGuardModule {
     pub fn new() -> Self {
         Self {
-            denied_commands: vec![
-                Regex::new(r"(?i)\brm\s+-[a-z]*(r[a-z]*f|f[a-z]*r)[a-z]*\s+/(\*|\s|$)")
-                    .expect("re"),
-                Regex::new(r"(?i)\bgit\s+push\s+.*(--force|-f\b|--force-with-lease)").expect("re"),
-                Regex::new(r"(?i)(curl|wget)\s+.*\|\s*(sh|bash|zsh)\b").expect("re"),
-            ],
+            denied_commands: DEFAULT_DENIED_COMMANDS.clone(),
             protected_path_fragments: vec![".env".into(), "id_rsa".into(), "id_ed25519".into()],
             workspace_root: None,
             redact_tool_outputs: true,
@@ -50,6 +56,7 @@ impl PolicyGuardModule {
         }
     }
 
+    #[must_use]
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
         self
@@ -63,23 +70,25 @@ impl PolicyGuardModule {
         Ok(self)
     }
 
+    #[must_use]
     pub fn with_protected_path(mut self, fragment: impl Into<String>) -> Self {
         self.protected_path_fragments.push(fragment.into());
         self
     }
 
+    #[must_use]
     pub fn with_audit_log(mut self, path: PathBuf) -> Self {
         self.audit_log = Some(Mutex::new(path));
         self
     }
 
-    fn write_audit(&self, event: Value) {
+    fn write_audit(&self, event: &Value) {
         let Some(ref lock) = self.audit_log else {
             return;
         };
         if let Ok(path) = lock.lock()
             && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&*path)
-            && let Ok(line) = serde_json::to_string(&event)
+            && let Ok(line) = serde_json::to_string(event)
         {
             let _ = writeln!(f, "{line}");
         }
@@ -87,7 +96,7 @@ impl PolicyGuardModule {
 }
 
 impl Module for PolicyGuardModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "policy_guard"
     }
 
@@ -98,8 +107,7 @@ impl Module for PolicyGuardModule {
     ) -> BoxFuture<'_, Result<ToolGateDecision>> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as u64);
 
         let mut deny_reason: Option<String> = None;
 
@@ -169,13 +177,15 @@ impl Module for PolicyGuardModule {
             }
         }
 
-        self.write_audit(json!({
-            "ts_ms": ts,
-            "phase": "before_tool",
-            "tool": tool_name,
-            "decision": if deny_reason.is_some() { "deny" } else { "allow" },
-            "reason": deny_reason,
-        }));
+        if self.audit_log.is_some() {
+            self.write_audit(&json!({
+                "ts_ms": ts,
+                "phase": "before_tool",
+                "tool": tool_name,
+                "decision": if deny_reason.is_some() { "deny" } else { "allow" },
+                "reason": deny_reason,
+            }));
+        }
 
         Box::pin(async move {
             match deny_reason {
@@ -193,11 +203,10 @@ impl Module for PolicyGuardModule {
     ) -> BoxFuture<'a, Result<()>> {
         if self.redact_tool_outputs {
             for b in &mut output.blocks {
-                if let ToolResultBlock::Text { text } = b {
-                    let clean = redact_secrets(text);
-                    if clean.len() != text.len() || clean != *text {
-                        *text = clean;
-                    }
+                if let ToolResultBlock::Text { text } = b
+                    && let std::borrow::Cow::Owned(clean) = carnot_cas::redact_secrets_cow(text)
+                {
+                    *text = clean;
                 }
             }
         }

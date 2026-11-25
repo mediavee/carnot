@@ -12,6 +12,7 @@ use carnot_core::{Result, ToolEffects, ToolOutput, ToolSpec};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -176,13 +177,13 @@ fn glob_to_regex_body(pattern: &str, re: &mut String, depth: usize) {
                             re.push(ch);
                             pushed = true;
                         }
-                        if !pushed {
+                        if pushed {
+                            re.push(']');
+                            i += end_rel + 2;
+                        } else {
                             re.pop();
                             re.push_str("\\[");
                             i += 1;
-                        } else {
-                            re.push(']');
-                            i += end_rel + 2;
                         }
                     }
                 } else {
@@ -340,8 +341,9 @@ impl Tool for GrepTool {
                 .get("limit")
                 .and_then(Value::as_u64)
                 .filter(|&v| v > 0)
-                .map(|v| (v as usize).clamp(1, MAX_MATCH_LIMIT))
-                .unwrap_or(DEFAULT_MATCH_LIMIT);
+                .map_or(DEFAULT_MATCH_LIMIT, |v| {
+                    (v as usize).clamp(1, MAX_MATCH_LIMIT)
+                });
 
             tokio::task::spawn_blocking(move || -> Result<ToolOutput> {
                 let re = match RegexBuilder::new(&pattern)
@@ -426,9 +428,10 @@ impl Tool for GrepTool {
                 if state.matches.is_empty() {
                     let mut msg = format!("[no matches for `{pattern}` in {raw_path}]");
                     if scan_capped {
-                        msg.push_str(&format!(
+                        let _ = write!(
+                            msg,
                             "\n[warning: file scan capped at {MAX_FILES_VISITED} files — narrow `path` or `ext`]"
-                        ));
+                        );
                     }
                     return Ok(ToolOutput::ok_text(msg).with_details(json!({
                         "matches": 0,
@@ -439,14 +442,16 @@ impl Tool for GrepTool {
 
                 let mut out = state.matches.join("\n");
                 if state.truncated {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "\n[truncated at {limit} matches — narrow `path`/`ext` or increase `limit`]"
-                    ));
+                    );
                 }
                 if scan_capped {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "\n[warning: file scan capped at {MAX_FILES_VISITED} files — narrow `path` or `ext`]"
-                    ));
+                    );
                 }
                 Ok(ToolOutput::ok_text(out).with_details(json!({
                     "matches": state.matches.len(),
@@ -506,7 +511,7 @@ impl SearchState<'_> {
 
         if let Ok(rd) = fs::read_dir(dir) {
             let mut entries: Vec<_> = rd.flatten().collect();
-            entries.sort_by_key(|e| e.file_name());
+            entries.sort_by_key(std::fs::DirEntry::file_name);
 
             // Deterministic ordering: search files in this directory first, then recurse into subdirs.
             let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -552,7 +557,7 @@ impl SearchState<'_> {
                         let got_ext = path
                             .extension()
                             .and_then(|s| s.to_str())
-                            .map(|s| s.to_ascii_lowercase());
+                            .map(str::to_ascii_lowercase);
                         if got_ext.as_deref() != Some(want_ext) {
                             continue;
                         }

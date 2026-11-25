@@ -1,4 +1,4 @@
-//! Declarative `.mcp.json` configuration loader with MCPoison RCE & secret-exfiltration guards.
+//! Declarative `.mcp.json` configuration loader with `MCPoison` RCE & secret-exfiltration guards.
 //!
 //! Security invariants:
 //!   - Workspace-local `.mcp.json` is NEVER auto-executed unless explicitly approved (`trust_workspace_mcp`
@@ -94,9 +94,7 @@ impl HttpServerConfig {
         if let Some(ref t) = self.transport {
             return t.eq_ignore_ascii_case("sse");
         }
-        url::Url::parse(&self.url)
-            .map(|u| u.path().trim_end_matches('/').ends_with("/sse"))
-            .unwrap_or(false)
+        url::Url::parse(&self.url).is_ok_and(|u| u.path().trim_end_matches('/').ends_with("/sse"))
     }
 }
 
@@ -145,7 +143,7 @@ impl McpServerConfig {
         raw.map(str::trim).filter(|s| !s.is_empty())
     }
 
-    /// Canonical BLAKE3 fingerprint of this server config (used for MCPoison trust-pinning & schema cache).
+    /// Canonical BLAKE3 fingerprint of this server config (used for `MCPoison` trust-pinning & schema cache).
     pub fn fingerprint(&self) -> String {
         let val = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         let canon = canonicalize_json(&val);
@@ -188,7 +186,7 @@ impl McpServerConfig {
     }
 }
 
-/// Validates and sanitizes a server config against MCPoison attacks.
+/// Validates and sanitizes a server config against `MCPoison` attacks.
 pub fn validate_server_config(
     name: &str,
     cfg: &mut McpServerConfig,
@@ -573,7 +571,7 @@ mod tests {
                 assert_eq!(h.description.as_deref(), Some("T3 Code workspace tools"));
                 assert!(!h.from_workspace);
             }
-            _ => panic!("expected http"),
+            McpServerConfig::Stdio(_) => panic!("expected http"),
         }
         match parsed.get("local-tool").expect("local-tool server") {
             McpServerConfig::Stdio(s) => {
@@ -582,7 +580,7 @@ mod tests {
                 assert_eq!(s.env.get("FOO").map(String::as_str), Some("bar"));
                 assert_eq!(s.cwd.as_deref(), Some(Path::new("/tmp/ws")));
             }
-            _ => panic!("expected stdio"),
+            McpServerConfig::Http(_) => panic!("expected stdio"),
         }
     }
 }

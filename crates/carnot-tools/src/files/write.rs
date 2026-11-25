@@ -100,8 +100,7 @@ impl Tool for WriteTool {
                         Ok(b) => Some(b),
                         Err(e) => {
                             return Ok(ToolOutput::err_text(format!(
-                                "Write aborted: cannot snapshot existing {}: {e}",
-                                raw_path
+                                "Write aborted: cannot snapshot existing {raw_path}: {e}"
                             )));
                         }
                     }
@@ -117,8 +116,7 @@ impl Tool for WriteTool {
                         Ok(h) => Some(h.hash),
                         Err(e) => {
                             return Ok(ToolOutput::err_text(format!(
-                                "Write aborted: failed to snapshot {} into CAS: {e}",
-                                raw_path
+                                "Write aborted: failed to snapshot {raw_path} into CAS: {e}"
                             )));
                         }
                     }

@@ -141,7 +141,7 @@ const SLASH_COMMANDS: &[SlashSpec] = &[
 
 /// Startup metadata shown in the TUI header & welcome card.
 #[derive(Debug, Clone)]
-pub struct TuiLaunchInfo {
+pub(crate) struct TuiLaunchInfo {
     pub default_provider: String,
     pub provider_configs: Vec<PathBuf>,
     pub active_extensions: Vec<String>,
@@ -405,15 +405,13 @@ impl PendingQuestion {
     }
 
     fn total_rows(&self) -> usize {
-        self.current()
-            .map(|q| {
-                if q.options.is_empty() {
-                    1
-                } else {
-                    q.options.len() + 1
-                }
-            })
-            .unwrap_or(1)
+        self.current().map_or(1, |q| {
+            if q.options.is_empty() {
+                1
+            } else {
+                q.options.len() + 1
+            }
+        })
     }
 
     fn is_custom_row(&self) -> bool {
@@ -928,7 +926,7 @@ impl TuiApp {
     async fn handle_slash_command(&mut self, cmd: &str) -> bool {
         let mut parts = cmd.split_whitespace();
         let verb = parts.next().unwrap_or("");
-        let rest = cmd.strip_prefix(verb).map(str::trim).unwrap_or("");
+        let rest = cmd.strip_prefix(verb).map_or("", str::trim);
 
         match verb {
             "exit" | "quit" | "q" => return true,
@@ -1118,7 +1116,7 @@ impl TuiApp {
             }
             "cache" => {
                 if !rest.is_empty() {
-                    let arg = rest.strip_prefix("ttl").map(str::trim).unwrap_or(rest);
+                    let arg = rest.strip_prefix("ttl").map_or(rest, str::trim);
                     if let Some(ttl) = carnot::CacheTtl::parse(arg) {
                         self.agent.set_cache_ttl(ttl).await;
                         self.push_notice(
@@ -1226,7 +1224,7 @@ impl TuiApp {
                 }
                 match self.agent.fork_session().await {
                     Ok((new_id, path)) => {
-                        self.session_id = new_id.clone();
+                        self.session_id.clone_from(&new_id);
                         let detail = path
                             .as_deref()
                             .map(|p| format!("  Saved branch: {}", shorten_path(p)));
@@ -1791,7 +1789,7 @@ impl TuiApp {
                             &spans,
                             content_w,
                             vec![bar.clone()],
-                            vec![bar.clone()],
+                            std::slice::from_ref(&bar),
                             &mut lines,
                         );
                     }
@@ -1821,7 +1819,7 @@ impl TuiApp {
                         for raw_line in text.lines() {
                             let spans = vec![Span::styled(raw_line.to_string(), p.thinking())];
                             let pref = vec![Span::styled("  │ ", p.border())];
-                            wrap_spans(&spans, content_w, pref.clone(), pref, &mut lines);
+                            wrap_spans(&spans, content_w, pref.clone(), &pref, &mut lines);
                         }
                     } else if active {
                         lines.push(Line::from(vec![
@@ -2537,7 +2535,9 @@ impl TuiApp {
                 p.danger(),
             ));
         }
-        let ext_span = if !self.launch.active_extensions.is_empty() {
+        let ext_span = if self.launch.active_extensions.is_empty() {
+            None
+        } else {
             let ext_chip = self
                 .launch
                 .active_extensions
@@ -2546,8 +2546,6 @@ impl TuiApp {
                 .collect::<Vec<_>>()
                 .join(" ");
             Some(Span::styled(format!(" {ext_chip} "), p.muted()))
-        } else {
-            None
         };
 
         // Context meter + cache + cost on the right
@@ -2754,7 +2752,7 @@ fn parse_git_head(head: &str) -> Option<String> {
 }
 
 /// Entry point for the interactive Carnot TUI.
-pub async fn run_tui(agent: Arc<Agent>, launch: TuiLaunchInfo) -> i32 {
+pub(crate) async fn run_tui(agent: Arc<Agent>, launch: TuiLaunchInfo) -> i32 {
     let mut guard = match TerminalGuard::enter() {
         Ok(g) => g,
         Err(e) => {

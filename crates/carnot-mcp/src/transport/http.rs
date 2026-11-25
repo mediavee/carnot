@@ -8,7 +8,7 @@ use super::{
 use crate::cache::{MCP_LEGACY_PROTOCOL_VERSION, ProtocolEra};
 use crate::config::HttpServerConfig;
 use carnot_core::{CarnotError, Result};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -137,7 +137,10 @@ impl StreamableHttpTransport {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal MCP HTTP wire helper mirrors transport request context"
+    )]
     pub(super) async fn request_once(
         &self,
         method: &str,
@@ -168,7 +171,7 @@ impl StreamableHttpTransport {
             .send();
 
         let resp = tokio::select! {
-            _ = cancel.cancelled() => return Err(TransportError::Other(CarnotError::Cancelled)),
+            () = cancel.cancelled() => return Err(TransportError::Other(CarnotError::Cancelled)),
             r = tokio::time::timeout(timeout, send_fut) => {
                 r.map_err(|_| TransportError::Other(CarnotError::Tool {
                     tool: format!("mcp:{}", self.server_name),
@@ -220,7 +223,7 @@ impl StreamableHttpTransport {
             let mut body_bytes = Vec::with_capacity(4096);
             loop {
                 let next_chunk = tokio::select! {
-                    _ = cancel.cancelled() => return Err(TransportError::Other(CarnotError::Cancelled)),
+                    () = cancel.cancelled() => return Err(TransportError::Other(CarnotError::Cancelled)),
                     c = stream.next() => c,
                 };
                 let Some(chunk_res) = next_chunk else { break };
@@ -264,7 +267,7 @@ impl StreamableHttpTransport {
 
         loop {
             let chunk = tokio::select! {
-                _ = cancel.cancelled() => return Err(TransportError::Other(CarnotError::Cancelled)),
+                () = cancel.cancelled() => return Err(TransportError::Other(CarnotError::Cancelled)),
                 c = stream.next() => c,
             };
             let Some(chunk_res) = chunk else {

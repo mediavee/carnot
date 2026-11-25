@@ -272,7 +272,11 @@ impl Provider for SubprocessProvider {
                 static_system_prompt: &request.static_system_prompt,
                 tools: &request.tools,
                 prefix_hash: &request.prefix_hash,
-                messages: request.messages.iter().map(|m| m.as_ref()).collect(),
+                messages: request
+                    .messages
+                    .iter()
+                    .map(std::convert::AsRef::as_ref)
+                    .collect(),
                 checkpoint_index: request.checkpoint_index,
                 cache_ttl: request.cache_ttl,
                 effort: request.effort,
@@ -326,7 +330,7 @@ impl Provider for SubprocessProvider {
                 loop {
                     line_buf.clear();
                     let read_res = tokio::select! {
-                        _ = cancel.cancelled() => {
+                        () = cancel.cancelled() => {
                             let cancel_msg = format!(
                                 "{}\n",
                                 json!({"type": "cancel", "request_id": req_id})

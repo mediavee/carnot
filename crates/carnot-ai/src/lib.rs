@@ -2,8 +2,8 @@
 //!   - 3-layer separation: `api` (code adapters) / `provider` (data in `providers.json`) / `model` (data)
 //!   - 7 registered protocol adapters: `anthropic-messages`, `openai-completions`, `openai-responses`,
 //!     `google-generative`, `google-cloudcode`, `subprocess-jsonl`, `faux`
-//!   - Out-of-the-box declarative catalog for Anthropic, OpenAI, OpenAI Responses, Grok (xAI),
-//!     Muse (Meta/Llama), Gemini, Antigravity (Cloud Code), OpenRouter, DeepSeek, Ollama, Faux
+//!   - Out-of-the-box declarative catalog for Anthropic, `OpenAI`, `OpenAI` Responses, Grok (xAI),
+//!     Muse (Meta/Llama), Gemini, Antigravity (Cloud Code), `OpenRouter`, `DeepSeek`, Ollama, Faux
 //!   - Origin-aware cross-provider history replay (zero 400s on foreign signatures/opaques)
 //!   - Full multimodal image support (incl. tool-result bridge) & declarative `UsageMap`
 
@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Build an HTTP client using the OS certificate store, falling back to the
-/// compiled-in Mozilla WebPKI root certificates when running inside minimal
+/// compiled-in Mozilla `WebPKI` root certificates when running inside minimal
 /// containers (e.g., Alpine / Bun / distroless) that ship without system CA bundles.
 pub fn build_http_client() -> reqwest::Client {
     build_http_client_for_url("https://")
@@ -42,6 +42,10 @@ pub fn build_http_client() -> reqwest::Client {
 /// URL-aware HTTP client builder: avoids OS root-store / macOS Keychain initialization on
 /// plaintext `http://` endpoints (local proxies, Ollama, vLLM, tests), while preserving full
 /// OS-store + `webpki-root-certs` fallback for all `https://` endpoints.
+///
+/// # Panics
+///
+/// Panics if constructing the fallback `reqwest::Client` with bundled `webpki-root-certs` fails.
 pub fn build_http_client_for_url(base_url: &str) -> reqwest::Client {
     let base = || {
         reqwest::Client::builder()
@@ -144,7 +148,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
 
     /// Expected rolling prompt-cache lifetime in milliseconds for `model` under `ttl`.
     /// Used by `carnot-agent` to avoid cold-cache pruning while the provider's cache is still warm
-    /// (e.g. OpenAI 24h extended retention in `Hybrid`/`Long` vs Anthropic 5m rolling tail in `Hybrid`).
+    /// (e.g. `OpenAI` 24h extended retention in `Hybrid`/`Long` vs Anthropic 5m rolling tail in `Hybrid`).
     fn rolling_cache_ttl_ms(&self, _model: &str, ttl: CacheTtl) -> u64 {
         match ttl {
             CacheTtl::Long => 3_610_000,

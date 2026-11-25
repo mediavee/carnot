@@ -91,8 +91,10 @@ pub fn validate_public_url(raw: &str) -> std::result::Result<Url, String> {
             Err(format!("SSRF blocked literal IPv6 `{v6}`"))
         }
         Some(Host::Domain(d)) => {
-            let low = d.to_ascii_lowercase();
-            if low == "localhost" || low.ends_with(".localhost") || low.ends_with(".local") {
+            let is_local_tld = d.rsplit_once('.').is_some_and(|(_, tld)| {
+                tld.eq_ignore_ascii_case("localhost") || tld.eq_ignore_ascii_case("local")
+            });
+            if d.eq_ignore_ascii_case("localhost") || is_local_tld {
                 Err(format!("SSRF blocked local domain `{d}`"))
             } else {
                 Ok(parsed)
@@ -181,7 +183,7 @@ mod tests {
 
     #[test]
     fn blocks_private_loopback_cgnat_nat64_and_decimal_ipv4() {
-        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
         assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
         assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));

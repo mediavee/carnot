@@ -73,7 +73,7 @@ pub(crate) fn render_markdown(input: &str, width: usize, p: &Palette) -> Vec<Lin
                 _ => p.text().add_modifier(Modifier::BOLD),
             };
             let spans = parse_inline(heading_text, base, p);
-            wrap_spans(&spans, width, vec![], vec![], &mut out);
+            wrap_spans(&spans, width, vec![], &[], &mut out);
             i += 1;
             continue;
         }
@@ -103,7 +103,7 @@ pub(crate) fn render_markdown(input: &str, width: usize, p: &Palette) -> Vec<Lin
             let content = rest.strip_prefix(' ').unwrap_or(rest);
             let spans = parse_inline(content, p.muted().add_modifier(Modifier::ITALIC), p);
             let prefix = vec![Span::styled("│ ", p.border())];
-            wrap_spans(&spans, width, prefix.clone(), prefix, &mut out);
+            wrap_spans(&spans, width, prefix.clone(), &prefix, &mut out);
             i += 1;
             continue;
         }
@@ -113,9 +113,9 @@ pub(crate) fn render_markdown(input: &str, width: usize, p: &Palette) -> Vec<Lin
             let pad = " ".repeat(indent_cols.min(8));
             let bullet = if indent_cols == 0 { "• " } else { "◦ " };
             let first_prefix = vec![Span::raw(pad.clone()), Span::styled(bullet, p.brand_bold())];
-            let cont_prefix = vec![Span::raw(format!("{pad}  "))];
+            let cont_prefix = [Span::raw(format!("{pad}  "))];
             let spans = parse_inline(body, p.text(), p);
-            wrap_spans(&spans, width, first_prefix, cont_prefix, &mut out);
+            wrap_spans(&spans, width, first_prefix, &cont_prefix, &mut out);
             i += 1;
             continue;
         }
@@ -126,16 +126,16 @@ pub(crate) fn render_markdown(input: &str, width: usize, p: &Palette) -> Vec<Lin
             let marker = format!("{num}. ");
             let cont_spaces = " ".repeat(marker.len());
             let first_prefix = vec![Span::raw(pad.clone()), Span::styled(marker, p.brand_bold())];
-            let cont_prefix = vec![Span::raw(format!("{pad}{cont_spaces}"))];
+            let cont_prefix = [Span::raw(format!("{pad}{cont_spaces}"))];
             let spans = parse_inline(body, p.text(), p);
-            wrap_spans(&spans, width, first_prefix, cont_prefix, &mut out);
+            wrap_spans(&spans, width, first_prefix, &cont_prefix, &mut out);
             i += 1;
             continue;
         }
 
         // Regular paragraph line
         let spans = parse_inline(line, p.text(), p);
-        wrap_spans(&spans, width, vec![], vec![], &mut out);
+        wrap_spans(&spans, width, vec![], &[], &mut out);
         i += 1;
     }
 
@@ -198,7 +198,7 @@ fn parse_unordered_item(line: &str) -> Option<(usize, &str)> {
 fn parse_ordered_item(line: &str) -> Option<(usize, &str, &str)> {
     let leading = line.bytes().take_while(|&b| b == b' ').count();
     let rest = &line[leading..];
-    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     if digits == 0 || digits > 4 {
         return None;
     }
@@ -270,7 +270,7 @@ fn render_table(rows: &[Vec<String>], width: usize, p: &Palette, out: &mut Vec<L
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols * 2 + 1);
         spans.push(Span::styled("│", p.border()));
         for (c_idx, &w) in col_w.iter().enumerate() {
-            let raw = row.get(c_idx).map(String::as_str).unwrap_or("");
+            let raw = row.get(c_idx).map_or("", String::as_str);
             let clipped = truncate_display(raw, w);
             let pad = w.saturating_sub(display_width(&clipped));
             let cell_style = if r_idx == 0 { p.brand_bold() } else { p.text() };
@@ -735,7 +735,7 @@ pub(crate) fn wrap_spans(
     spans: &[Span<'static>],
     width: usize,
     first_prefix: Vec<Span<'static>>,
-    cont_prefix: Vec<Span<'static>>,
+    cont_prefix: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
     let width = width.max(8);
@@ -766,7 +766,7 @@ pub(crate) fn wrap_spans(
 
             if has_content {
                 out.push(Line::from(cur_spans));
-                cur_spans = cont_prefix.clone();
+                cur_spans = cont_prefix.to_vec();
                 cur_w = cont_pw;
                 has_content = false;
                 if is_ws {
@@ -784,7 +784,7 @@ pub(crate) fn wrap_spans(
                             piece.clear();
                         }
                         out.push(Line::from(cur_spans));
-                        cur_spans = cont_prefix.clone();
+                        cur_spans = cont_prefix.to_vec();
                         cur_w = cont_pw;
                     }
                     piece.push(ch);

@@ -111,6 +111,7 @@ use std::sync::Arc;
 /// Fluent builder assembling a Carnot `Agent` with custom providers, MCP 2026-07-28 / 2025-11-25 /
 /// Legacy SSE 2024-11-05 servers, Agent Skills, modules (`Subagent`, `WebFetch`, `LspDiagnostics`,
 /// `PolicyGuard`), extensions, and session resume.
+#[must_use]
 #[derive(Debug)]
 pub struct CarnotBuilder {
     config: CarnotConfig,
@@ -451,7 +452,7 @@ impl CarnotBuilder {
     /// Synchronous build (no MCP server connections; suitable for embedded Rust callers & tests).
     pub fn build(self) -> Result<Arc<Agent>> {
         let cas = Arc::new(CasStore::open(&self.config.workspace_root)?);
-        self.build_with_mcp(cas, Arc::new(McpManager::empty()))
+        self.build_with_mcp(&cas, &McpManager::empty())
     }
 
     /// Async build loading all validated `.mcp.json` servers and drop-in file extensions.
@@ -504,11 +505,11 @@ impl CarnotBuilder {
         )
         .await?;
         self.extra_modules.extend(dropins);
-        let agent = self.build_with_mcp(cas, Arc::clone(&mcp))?;
+        let agent = self.build_with_mcp(&cas, &mcp)?;
         Ok((agent, mcp))
     }
 
-    fn build_with_mcp(mut self, cas: Arc<CasStore>, mcp: Arc<McpManager>) -> Result<Arc<Agent>> {
+    fn build_with_mcp(mut self, cas: &Arc<CasStore>, mcp: &McpManager) -> Result<Arc<Agent>> {
         let mut registry = ProviderRegistry::load_default(&self.config.provider_config_paths)?;
         for adapter in self.extra_adapters {
             registry.register_adapter(adapter);
@@ -517,7 +518,7 @@ impl CarnotBuilder {
             && let Some((_, entry)) = registry.catalog().find_provider(&self.config.provider)
             && let Some(ref default_model) = entry.default_model
         {
-            self.config.model = default_model.clone();
+            self.config.model.clone_from(default_model);
         }
         if let Some(ctx_win) = registry.context_window_for_model(&self.config.model) {
             self.config.context_window = ctx_win;
@@ -527,7 +528,8 @@ impl CarnotBuilder {
         }
         // Guard against providers rejecting `input_tokens + max_tokens > context_window`:
         // cap default max_output_tokens to at most half the context window.
-        let safe_max_out = ((self.config.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+        let safe_max_out =
+            ((self.config.context_window / 2).max(4096)).min(u64::from(u32::MAX)) as u32;
         if self.config.max_output_tokens > safe_max_out {
             self.config.max_output_tokens = safe_max_out;
         }
@@ -544,7 +546,7 @@ impl CarnotBuilder {
         {
             self.config.extra_writable_roots.push(fallback_cas_root);
         }
-        let mut tools = ToolRegistry::with_canonical_lid_tools(&self.config, Arc::clone(&cas));
+        let mut tools = ToolRegistry::with_canonical_lid_tools(&self.config, Arc::clone(cas));
         for t in mcp.tools() {
             tools.register(t);
         }
@@ -574,7 +576,7 @@ impl CarnotBuilder {
             let resolved = WebModule::resolve(
                 web_cfg,
                 caps,
-                Arc::clone(&cas),
+                Arc::clone(cas),
                 sw.cas_handles,
                 self.config.cas_spill_threshold_bytes,
                 self.config.cas_preview_max_bytes,
@@ -592,7 +594,7 @@ impl CarnotBuilder {
             )));
         }
         #[cfg(feature = "ext-memory")]
-        if let Some(mem_cfg) = self.memory_config {
+        if let Some(ref mem_cfg) = self.memory_config {
             modules.push(Arc::new(MemoryModule::open(
                 &self.config.workspace_root,
                 mem_cfg,
@@ -645,7 +647,7 @@ impl CarnotBuilder {
                 )
                 .with_provider_configs(self.config.provider_config_paths.clone()),
             );
-            modules.push(sm.clone());
+            modules.push(Arc::clone(&sm) as Arc<dyn Module>);
             Some(sm)
         } else {
             None
@@ -684,3 +686,13 @@ impl CarnotBuilder {
         Ok(agent)
     }
 }
+
+// Compile-time thread-safety invariants for primary public facade types (M-TYPES-SEND).
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Agent>();
+    assert_send_sync::<CarnotBuilder>();
+    assert_send_sync::<CasStore>();
+    assert_send_sync::<McpManager>();
+    assert_send_sync::<ProviderRegistry>();
+};

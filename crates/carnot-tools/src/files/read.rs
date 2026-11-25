@@ -7,6 +7,7 @@ use crate::{BoxFuture, Tool};
 use base64::Engine as _;
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolResultBlock, ToolSpec};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ const AUTO_OUTLINE_MIN_LINES: usize = 800;
 const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_READ_LINES: usize = 2_000;
+const MAX_RENDERED_LINE_CHARS: usize = 2_000;
 
 #[derive(Debug)]
 pub struct ReadTool {
@@ -60,7 +62,7 @@ impl Tool for ReadTool {
     ) -> BoxFuture<'_, Result<ToolOutput>> {
         let ws = self.workspace_root.clone();
         let extra = self.extra_roots.clone();
-        let tracker = self.tracker.clone();
+        let tracker = Arc::clone(&self.tracker);
 
         Box::pin(async move {
             let Some(raw_path) = input
@@ -112,8 +114,7 @@ impl Tool for ReadTool {
                 // can NEVER hang `spawn_blocking` indefinitely.
                 if !meta.is_file() {
                     return Ok(ToolOutput::err_text(format!(
-                        "Refusing to Read non-regular file {} (FIFO, socket, or special device).",
-                        raw_path
+                        "Refusing to Read non-regular file {raw_path} (FIFO, socket, or special device)."
                     )));
                 }
                 if meta.len() > MAX_READ_BYTES {
@@ -219,7 +220,7 @@ impl Tool for ReadTool {
                         let s = (*s_line).max(1).min(total_lines);
                         let e = (*e_line).max(s).min(total_lines);
                         for (i, line) in all_lines[s - 1..e].iter().enumerate() {
-                            rendered.push_str(&format!("{}\t{}\n", s + i, line));
+                            let _ = writeln!(rendered, "{}\t{line}", s + i);
                         }
                     }
                     return Ok(ToolOutput::ok_text(rendered.trim_end_matches('\n')).with_details(
@@ -254,7 +255,7 @@ impl Tool for ReadTool {
                 // Check disk-coherent ReadTracker on raw unnumbered lines.
                 let delta = tracker
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .check_reread(&path, &raw_slice, (start, end));
                 match delta {
                     ReadDelta::UnchangedStub(stub) => {
@@ -264,7 +265,7 @@ impl Tool for ReadTool {
                     ReadDelta::UnifiedDiff(diff_txt) => {
                         tracker
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner())
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .record(&path, &raw_slice, (start, end));
                         return Ok(ToolOutput::ok_text(diff_txt)
                             .with_details(json!({"file_path": raw_path, "mode": "diff"})));
@@ -272,38 +273,47 @@ impl Tool for ReadTool {
                     ReadDelta::FullNeeded => {
                         tracker
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner())
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .record(&path, &raw_slice, (start, end));
                     }
                 }
 
                 // Format compact `N\ttext` numbered lines (zero padding bloat!) with per-line cap so
                 // 500 KB minified JS/JSON lines cannot blow the context window in one Read call.
-                const MAX_RENDERED_LINE_CHARS: usize = 2_000;
-                let mut rendered = slice_lines
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        if l.chars().count() > MAX_RENDERED_LINE_CHARS {
-                            let head: String = l.chars().take(MAX_RENDERED_LINE_CHARS).collect();
-                            format!(
-                                "{}\t{head} [... line truncated; {} total chars]",
-                                start + i,
-                                l.chars().count()
-                            )
-                        } else {
-                            format!("{}\t{l}", start + i)
+                let mut rendered =
+                    String::with_capacity(raw_slice.len().saturating_add(slice_lines.len() * 8));
+                {
+                    for (i, l) in slice_lines.iter().enumerate() {
+                        if i > 0 {
+                            rendered.push('\n');
                         }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                        if l.len() > MAX_RENDERED_LINE_CHARS {
+                            let total_chars = l.chars().count();
+                            if total_chars > MAX_RENDERED_LINE_CHARS {
+                                let head_end = l
+                                    .char_indices()
+                                    .nth(MAX_RENDERED_LINE_CHARS)
+                                    .map_or(l.len(), |(idx, _)| idx);
+                                let _ = write!(
+                                    rendered,
+                                    "{}\t{} [... line truncated; {total_chars} total chars]",
+                                    start + i,
+                                    &l[..head_end]
+                                );
+                                continue;
+                            }
+                        }
+                        let _ = write!(rendered, "{}\t{l}", start + i);
+                    }
+                }
 
                 let truncated = end < total_lines;
                 if truncated {
-                    rendered.push_str(&format!(
+                    let _ = write!(
+                        rendered,
                         "\n[truncated: showing lines {start}-{end} of {total_lines}; pass offset={} to read further]",
                         end + 1
-                    ));
+                    );
                 }
 
                 Ok(ToolOutput::ok_text(rendered).with_details(json!({
@@ -349,7 +359,7 @@ fn build_directory_outline(ws: &Path, extra: &[PathBuf], dir: &Path, raw_path: &
             entries.push(p);
         }
     }
-    entries.sort();
+    entries.sort_unstable();
     let mut out = format!(
         "[directory outline: {raw_path} ({} entries)]\n",
         entries.len()
@@ -360,22 +370,22 @@ fn build_directory_outline(ws: &Path, extra: &[PathBuf], dir: &Path, raw_path: &
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         if p.is_dir() {
-            out.push_str(&format!("- {fname}/\n"));
+            let _ = writeln!(out, "- {fname}/");
             continue;
         }
-        let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(&p).map_or(0, |m| m.len());
         if size <= 256 * 1024
             && let Ok(src) = fs::read_to_string(&p)
             && let Some(sym_outline) = structural_outline(&p, &src)
         {
             let compact: Vec<&str> = sym_outline.lines().skip(1).take(8).collect();
-            if !compact.is_empty() {
-                out.push_str(&format!("- {fname} ({size} B): {}\n", compact.join(" ; ")));
+            if compact.is_empty() {
+                let _ = writeln!(out, "- {fname} ({size} B)");
             } else {
-                out.push_str(&format!("- {fname} ({size} B)\n"));
+                let _ = writeln!(out, "- {fname} ({size} B): {}", compact.join(" ; "));
             }
         } else {
-            out.push_str(&format!("- {fname} ({size} B)\n"));
+            let _ = writeln!(out, "- {fname} ({size} B)");
         }
         if out.len() > 2_500 {
             out.push_str("[... directory outline truncated ...]\n");

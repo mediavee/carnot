@@ -20,6 +20,7 @@ use carnot_tools::{BoxFuture as ToolFuture, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,9 +138,10 @@ pub struct MemoryConfig {
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        let root_dir = std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".carnot").join("memory"))
-            .unwrap_or_else(|| PathBuf::from(".carnot").join("memory"));
+        let root_dir = std::env::var_os("HOME").map_or_else(
+            || PathBuf::from(".carnot").join("memory"),
+            |h| PathBuf::from(h).join(".carnot").join("memory"),
+        );
         Self {
             root_dir,
             max_turn1_chars: DEFAULT_TURN1_MAX_CHARS,
@@ -151,8 +153,7 @@ impl Default for MemoryConfig {
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn slugify(raw: &str) -> String {
@@ -185,8 +186,7 @@ fn project_dir_slug(workspace_root: &Path) -> String {
     let base = canon
         .file_name()
         .and_then(|s| s.to_str())
-        .map(slugify)
-        .unwrap_or_else(|| "workspace".to_string());
+        .map_or_else(|| "workspace".to_string(), slugify);
     let hash = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex();
     format!("{}-{}", &base[..base.len().min(28)], &hash[..10])
 }
@@ -249,13 +249,14 @@ fn render_markdown_index(scope_label: &str, entries: &[MemoryEntry]) -> String {
         } else {
             format!(" — tags: {}", e.tags.join(", "))
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "## `{}` ({}{pin}): {}{tags}\n\n{}\n\n",
             e.id,
             e.kind.as_str(),
             e.title,
             e.content.trim()
-        ));
+        );
     }
     out
 }
@@ -595,10 +596,11 @@ impl MemoryState {
             shown += 1;
         }
         if shown < total {
-            out.push_str(&format!(
-                "(+{} more entries searchable via `MemorySearch`)\n",
+            let _ = writeln!(
+                out,
+                "(+{} more entries searchable via `MemorySearch`)",
                 total - shown
-            ));
+            );
         }
         Some(out.trim_end().to_string())
     }
@@ -614,8 +616,8 @@ pub struct MemoryModule {
 }
 
 impl MemoryModule {
-    pub fn open(workspace_root: &Path, cfg: MemoryConfig) -> Self {
-        let state = Arc::new(Mutex::new(MemoryState::open(workspace_root, &cfg)));
+    pub fn open(workspace_root: &Path, cfg: &MemoryConfig) -> Self {
+        let state = Arc::new(Mutex::new(MemoryState::open(workspace_root, cfg)));
         let search_tool = Arc::new(MemorySearchTool {
             state: Arc::clone(&state),
         });
@@ -631,13 +633,16 @@ impl MemoryModule {
     }
 
     pub fn entry_counts(&self) -> (usize, usize) {
-        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (g.project_entries.len(), g.global_entries.len())
     }
 }
 
 impl Module for MemoryModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "memory"
     }
 
@@ -652,7 +657,7 @@ impl Module for MemoryModule {
         let digest = self
             .state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .format_turn1_digest(self.max_turn1_chars);
         Box::pin(async move { Ok(digest) })
     }
@@ -719,12 +724,11 @@ impl Tool for MemorySearchTool {
                 .unwrap_or(6)
                 .clamp(1, 20) as usize;
 
-            let hits = self.state.lock().unwrap_or_else(|e| e.into_inner()).search(
-                query,
-                scope_filter,
-                kind_filter,
-                limit,
-            );
+            let hits = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .search(query, scope_filter, kind_filter, limit);
 
             if hits.is_empty() {
                 return Ok(ToolOutput::ok_text(format!(
@@ -740,14 +744,15 @@ impl Tool for MemorySearchTool {
                 } else {
                     format!(" | tags: {}", e.tags.join(", "))
                 };
-                out.push_str(&format!(
-                    "\n- `{}` ({}/{}{pin}, score={score:.2}{tags}): **{}**\n  {}\n",
+                let _ = writeln!(
+                    out,
+                    "\n- `{}` ({}/{}{pin}, score={score:.2}{tags}): **{}**\n  {}",
                     e.id,
                     e.scope.as_str(),
                     e.kind.as_str(),
                     e.title,
                     e.content.trim().replace('\n', "\n  ")
-                ));
+                );
             }
             Ok(ToolOutput::ok_text(out).with_details(json!({
                 "count": hits.len(),
@@ -812,7 +817,7 @@ impl Tool for MemorySaveTool {
                 let removed = self
                     .state
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .delete(scope, &id)?;
                 return Ok(ToolOutput::ok_text(if removed {
                     format!("Deleted memory `{id}` from {} scope.", scope.as_str())
@@ -877,7 +882,7 @@ impl Tool for MemorySaveTool {
             let (saved, updated) = self
                 .state
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .upsert(entry)?;
 
             let verb = if updated { "Updated" } else { "Saved" };
@@ -913,7 +918,7 @@ mod tests {
             max_turn1_chars: 1800,
             max_entries_per_scope: 20,
         };
-        let m1 = MemoryModule::open(&ws, cfg.clone());
+        let m1 = MemoryModule::open(&ws, &cfg);
         let tools = m1.tools();
         let search = tools
             .iter()
@@ -978,7 +983,7 @@ mod tests {
         .expect("save global");
 
         // Reload in a brand-new session instance -> persists across sessions + secret redacted on disk!
-        let m2 = MemoryModule::open(&ws, cfg);
+        let m2 = MemoryModule::open(&ws, &cfg);
         assert_eq!(m2.entry_counts(), (1, 1));
         let start_ctx = m2
             .on_session_start(&CarnotConfig::new(ws.clone()))

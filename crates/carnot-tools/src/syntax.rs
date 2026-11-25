@@ -77,8 +77,7 @@ mod imp {
         let after_errs = parse_error_lines(path, after)?;
         let before_count = before
             .and_then(|b| parse_error_lines(path, b))
-            .map(|v| v.len())
-            .unwrap_or(0);
+            .map_or(0, |v| v.len());
         if after_errs.len() > before_count {
             let sample: Vec<String> = after_errs.iter().take(6).map(usize::to_string).collect();
             Some(format!(
@@ -159,8 +158,7 @@ mod imp {
             let end = node.end_position().row + 1;
             let sig = lines
                 .get(start.saturating_sub(1))
-                .map(|s| s.trim())
-                .unwrap_or(kind);
+                .map_or(kind, |s| s.trim());
             let indent = "  ".repeat(depth);
             out.push(format!("{indent}L{start}-{end}: {sig}"));
         }

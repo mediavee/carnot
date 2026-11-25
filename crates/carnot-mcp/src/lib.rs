@@ -9,7 +9,7 @@
 //!     `ttlMs`, `cacheScope` & effective expanded auth hash (0 handshake RTTs on warm starts!)
 //!   - MRTR (`resultType: "input_required"`) + official Tasks extension (`io.modelcontextprotocol/tasks`)
 //!   - Canonicalized & minified JSON Schemas (`defer_loading: true` => 0 tokens in static cache prefix!)
-//!   - Anti-DoS bounded `$ref` validation & MCPoison RCE/SSRF guards on `.mcp.json`
+//!   - Anti-DoS bounded `$ref` validation & `MCPoison` RCE/SSRF guards on `.mcp.json`
 
 pub mod cache;
 pub mod config;
@@ -305,7 +305,7 @@ impl McpManager {
                     }
                 });
 
-        let results = futures::future::join_all(init_futs).await;
+        let results = futures_util::future::join_all(init_futs).await;
         let mut servers = BTreeMap::new();
         let mut summaries = Vec::new();
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
@@ -345,7 +345,6 @@ impl McpManager {
                 }
                 Err(e) => {
                     tracing::warn!(server = %name, error = %e, "MCP server failed to initialize; skipping");
-                    eprintln!("[carnot:mcp] warning: server `{name}` failed to initialize: {e}");
                     summaries.push(McpServerSummary {
                         name,
                         transport,
@@ -476,7 +475,7 @@ fn parse_and_minify_tools(server_name: &str, raw_tools: Vec<Value>) -> Vec<Cache
             header_params,
         });
     }
-    entries.sort_by(|a, b| a.wire_name.cmp(&b.wire_name));
+    entries.sort_unstable_by(|a, b| a.wire_name.cmp(&b.wire_name));
     entries
 }
 
@@ -521,12 +520,11 @@ impl Tool for McpToolProxy {
             for hp in &self.entry.header_params {
                 let mut cur = &input;
                 for seg in &hp.json_path {
-                    match cur.get(seg) {
-                        Some(next) => cur = next,
-                        None => {
-                            cur = &Value::Null;
-                            break;
-                        }
+                    if let Some(next) = cur.get(seg) {
+                        cur = next;
+                    } else {
+                        cur = &Value::Null;
+                        break;
                     }
                 }
                 if let Some(encoded) = transport::format_param_header_value(cur) {
@@ -736,10 +734,16 @@ for line in sys.stdin:
         let mut cfgs = BTreeMap::new();
         cfgs.insert("m26".to_string(), srv_cfg.clone());
 
-        let mgr1 =
-            McpManager::from_configs(cfgs.clone(), dir.clone(), cas.clone(), true, 4096, 1400)
-                .await
-                .expect("mgr1");
+        let mgr1 = McpManager::from_configs(
+            cfgs.clone(),
+            dir.clone(),
+            Arc::clone(&cas),
+            true,
+            4096,
+            1400,
+        )
+        .await
+        .expect("mgr1");
         assert_eq!(mgr1.summaries()[0].era, ProtocolEra::Modern20260728);
         assert_eq!(mgr1.summaries()[0].protocol_version, "2026-07-28");
         assert_eq!(mgr1.tools().len(), 3);
@@ -754,7 +758,7 @@ for line in sys.stdin:
         let t0 = Instant::now();
         let mut handles = Vec::new();
         for i in 0..12 {
-            let t = slow_echo.clone();
+            let t = Arc::clone(&slow_echo);
             handles.push(tokio::spawn(async move {
                 t.execute(json!({"x": i}), CancellationToken::new()).await
             }));
@@ -933,7 +937,7 @@ for line in sys.stdin:
         let mgr = McpManager::from_configs(cfgs, dir.clone(), cas, true, 4096, 1400)
             .await
             .expect("mgr");
-        let tool = mgr.tools()[0].clone();
+        let tool = Arc::clone(&mgr.tools()[0]);
         // Non-ASCII tenant triggers exact SEP-2243 `=?base64?...?=` sentinel encoding!
         let out = tool
             .execute(json!({"tenant": "café"}), CancellationToken::new())

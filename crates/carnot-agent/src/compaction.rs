@@ -26,6 +26,7 @@ use carnot_ext::{CompactionHookAction, CompactionHookContext, Module};
 use carnot_session::SessionStore;
 use carnot_tools::ToolRegistry;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -128,7 +129,7 @@ pub fn hydrate_anchors_from_session(messages: &[Arc<Message>]) -> (Option<String
                     if c.is_empty() {
                         continue;
                     }
-                    let body = c.split_once('\n').map(|(_, rest)| rest.trim()).unwrap_or(c);
+                    let body = c.split_once('\n').map_or(c, |(_, rest)| rest.trim());
                     if !body.is_empty() {
                         followups.push(clip_anchor_text(body, MAX_FOLLOWUP_INSTRUCTION_CHARS));
                     }
@@ -407,20 +408,17 @@ async fn try_semantic_llm_handoff(
         if cancel.is_cancelled() {
             return None;
         }
-        let rx_res = match tokio::time::timeout(
+        let Ok(Ok(rx_res)) = tokio::time::timeout(
             SEMANTIC_COMPACTION_TIMEOUT,
             provider.stream(req.clone(), cancel.clone()),
         )
         .await
-        {
-            Ok(Ok(rx)) => rx,
-            Ok(Err(_)) | Err(_) => {
-                if attempt == 0 && !cancel.is_cancelled() {
-                    tokio::time::sleep(Duration::from_millis(1_500)).await;
-                    continue;
-                }
-                return None;
+        else {
+            if attempt == 0 && !cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                continue;
             }
+            return None;
         };
         let mut rx = rx_res;
 
@@ -486,7 +484,10 @@ async fn try_semantic_llm_handoff(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal compaction orchestrator borrows disjoint Agent fields to avoid holding a full Agent lock"
+)]
 pub(crate) async fn execute_compaction(
     mode: CompactionMode,
     config: &CarnotConfig,
@@ -563,41 +564,39 @@ pub(crate) async fn execute_compaction(
 
     // Tier 1: Try cache-warm semantic LLM handoff for Soft & Manual modes
     // (Skip LLM call in EmergencyOverflow since the prompt already exceeds the physical window!)
-    let semantic_handoff = if mode != CompactionMode::EmergencyOverflow {
-        if let Some((text, usage)) = try_semantic_llm_handoff(
-            config,
-            provider,
-            tools,
-            session,
-            effective_focus.as_deref(),
-            cancel,
-        )
-        .await
-        {
-            // Account for compaction usage accurately in session & metrics
-            let turn_num = {
-                let mut m = metrics.lock().await;
-                m.requests += 1;
-                m.context_auc_tokens += usage.total_context_tokens();
-                if usage.cache_read_tokens > 0 {
-                    m.prefix_cache_hits += 1;
-                } else {
-                    m.prefix_cache_misses += 1;
-                }
-                m.total_usage.add_assign(&usage);
-                crate::add_cost_micros(total_cost_micros, usage.cost_usd);
-                m.turns
-            };
-            let _ = session.lock().await.record_usage(turn_num, usage.clone());
-            events.push(AgentEvent::UsageRecorded {
-                turn: turn_num,
-                usage,
-                rate_limits: Vec::new(),
-            });
-            Some(text)
-        } else {
-            None
-        }
+    let semantic_handoff = if mode == CompactionMode::EmergencyOverflow {
+        None
+    } else if let Some((text, usage)) = try_semantic_llm_handoff(
+        config,
+        provider,
+        tools,
+        session,
+        effective_focus.as_deref(),
+        cancel,
+    )
+    .await
+    {
+        // Account for compaction usage accurately in session & metrics
+        let turn_num = {
+            let mut m = metrics.lock().await;
+            m.requests += 1;
+            m.context_auc_tokens += usage.total_context_tokens();
+            if usage.cache_read_tokens > 0 {
+                m.prefix_cache_hits += 1;
+            } else {
+                m.prefix_cache_misses += 1;
+            }
+            m.total_usage.add_assign(&usage);
+            crate::add_cost_micros(total_cost_micros, usage.cost_usd);
+            m.turns
+        };
+        let _ = session.lock().await.record_usage(turn_num, usage.clone());
+        events.push(AgentEvent::UsageRecorded {
+            turn: turn_num,
+            usage,
+            rate_limits: Vec::new(),
+        });
+        Some(text)
     } else {
         None
     };
@@ -624,12 +623,13 @@ pub(crate) async fn execute_compaction(
 
     // Assemble the final zero-loss compacted state message
     let mut summary = String::with_capacity(4096);
-    summary.push_str(&format!(
-        "[carnot:compaction mode={} semantic_llm={} session={}]\n",
+    let _ = writeln!(
+        summary,
+        "[carnot:compaction mode={} semantic_llm={} session={}]",
         mode.as_str(),
         used_semantic_llm,
         s.session_id
-    ));
+    );
     summary.push_str(
         "Older turns were compacted (full verbatim audit log remains on disk in session JSONL).\n",
     );
@@ -642,11 +642,12 @@ pub(crate) async fn execute_compaction(
     if !followups.is_empty() {
         summary.push_str("\n[carnot:user-followups]\n");
         for (idx, ins) in followups.iter().enumerate() {
-            summary.push_str(&format!(
-                "### Follow-up {}\n{}\n",
+            let _ = writeln!(
+                summary,
+                "### Follow-up {}\n{}",
                 idx + 1,
                 clip_anchor_text(ins, MAX_FOLLOWUP_INSTRUCTION_CHARS)
-            ));
+            );
         }
     }
 
@@ -663,34 +664,36 @@ pub(crate) async fn execute_compaction(
     // Ground-truth deterministic harness footer (restorable pointers — never hallucinated!)
     summary.push_str("\n[carnot:verified-workspace-state]\n");
     if let Some(ref sp) = s.path {
-        summary.push_str(&format!("Full verbatim session log: {}\n", sp.display()));
+        let _ = writeln!(summary, "Full verbatim session log: {}", sp.display());
     }
     if let Some(ref st) = git_facts.status_short {
-        summary.push_str(&format!("git status --short:\n{st}\n"));
+        let _ = writeln!(summary, "git status --short:\n{st}");
     }
     if let Some(ref ds) = git_facts.diff_stat {
-        summary.push_str(&format!("git diff --stat:\n{ds}\n"));
+        let _ = writeln!(summary, "git diff --stat:\n{ds}");
     }
     let (modified_files, read_only_files) = extract_file_ops_from_session(s.active_messages(), seg);
     if !modified_files.is_empty() {
-        summary.push_str(&format!("Files edited: {}\n", modified_files.join(", ")));
+        let _ = writeln!(summary, "Files edited: {}", modified_files.join(", "));
     }
     if !read_only_files.is_empty() {
-        summary.push_str(&format!(
-            "Read-only inspected files (all key discoveries are already captured in [carnot:task-handoff] above; only re-read a file if you need to edit it or inspect an uncaptured detail): {}\n",
+        let _ = writeln!(
+            summary,
+            "Read-only inspected files (all key discoveries are already captured in [carnot:task-handoff] above; only re-read a file if you need to edit it or inspect an uncaptured detail): {}",
             read_only_files.join(", ")
-        ));
+        );
     }
     if !seg.handles_created.is_empty() {
-        summary.push_str(&format!(
-            "Lossless CAS output handles (inspect with Read/Grep): {}\n",
+        let _ = writeln!(
+            summary,
+            "Lossless CAS output handles (inspect with Read/Grep): {}",
             seg.handles_created.join(", ")
-        ));
+        );
     }
     if !seg.failed_attempts.is_empty() {
         summary.push_str("Observed failed attempts (do NOT repeat):\n");
         for f in seg.failed_attempts.iter().take(10) {
-            summary.push_str(&format!("- {f}\n"));
+            let _ = writeln!(summary, "- {f}");
         }
     }
     summary.push_str(

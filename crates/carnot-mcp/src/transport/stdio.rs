@@ -6,7 +6,6 @@ use carnot_core::{CarnotError, Result};
 use carnot_sandbox::apply_safe_env;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,16 +36,16 @@ impl std::fmt::Debug for StdioActor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StdioActor")
             .field("server_name", &self.server_name)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl StdioActor {
-    pub(super) async fn spawn(
+    pub(super) fn spawn(
         server_name: String,
         cache_key: String,
         cfg: &StdioServerConfig,
-        workspace_root: PathBuf,
+        workspace_root: &std::path::Path,
         list_changed: Arc<AtomicBool>,
     ) -> Result<Self> {
         let mut cmd = Command::new(&cfg.command);
@@ -58,7 +57,7 @@ impl StdioActor {
         if let Some(ref cwd) = cfg.cwd {
             cmd.current_dir(cwd);
         } else {
-            cmd.current_dir(&workspace_root);
+            cmd.current_dir(workspace_root);
         }
         apply_safe_env(&mut cmd, &cfg.env);
 
@@ -107,9 +106,9 @@ impl StdioActor {
         }
 
         let closed = Arc::new(AtomicBool::new(false));
-        let closed_r = closed.clone();
-        let pending_r = pending.clone();
-        let progress_r = progress.clone();
+        let closed_r = Arc::clone(&closed);
+        let pending_r = Arc::clone(&pending);
+        let progress_r = Arc::clone(&progress);
         let write_tx_r = write_tx.clone();
         let srv_r = server_name.clone();
         let ws_uri = format!("file://{}", workspace_root.display());
@@ -135,13 +134,12 @@ impl StdioActor {
                     &srv_r,
                     &cache_key,
                     &ws_uri,
-                    v,
+                    &v,
                     &pending_r,
                     &progress_r,
                     &list_changed,
                     Some(&write_tx_r),
-                )
-                .await;
+                );
             }
             closed_r.store(true, Ordering::Release);
             if let Ok(mut map) = pending_r.lock() {
@@ -227,7 +225,7 @@ impl StdioActor {
         }
 
         let res = tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 if !matches!(method, "initialize" | "server/discover") {
                     let _ = self.notify("notifications/cancelled", json!({
                         "requestId": id,
@@ -236,7 +234,7 @@ impl StdioActor {
                 }
                 Err(TransportError::Other(CarnotError::Cancelled))
             }
-            _ = tokio::time::sleep(timeout) => {
+            () = tokio::time::sleep(timeout) => {
                 if !matches!(method, "initialize" | "server/discover") {
                     let _ = self.notify("notifications/cancelled", json!({
                         "requestId": id,
@@ -280,12 +278,15 @@ pub(super) fn merge_progress_token(params: &mut Value, tok: &str) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_incoming_message(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal stdio frame dispatcher borrows shared actor maps directly"
+)]
+fn dispatch_incoming_message(
     server_name: &str,
     cache_key: &str,
     ws_uri: &str,
-    v: Value,
+    v: &Value,
     pending: &PendingMap,
     progress: &ProgressMap,
     list_changed: &AtomicBool,

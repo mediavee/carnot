@@ -6,7 +6,7 @@ use super::{
 };
 use crate::config::HttpServerConfig;
 use carnot_core::{CarnotError, Result};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -88,14 +88,11 @@ impl LegacySseActor {
                 tokio::time::sleep(Duration::from_millis(250u64 << attempt)).await;
             }
         }
-        let resp = match resp {
-            Some(r) => r,
-            None => {
-                return Err(last_err.unwrap_or_else(|| CarnotError::Tool {
-                    tool: format!("mcp:{server_name}"),
-                    message: format!("SSE connect failed to {}", cfg.url),
-                }));
-            }
+        let Some(resp) = resp else {
+            return Err(last_err.unwrap_or_else(|| CarnotError::Tool {
+                tool: format!("mcp:{server_name}"),
+                message: format!("SSE connect failed to {}", cfg.url),
+            }));
         };
 
         let base_url = url::Url::parse(&cfg.url).map_err(|e| CarnotError::Tool {
@@ -118,7 +115,7 @@ impl LegacySseActor {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             loop {
                 let next_chunk = tokio::select! {
-                    _ = cancel_bg.cancelled() => None,
+                    () = cancel_bg.cancelled() => None,
                     c = stream.next() => c,
                 };
                 let Some(Ok(chunk)) = next_chunk else {
@@ -248,7 +245,7 @@ impl LegacySseActor {
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, tx);
 
         let payload = json!({
@@ -325,7 +322,7 @@ impl LegacySseActor {
         }
 
         let waited = tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 if let Ok(mut m) = self.pending.lock() {
                     m.remove(&id);
                 }

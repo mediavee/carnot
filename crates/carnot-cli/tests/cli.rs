@@ -13,14 +13,14 @@ fn cli_audit_prefix_and_doctor_return_valid_json() {
         .arg("audit-prefix")
         .output()
         .expect("run audit-prefix");
-    assert!(audit.status.success(), "audit-prefix failed: {:?}", audit);
+    assert!(audit.status.success(), "audit-prefix failed: {audit:?}");
     let audit_val: serde_json::Value =
         serde_json::from_slice(&audit.stdout).expect("valid audit-prefix JSON");
     assert_eq!(audit_val["status"], "pass");
     assert_eq!(audit_val["tools_count"], 5);
 
     let doctor = carnot_bin().arg("doctor").output().expect("run doctor");
-    assert!(doctor.status.success(), "doctor failed: {:?}", doctor);
+    assert!(doctor.status.success(), "doctor failed: {doctor:?}");
     let doc_val: serde_json::Value =
         serde_json::from_slice(&doctor.stdout).expect("valid doctor JSON");
     assert_eq!(doc_val["status"], "ok");
@@ -273,7 +273,7 @@ for line in sys.stdin:
         .arg("doctor")
         .output()
         .expect("run doctor with --ext");
-    assert!(doctor.status.success(), "doctor failed: {:?}", doctor);
+    assert!(doctor.status.success(), "doctor failed: {doctor:?}");
     let doc_val: serde_json::Value =
         serde_json::from_slice(&doctor.stdout).expect("valid doctor JSON");
     let dropins = doc_val["extensions"]["dropin"]
@@ -301,7 +301,7 @@ for line in sys.stdin:
         ])
         .output()
         .expect("run faux prompt with --ext");
-    assert!(run.status.success(), "prompt with --ext failed: {:?}", run);
+    assert!(run.status.success(), "prompt with --ext failed: {run:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -635,6 +635,12 @@ fn cli_rpc_host_extension_scripted_tool_calls_ephemeral_cache_invariance_and_con
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
+    fn write_line(stdin: &mut std::process::ChildStdin, raw: &str) {
+        stdin.write_all(raw.as_bytes()).expect("write");
+        stdin.write_all(b"\n").expect("nl");
+        stdin.flush().expect("flush");
+    }
+
     let dir = std::env::temp_dir().join(format!("carnot-cli-scripted-{}", std::process::id()));
     let sessions_dir = dir.join("sessions");
     let _ = std::fs::create_dir_all(&sessions_dir);
@@ -684,14 +690,11 @@ fn cli_rpc_host_extension_scripted_tool_calls_ephemeral_cache_invariance_and_con
     let stdout = child.stdout.take().expect("stdout");
     let mut reader = BufReader::new(stdout);
 
-    fn write_line(stdin: &mut std::process::ChildStdin, raw: &str) {
-        stdin.write_all(raw.as_bytes()).expect("write");
-        stdin.write_all(b"\n").expect("nl");
-        stdin.flush().expect("flush");
-    }
     let mut send = |val: serde_json::Value| {
         let s = serde_json::to_string(&val).expect("serialize");
-        write_line(&mut stdin, &s);
+        stdin.write_all(s.as_bytes()).expect("write");
+        stdin.write_all(b"\n").expect("nl");
+        stdin.flush().expect("flush");
     };
 
     send(serde_json::json!({
@@ -908,7 +911,7 @@ cache_ttl = "5m"
         .arg("modules")
         .output()
         .expect("modules");
-    assert!(mods.status.success(), "modules failed: {:?}", mods);
+    assert!(mods.status.success(), "modules failed: {mods:?}");
     let mv: serde_json::Value = serde_json::from_slice(&mods.stdout).expect("json");
     assert_eq!(mv["profile"], "minimal");
 

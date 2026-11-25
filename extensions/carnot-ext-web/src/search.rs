@@ -1,4 +1,4 @@
-//! Structured `WebSearch` tool backed by real search APIs (SearXNG, Exa, Tavily, Brave).
+//! Structured `WebSearch` tool backed by real search APIs (`SearXNG`, Exa, Tavily, Brave).
 //!
 //! Zero brittle HTML scraping; declares `defer_loading: true` (0 static prefix tokens) and
 //! `ToolEffects::global_read()` (parallelizable in read-only waves).
@@ -6,8 +6,9 @@
 use carnot_cas::{CasStore, shape_command_output_with_redaction};
 use carnot_core::{CarnotError, Result, ToolEffects, ToolOutput, ToolSpec};
 use carnot_tools::{BoxFuture, Tool};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -234,10 +235,10 @@ fn format_hits_markdown(query: &str, backend: SearchBackend, hits: &[SearchHit])
         hits.len()
     );
     for (idx, h) in hits.iter().enumerate() {
-        out.push_str(&format!("\n{}. [{}]({})\n", idx + 1, h.title, h.url));
+        let _ = writeln!(out, "\n{}. [{}]({})", idx + 1, h.title, h.url);
         if !h.snippet.is_empty() {
             let clipped: String = h.snippet.chars().take(400).collect();
-            out.push_str(&format!("   {clipped}\n"));
+            let _ = writeln!(out, "   {clipped}");
         }
     }
     out
@@ -463,7 +464,7 @@ impl Tool for WebSearchTool {
             };
 
             let mut hits = tokio::select! {
-                _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                () = cancel.cancelled() => return Err(CarnotError::Cancelled),
                 res = req_fut => match res {
                     Ok(h) => h,
                     Err(msg) => return Ok(ToolOutput::err_text(msg)),

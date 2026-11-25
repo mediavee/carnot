@@ -13,6 +13,7 @@
 //!   - Per-user `0700` fork root (`~/.carnot/forks`) + deterministic `Drop` cleanup & prune.
 
 use carnot_core::{CarnotError, Result};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -56,8 +57,7 @@ fn is_process_alive(pid: u32) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(true)
+        .map_or(true, |s| s.success())
 }
 
 #[cfg(not(unix))]
@@ -68,10 +68,10 @@ fn is_process_alive(pid: u32) -> bool {
 fn forks_base_dir() -> Result<PathBuf> {
     let base = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| PathBuf::from(h).join(".carnot").join("forks"))
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("carnot-forks-{}", std::process::id()))
-        });
+        .map_or_else(
+            || std::env::temp_dir().join(format!("carnot-forks-{}", std::process::id())),
+            |h| PathBuf::from(h).join(".carnot").join("forks"),
+        );
     std::fs::create_dir_all(&base)?;
     #[cfg(unix)]
     {
@@ -372,9 +372,10 @@ impl IsolatedForkWorktree {
             Ok(new_sha) => self.base_sha = new_sha,
             Err(e) => {
                 self.land_checkpoint_failed = true;
-                final_stat.push_str(&format!(
+                let _ = write!(
+                    final_stat,
                     "\n[warning: patch was applied to parent workspace, but advancing worktree baseline failed ({e}); do not re-run `land` on this worker — inspect or close it instead]"
-                ));
+                );
             }
         }
 
@@ -412,8 +413,7 @@ impl IsolatedForkWorktree {
             let owner_alive = std::fs::read_to_string(&pid_path)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(is_process_alive)
-                .unwrap_or(false);
+                .is_some_and(is_process_alive);
             if owner_alive {
                 continue;
             }

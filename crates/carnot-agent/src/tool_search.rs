@@ -1,7 +1,7 @@
 //! Cache-invariant universal `ToolSearch` + `CallDeferredTool` fallback for non-Anthropic providers
 //! without mutating the static cached tool prefix.
 //!
-//! When a provider does NOT support Anthropic's native `tool_search_tool_regex_20251119` (e.g. OpenAI
+//! When a provider does NOT support Anthropic's native `tool_search_tool_regex_20251119` (e.g. `OpenAI`
 //! or local OpenAI-compatible models) and deferred tools (MCP, `WebFetch`, etc.) are registered:
 //!   - The static `tools` array stays **100% FIXED** (`Bash`, `Read`, `Edit`, `Write`, `ToolSearch`,
 //!     `CallDeferredTool`) so `prefix_hash` and `prompt_cache_key` NEVER mutate!
@@ -21,7 +21,7 @@ pub const TOOL_SEARCH_NAME: &str = "ToolSearch";
 pub const CALL_DEFERRED_TOOL_NAME: &str = "CallDeferredTool";
 
 /// Max number of non-MCP deferred tools promoted directly to eager tools on providers without
-/// native `defer_loading` (OpenAI, Gemini, local models).
+/// native `defer_loading` (`OpenAI`, Gemini, local models).
 ///
 /// Rationale:
 ///   - Providers WITH native `defer_loading` (Anthropic) keep `defer_loading: true` on the wire
@@ -167,7 +167,7 @@ pub struct ToolSearchTool {
 impl ToolSearchTool {
     pub fn new(deferred_tools: &[Arc<dyn Tool>]) -> Self {
         let mut deferred_specs: Vec<ToolSpec> = deferred_tools.iter().map(|t| t.spec()).collect();
-        deferred_specs.sort_by(|a, b| a.name.cmp(&b.name));
+        deferred_specs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         Self { deferred_specs }
     }
 }
@@ -281,7 +281,7 @@ impl Tool for ToolSearchTool {
             let re = RegexBuilder::new(query).case_insensitive(true).build().ok();
             let tokens: Vec<String> = query
                 .split_whitespace()
-                .map(|t| t.to_ascii_lowercase())
+                .map(str::to_ascii_lowercase)
                 .collect();
 
             let mut scored: Vec<(usize, &ToolSpec)> = self
@@ -315,7 +315,7 @@ impl Tool for ToolSearchTool {
                 })
                 .collect();
 
-            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+            scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
             scored.truncate(limit);
 
             if scored.is_empty() {

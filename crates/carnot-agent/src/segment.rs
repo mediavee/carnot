@@ -35,7 +35,10 @@ impl SegmentTracker {
             Self::push_unique(&mut self.handles_created, handle.to_string());
             metrics.cas_handles_created += 1;
         }
-        if let Some(saved) = out.details.get("bytes_saved").and_then(|v| v.as_u64())
+        if let Some(saved) = out
+            .details
+            .get("bytes_saved")
+            .and_then(serde_json::Value::as_u64)
             && saved > 0
         {
             metrics.semantic_bytes_saved += saved;
@@ -44,7 +47,11 @@ impl SegmentTracker {
             metrics.edit_attempts += 1;
             if out.is_error {
                 metrics.edit_failures += 1;
-            } else if let Some(fc) = out.details.get("fuzzy_matches").and_then(|v| v.as_u64()) {
+            } else if let Some(fc) = out
+                .details
+                .get("fuzzy_matches")
+                .and_then(serde_json::Value::as_u64)
+            {
                 metrics.edit_fuzzy_matches += fc;
             }
         }

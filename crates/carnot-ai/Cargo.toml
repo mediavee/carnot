@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 base64.workspace = true
 carnot-core.workspace = true
-futures.workspace = true
+futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

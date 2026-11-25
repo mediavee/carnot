@@ -45,6 +45,7 @@ use carnot_ext::{
 use carnot_tools::{BoxFuture, Tool, ToolRegistry};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -251,8 +252,7 @@ impl SubagentTool {
             let target_prov_name = if let Some(p) = req_provider {
                 reg.catalog()
                     .find_provider(p)
-                    .map(|(canon, _)| canon.to_string())
-                    .unwrap_or_else(|| p.to_string())
+                    .map_or_else(|| p.to_string(), |(canon, _)| canon.to_string())
             } else if let Some(m) = req_model
                 && let Some(routed) = reg.catalog().provider_for_model(m)
             {
@@ -264,8 +264,7 @@ impl SubagentTool {
             let has_model_routes = reg
                 .catalog()
                 .find_provider(&target_prov_name)
-                .map(|(_, e)| !e.model_routes.is_empty())
-                .unwrap_or(false);
+                .is_some_and(|(_, e)| !e.model_routes.is_empty());
             let same_model = req_model.is_none() || req_model == Some(child_cfg.model.as_str());
 
             if target_prov_name.eq_ignore_ascii_case(&live_provider_id)
@@ -281,7 +280,7 @@ impl SubagentTool {
                     }
                 }
                 let safe_max_out =
-                    ((child_cfg.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+                    ((child_cfg.context_window / 2).max(4096)).min(u64::from(u32::MAX)) as u32;
                 if child_cfg.max_output_tokens > safe_max_out {
                     child_cfg.max_output_tokens = safe_max_out;
                 }
@@ -296,7 +295,7 @@ impl SubagentTool {
                     child_cfg.max_output_tokens = mo;
                 }
                 let safe_max_out =
-                    ((child_cfg.context_window / 2).max(4096)).min(u32::MAX as u64) as u32;
+                    ((child_cfg.context_window / 2).max(4096)).min(u64::from(u32::MAX)) as u32;
                 if child_cfg.max_output_tokens > safe_max_out {
                     child_cfg.max_output_tokens = safe_max_out;
                 }
@@ -463,9 +462,10 @@ impl SubagentTool {
                     "Conflict checking worker `{job_id}` patch (parent workspace was NOT modified):\n{stderr}"
                 );
                 if let Some(ref cp) = cas_path {
-                    msg.push_str(&format!(
+                    let _ = write!(
+                        msg,
                         "\nPatch saved to `{cp}` (you can resolve via `git apply --3way {cp}` or steer `{job_id}` via `SendMessage`)."
-                    ));
+                    );
                 }
                 Ok(ToolOutput::err_text(msg).with_details(json!({
                     "job_id": job_id,
@@ -746,7 +746,7 @@ impl Tool for SubagentTool {
                 })
                 .await
                 .map_err(|e| CarnotError::Session(format!("worktree create task failed: {e}")))??;
-                plan.config.workspace_root = fk.worker_workspace.clone();
+                plan.config.workspace_root.clone_from(&fk.worker_workspace);
                 plan.config.extra_env.insert(
                     "CARGO_TARGET_DIR".into(),
                     fk.cargo_target_dir.to_string_lossy().to_string(),
@@ -941,15 +941,16 @@ impl Tool for SubagentTool {
                         summary
                     );
                     if let Some(ref hr) = outcome.halted_reason {
-                        report.push_str(&format!("\n[subagent-halted] {hr}"));
+                        let _ = write!(report, "\n[subagent-halted] {hr}");
                     }
                     if let Some(st) = ws_status {
-                        report.push_str(&format!("\n[subagent-workspace-changes]\n{st}"));
+                        let _ = write!(report, "\n[subagent-workspace-changes]\n{st}");
                     }
                     if let Some(ref dh) = diff_handle {
-                        report.push_str(&format!(
+                        let _ = write!(
+                            report,
                             "\n[subagent-diff-patch] Saved isolated worktree diff to `{dh}` (apply via `git apply {dh}`)"
-                        ));
+                        );
                     }
                     let rep = WorkerReport {
                         worker_name: plan.name,
@@ -1210,6 +1211,7 @@ impl SubagentModule {
         Self::with_configs(config, provider, Vec::new(), extra_modules)
     }
 
+    #[must_use]
     pub fn with_provider_configs(self, provider_configs: Vec<PathBuf>) -> Self {
         Self::with_configs(
             self.subagent_tool.parent_config.clone(),
@@ -1261,7 +1263,10 @@ impl SubagentModule {
 
     /// Creates a worker-role `SubagentModule` holding `Weak<Fleet>` (acyclic ownership!) while
     /// registering the exact same 2 tools (preserving byte-identical `prefix_hash`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal worker constructor forwards acyclic Weak<Fleet> and shared budget handles"
+    )]
     fn for_worker(
         worker_name: String,
         config: CarnotConfig,
@@ -1326,12 +1331,15 @@ impl SubagentModule {
 }
 
 impl Module for SubagentModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "subagent"
     }
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        vec![self.subagent_tool.clone(), self.send_msg_tool.clone()]
+        vec![
+            Arc::clone(&self.subagent_tool) as Arc<dyn Tool>,
+            Arc::clone(&self.send_msg_tool) as Arc<dyn Tool>,
+        ]
     }
 
     fn on_session_start(&self, cfg: &CarnotConfig) -> ExtFuture<'_, Result<Option<String>>> {
@@ -1513,14 +1521,14 @@ impl Module for SubagentModule {
                     && !parent.has_pending_steers().await
                 {
                     tokio::select! {
-                        _ = cancel.cancelled() => {
+                        () = cancel.cancelled() => {
                             return Ok(BoundaryAction::Continue);
                         }
-                        _ = &mut steer_notified => {
+                        () = &mut steer_notified => {
                             return Ok(BoundaryAction::Continue);
                         }
-                        _ = &mut fleet_notified => {}
-                        _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)) => {}
+                        () = &mut fleet_notified => {}
+                        () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)) => {}
                     }
                     if cancel.is_cancelled() || parent.has_pending_steers().await {
                         return Ok(BoundaryAction::Continue);

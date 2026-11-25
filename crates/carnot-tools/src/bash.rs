@@ -42,12 +42,14 @@ impl BoundedOutput {
     }
 
     fn take_delta(&mut self) -> String {
+        use std::fmt::Write as _;
         let mut s = String::new();
         if self.omitted_bytes > 0 {
-            s.push_str(&format!(
-                "[... {} older bytes omitted after 8 MiB ring cap ...]\n",
+            let _ = writeln!(
+                s,
+                "[... {} older bytes omitted after 8 MiB ring cap ...]",
                 self.omitted_bytes
-            ));
+            );
             self.omitted_bytes = 0;
         }
         if !self.pending_bytes.is_empty() {
@@ -83,10 +85,16 @@ impl JobRegistry {
     }
 
     fn insert(&self, job: Arc<BackgroundJob>) -> String {
-        let mut c = self.counter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = self
+            .counter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *c += 1;
         let id = format!("job-{}", *c);
-        let mut map = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Evict oldest finished jobs if cap exceeded.
         if map.len() >= MAX_RETAINED_JOBS {
             let finished: Vec<String> = map
@@ -105,7 +113,7 @@ impl JobRegistry {
     fn get(&self, id: &str) -> Option<Arc<BackgroundJob>> {
         self.jobs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
             .cloned()
     }
@@ -113,7 +121,7 @@ impl JobRegistry {
     fn remove(&self, id: &str) {
         self.jobs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id);
     }
 
@@ -201,7 +209,10 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "BashTool constructor wires explicit sandbox, CAS, and timeout settings from CarnotConfig"
+    )]
     pub fn new(
         workspace_root: PathBuf,
         sandbox: SandboxPolicy,
@@ -230,6 +241,7 @@ impl BashTool {
         }
     }
 
+    #[must_use]
     pub fn with_redact_cas_secrets(mut self, redact: bool) -> Self {
         self.redact_cas_secrets = redact;
         self
@@ -237,6 +249,7 @@ impl BashTool {
 
     /// Attaches a shared CAS hash set (cleared on compaction/rewind by `ToolRegistry::reset_read_tracker`)
     /// so repeated identical large command outputs collapse to a 1-line dedup receipt.
+    #[must_use]
     pub fn with_seen_cas_hashes(mut self, seen_cas_hashes: Arc<Mutex<HashSet<String>>>) -> Self {
         self.seen_cas_hashes = seen_cas_hashes;
         self
@@ -325,19 +338,18 @@ impl Tool for BashTool {
                 let wait_ms = input
                     .get("timeout")
                     .and_then(Value::as_u64)
-                    .map(|s| s.saturating_mul(1000))
-                    .unwrap_or(self.yield_ms)
+                    .map_or(self.yield_ms, |s| s.saturating_mul(1000))
                     .min(120_000);
 
                 let mut rx = job.exit_rx.clone();
                 if rx.borrow().is_none() {
                     tokio::select! {
-                        _ = cancel.cancelled() => {
+                        () = cancel.cancelled() => {
                             return Ok(ToolOutput::err_text(format!("Cancelled while polling {job_id}")));
                         }
                         _ = tokio::time::timeout(
                             Duration::from_millis(wait_ms),
-                            rx.wait_for(|v| v.is_some()),
+                            rx.wait_for(std::option::Option::is_some),
                         ) => {}
                     }
                 }
@@ -345,7 +357,7 @@ impl Tool for BashTool {
                 let delta = job
                     .output
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take_delta();
                 let FormattedBashOutput {
                     text: mut shaped,
@@ -379,7 +391,7 @@ impl Tool for BashTool {
                 };
                 return Ok(ToolOutput {
                     blocks: vec![carnot_core::ToolResultBlock::text(body)],
-                    is_error: exit.map(|c| c != 0).unwrap_or(false),
+                    is_error: exit.is_some_and(|c| c != 0),
                     details: json!({
                         "job_id": job_id,
                         "exit_code": exit,
@@ -459,9 +471,9 @@ impl Tool for BashTool {
             });
 
             // Background pump: live chunked readers + process-group kill + 500ms pipe drain grace!
-            let job_bg = job.clone();
+            let job_bg = Arc::clone(&job);
             tokio::spawn(async move {
-                let job_out = job_bg.clone();
+                let job_out = Arc::clone(&job_bg);
                 let out_task = tokio::spawn(async move {
                     if let Some(mut s) = stdout {
                         let mut buf = [0u8; 8192];
@@ -472,7 +484,7 @@ impl Tool for BashTool {
                                     job_out
                                         .output
                                         .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .push_bytes(&buf[..n]);
                                 }
                             }
@@ -480,7 +492,7 @@ impl Tool for BashTool {
                     }
                 });
 
-                let job_err = job_bg.clone();
+                let job_err = Arc::clone(&job_bg);
                 let err_task = tokio::spawn(async move {
                     if let Some(mut s) = stderr {
                         let mut buf = [0u8; 8192];
@@ -491,7 +503,7 @@ impl Tool for BashTool {
                                     job_err
                                         .output
                                         .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .push_bytes(&buf[..n]);
                                 }
                             }
@@ -500,16 +512,16 @@ impl Tool for BashTool {
                 });
 
                 let exit = tokio::select! {
-                    _ = job_cancel.cancelled() => {
+                    () = job_cancel.cancelled() => {
                         kill_process_group(&mut child).await;
                         137
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(hard_timeout_ms)) => {
+                    () = tokio::time::sleep(Duration::from_millis(hard_timeout_ms)) => {
                         kill_process_group(&mut child).await;
                         124
                     }
                     res = child.wait() => {
-                        res.map(status_to_exit_code).unwrap_or(-1)
+                        res.map_or(-1, status_to_exit_code)
                     }
                 };
 
@@ -534,12 +546,12 @@ impl Tool for BashTool {
             // Wait up to `yield_ms` via watch::Receiver (zero lost wakeup).
             let mut wait_rx = exit_rx;
             let waited_done = tokio::select! {
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     job.cancel.cancel();
                     return Err(CarnotError::Cancelled);
                 }
-                res = wait_rx.wait_for(|v| v.is_some()) => res.is_ok(),
-                _ = tokio::time::sleep(Duration::from_millis(yield_ms)) => false,
+                res = wait_rx.wait_for(std::option::Option::is_some) => res.is_ok(),
+                () = tokio::time::sleep(Duration::from_millis(yield_ms)) => false,
             };
             let completed = waited_done || wait_rx.borrow().is_some();
 
@@ -548,7 +560,7 @@ impl Tool for BashTool {
                 let raw = job
                     .output
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take_all();
                 let FormattedBashOutput {
                     text: mut shaped,
@@ -587,9 +599,9 @@ impl Tool for BashTool {
                 let partial = job
                     .output
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take_delta();
-                let job_id = self.jobs.insert(job.clone());
+                let job_id = self.jobs.insert(Arc::clone(&job));
                 let header = if partial.is_empty() {
                     String::new()
                 } else {
@@ -597,8 +609,7 @@ impl Tool for BashTool {
                     format!("{}\n", p.text)
                 };
                 Ok(ToolOutput::ok_text(format!(
-                    "{header}[yielded after {}ms -> {job_id} still running: `{command}` — call Bash{{\"job\":\"{job_id}\"}} to collect or {{\"job\":\"{job_id}\",\"kill\":true}} to stop]",
-                    yield_ms
+                    "{header}[yielded after {yield_ms}ms -> {job_id} still running: `{command}` — call Bash{{\"job\":\"{job_id}\"}} to collect or {{\"job\":\"{job_id}\",\"kill\":true}} to stop]"
                 ))
                 .with_details(json!({
                     "command": command,

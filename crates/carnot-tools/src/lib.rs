@@ -93,10 +93,10 @@ impl ToolRegistry {
         let mut reg = Self {
             tools: HashMap::new(),
             order: Vec::new(),
-            read_tracker: read_tracker.clone(),
-            seen_cas_hashes: seen_cas_hashes.clone(),
-            job_registry: job_registry.clone(),
-            undo_stack: undo_stack.clone(),
+            read_tracker: Arc::clone(&read_tracker),
+            seen_cas_hashes: Arc::clone(&seen_cas_hashes),
+            job_registry: Arc::clone(&job_registry),
+            undo_stack: Arc::clone(&undo_stack),
             cas: Some(Arc::clone(&cas)),
         };
 
@@ -148,7 +148,7 @@ impl ToolRegistry {
             config.workspace_root.clone(),
             config.extra_writable_roots.clone(),
             Arc::clone(&cas),
-            undo_stack.clone(),
+            Arc::clone(&undo_stack),
             config.modules.tx_edit_syntax,
         )));
 

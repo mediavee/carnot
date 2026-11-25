@@ -197,7 +197,7 @@ impl ProviderRegistry {
             ));
         }
 
-        items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+        items.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
         items.into_iter().map(|(_, m)| m).collect()
     }
 

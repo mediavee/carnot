@@ -203,8 +203,7 @@ impl LspConn {
                             let count = v
                                 .pointer("/params/items")
                                 .and_then(Value::as_array)
-                                .map(|a| a.len().max(1))
-                                .unwrap_or(1);
+                                .map_or(1, |a| a.len().max(1));
                             Value::Array(vec![json!({}); count])
                         }
                         _ => Value::Null,
@@ -232,11 +231,7 @@ impl LspConn {
                                 .unwrap_or(0) as u32;
                             let code = d
                                 .get("code")
-                                .map(|c| {
-                                    c.as_str()
-                                        .map(str::to_string)
-                                        .unwrap_or_else(|| c.to_string())
-                                })
+                                .map(|c| c.as_str().map_or_else(|| c.to_string(), str::to_string))
                                 .unwrap_or_default();
                             let message = d
                                 .get("message")
@@ -254,14 +249,17 @@ impl LspConn {
                         }
                     }
                     d_r.lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(uri.to_string(), errs);
                     n_r.notify_waiters();
                     continue;
                 }
 
                 if let Some(id) = v.get("id").and_then(Value::as_u64)
-                    && let Some(tx) = p_r.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
+                    && let Some(tx) = p_r
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&id)
                 {
                     let _ = tx.send(v);
                 }
@@ -312,32 +310,34 @@ impl LspConn {
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, tx);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if self.write_tx.send(frame_lsp_message(&msg)).await.is_err() {
             self.pending
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
             return None;
         }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(v)) => Some(v),
-            _ => {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
-                None
-            }
+        if let Ok(Ok(v)) = tokio::time::timeout(timeout, rx).await {
+            Some(v)
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            None
         }
     }
 
     async fn sync_document(&self, path: &Path, lang: LspLang, text: &str) -> String {
         let uri = path_to_file_uri(path);
         let next_ver = {
-            let mut m = self.doc_versions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut m = self
+                .doc_versions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = m.entry(uri.clone()).or_insert(0);
             *entry += 1;
             *entry
@@ -371,7 +371,7 @@ impl LspConn {
     fn current_diagnostics(&self, uri: &str) -> Vec<RawDiag> {
         self.diagnostics
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(uri)
             .cloned()
             .unwrap_or_default()
@@ -397,7 +397,7 @@ impl LspServerPool {
     }
 
     /// Returns an already-warm connection immediately without blocking, or starts background warm-up.
-    async fn get_if_warm_or_spawn_bg(self: &Arc<Self>, lang: LspLang) -> Option<Arc<LspConn>> {
+    fn get_if_warm_or_spawn_bg(self: &Arc<Self>, lang: LspLang) -> Option<Arc<LspConn>> {
         if let Ok(guard) = self.conns.try_lock()
             && let Some(slot) = guard.get(&lang)
         {
@@ -406,7 +406,7 @@ impl LspServerPool {
         let should_spawn = self
             .warming
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(lang);
         if should_spawn {
             let pool = Arc::clone(self);
@@ -414,7 +414,7 @@ impl LspServerPool {
                 let _ = pool.get_or_spawn(lang).await;
                 pool.warming
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&lang);
             });
         }
@@ -520,21 +520,18 @@ impl Tool for LspQueryTool {
             };
 
             let conn = tokio::select! {
-                _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
-                c = self.pool.get_or_spawn(lang) => match c {
-                    Some(conn) => conn,
-                    None => {
-                        let tried: Vec<&str> = lang
-                            .default_candidates()
-                            .iter()
-                            .map(|(bin, _)| *bin)
-                            .collect();
-                        return Ok(ToolOutput::err_text(format!(
-                            "Language server for `{}` is not installed or failed to initialize (tried: {}).",
-                            lang.language_id(),
-                            tried.join(", ")
-                        )));
-                    }
+                () = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                c = self.pool.get_or_spawn(lang) => if let Some(conn) = c { conn } else {
+                    let tried: Vec<&str> = lang
+                        .default_candidates()
+                        .iter()
+                        .map(|(bin, _)| *bin)
+                        .collect();
+                    return Ok(ToolOutput::err_text(format!(
+                        "Language server for `{}` is not installed or failed to initialize (tried: {}).",
+                        lang.language_id(),
+                        tried.join(", ")
+                    )));
                 }
             };
             let notified = conn.diag_notify.notified();
@@ -588,7 +585,7 @@ impl Tool for LspQueryTool {
             };
 
             let resp = tokio::select! {
-                _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                () = cancel.cancelled() => return Err(CarnotError::Cancelled),
                 r = conn.request(method, params, Duration::from_secs(QUERY_TIMEOUT_SECS)) => r,
             };
             let Some(v) = resp else {
@@ -685,7 +682,7 @@ impl LspDiagnosticsModule {
 }
 
 impl Module for LspDiagnosticsModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "lsp_diagnostics"
     }
 
@@ -721,7 +718,7 @@ impl Module for LspDiagnosticsModule {
                 return Ok(());
             };
             // Never stall an Edit/Read on a cold LSP boot — warm up asynchronously in background!
-            let Some(conn) = self.pool.get_if_warm_or_spawn_bg(lang).await else {
+            let Some(conn) = self.pool.get_if_warm_or_spawn_bg(lang) else {
                 return Ok(());
             };
             let Ok(content) = tokio::fs::read_to_string(&path).await else {
@@ -737,7 +734,7 @@ impl Module for LspDiagnosticsModule {
                 let fps = fingerprint_diags(&diags, &content);
                 self.baseline
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(path, fps);
                 return Ok(());
             }
@@ -749,7 +746,7 @@ impl Module for LspDiagnosticsModule {
             let prev_fps = self
                 .baseline
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&path)
                 .cloned()
                 .unwrap_or_default();
@@ -771,7 +768,7 @@ impl Module for LspDiagnosticsModule {
             let new_fps = fingerprint_diags(&after_diags, &content);
             self.baseline
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(path, new_fps);
 
             if !new_errs.is_empty() {

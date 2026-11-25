@@ -15,6 +15,7 @@ use carnot::{
 };
 use carnot_core::ContentBlock;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,7 +29,7 @@ fn msgs_json(msgs: &[Arc<carnot::Message>]) -> String {
 struct DenyRmRfAndRewriteReadModule;
 
 impl Module for DenyRmRfAndRewriteReadModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "deny_rm_rf_and_rewrite"
     }
 
@@ -41,8 +42,7 @@ impl Module for DenyRmRfAndRewriteReadModule {
             && input
                 .get("command")
                 .and_then(Value::as_str)
-                .map(|c| c.contains("rm -rf /"))
-                .unwrap_or(false)
+                .is_some_and(|c| c.contains("rm -rf /"))
         {
             ToolGateDecision::Deny {
                 reason: "blocked dangerous rm -rf /".into(),
@@ -71,9 +71,10 @@ async fn e2e_read_edit_cas_spill_prefix_monotonicity_and_permission_gate() {
     // Generate a big log (>6 KiB): Read returns lines directly (no CAS loop!), Bash spills to .carnot/h/
     let mut big_log = String::new();
     for i in 0..200 {
-        big_log.push_str(&format!(
-            "line {i:03}: verbose diagnostic padding content here\n"
-        ));
+        let _ = writeln!(
+            big_log,
+            "line {i:03}: verbose diagnostic padding content here"
+        );
     }
     fs::write(dir.join("debug.log"), &big_log).expect("write log");
 
@@ -116,7 +117,7 @@ async fn e2e_read_edit_cas_spill_prefix_monotonicity_and_permission_gate() {
 
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .with_module(Arc::new(DenyRmRfAndRewriteReadModule))
         .persist_session(true)
         .build()
@@ -190,7 +191,7 @@ async fn e2e_multimodal_prompt_blocks_forwards_images_verbatim() {
     cfg.modules.sandbox = false;
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -269,7 +270,7 @@ async fn e2e_path_confinement_crlf_and_permissions() {
     cfg.modules.sandbox = false;
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -363,7 +364,7 @@ async fn e2e_parallel_disjoint_edits_and_invalid_json_guard() {
     cfg.modules.sandbox = false;
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -421,7 +422,7 @@ async fn e2e_adaptive_bash_yield_live_partial_and_bg_grandchild_no_hang() {
 
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -478,7 +479,7 @@ async fn e2e_max_tokens_pairs_truncated_tool_use_so_session_stays_usable() {
     cfg.max_tokens_continuations = 0;
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -529,7 +530,7 @@ async fn e2e_max_tokens_auto_continues_and_recovers() {
     cfg.modules.sandbox = false;
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -575,7 +576,7 @@ async fn e2e_multimodal_read_agents_md_and_policy_redaction() {
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
         .policy_guard(true)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -632,7 +633,7 @@ async fn e2e_subagent_shares_parent_prefix_cache_and_isolates_context() {
     cfg.modules.subagent = true;
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -656,10 +657,6 @@ async fn e2e_subagent_shares_parent_prefix_cache_and_isolates_context() {
 
 #[tokio::test]
 async fn e2e_tool_search_fallback_and_session_resume() {
-    let dir = std::env::temp_dir().join(format!("carnot-ts-{}", uuid::Uuid::new_v4()));
-    let sdir = dir.join("sessions");
-    fs::create_dir_all(&dir).expect("mkdir");
-
     #[derive(Debug)]
     struct DeferredDemoTool;
     impl carnot::Tool for DeferredDemoTool {
@@ -685,6 +682,10 @@ async fn e2e_tool_search_fallback_and_session_resume() {
         }
     }
 
+    let dir = std::env::temp_dir().join(format!("carnot-ts-{}", uuid::Uuid::new_v4()));
+    let sdir = dir.join("sessions");
+    fs::create_dir_all(&dir).expect("mkdir");
+
     let faux1 = Arc::new(FauxProvider::new(vec![
         // FauxProvider has supports_native_tool_search() == false -> ToolSearch + CallDeferredTool auto-registered!
         ScriptedTurn::tool_calls(vec![("ts1", "ToolSearch", json!({"query": "customer"}))]),
@@ -702,7 +703,7 @@ async fn e2e_tool_search_fallback_and_session_resume() {
     let agent1 = CarnotBuilder::new(dir.clone())
         .config(cfg.clone())
         .with_tool(Arc::new(DeferredDemoTool))
-        .provider(faux1.clone())
+        .provider(Arc::clone(&faux1) as Arc<dyn carnot::Provider>)
         .persist_session(true)
         .build()
         .expect("build1");
@@ -726,7 +727,7 @@ async fn e2e_tool_search_fallback_and_session_resume() {
     let agent2 = CarnotBuilder::new(dir.clone())
         .config(cfg)
         .resume_session(session_file)
-        .provider(faux2.clone())
+        .provider(Arc::clone(&faux2) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build2");
     let out2 = agent2.prompt("Who was that customer?").await.expect("run2");
@@ -768,7 +769,7 @@ async fn e2e_subagent_inherits_policy_guard_and_cannot_bypass() {
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
         .policy_guard(true)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .persist_session(false)
         .build()
         .expect("build");
@@ -809,7 +810,7 @@ async fn e2e_root_max_cost_usd_halts_cleanly() {
         .sandbox(false)
         .max_cost_usd(0.0001)
         .persist_session(false)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
@@ -867,7 +868,7 @@ async fn e2e_cache_warm_semantic_compaction_preserves_full_goal_and_bash_cwd() {
     let agent = CarnotBuilder::new(dir.clone())
         .sandbox(false)
         .persist_session(false)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
@@ -944,7 +945,7 @@ async fn e2e_background_subagent_spawn_list_collect_and_cost_rollup() {
     }
 
     impl Provider for SplitProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "split-faux"
         }
         fn stream(
@@ -955,8 +956,7 @@ async fn e2e_background_subagent_spawn_list_collect_and_cost_rollup() {
             let is_child = req
                 .messages
                 .first()
-                .map(|m| m.text_concat().contains("CHILD_TASK"))
-                .unwrap_or(false);
+                .is_some_and(|m| m.text_concat().contains("CHILD_TASK"));
             let target = if is_child {
                 Arc::clone(&self.child)
             } else {
@@ -1061,7 +1061,7 @@ async fn e2e_before_compact_module_hook_adds_focus_and_can_cancel() {
     }
 
     impl Module for CompactHookModule {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "compact_hook_test"
         }
 
@@ -1101,7 +1101,7 @@ async fn e2e_before_compact_module_hook_adds_focus_and_can_cancel() {
     cfg.modules.compaction = true;
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .with_module(Arc::new(CompactHookModule {
             cancel_next: Arc::clone(&cancel_flag),
         }))
@@ -1179,7 +1179,7 @@ async fn e2e_deferred_directory_turn1_and_select_tool_search() {
     let agent = CarnotBuilder::new(dir.clone())
         .sandbox(false)
         .persist_session(false)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .with_tool(Arc::new(DeferredPingTool))
         .build()
         .expect("build");
@@ -1224,7 +1224,7 @@ async fn e2e_official_rust_extensions_preserve_static_prefix_invariance() {
     let base_agent = CarnotBuilder::new(dir.clone())
         .sandbox(false)
         .persist_session(false)
-        .provider(base_faux.clone())
+        .provider(Arc::clone(&base_faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build base");
     base_agent.prompt("ping").await.expect("base prompt");
@@ -1235,7 +1235,7 @@ async fn e2e_official_rust_extensions_preserve_static_prefix_invariance() {
         .persist_session(false)
         .web_fetch(true)
         .lsp_diagnostics(true)
-        .provider(ext_faux.clone())
+        .provider(Arc::clone(&ext_faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build with ext-web + ext-lsp");
     ext_agent.prompt("ping").await.expect("ext prompt");
@@ -1315,7 +1315,7 @@ async fn e2e_official_rust_extensions_preserve_static_prefix_invariance() {
         .sandbox(false)
         .persist_session(false)
         .web_mode(carnot::WebMode::Auto)
-        .provider(native_faux.clone())
+        .provider(Arc::clone(&native_faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build auto native web");
     let out = native_agent.prompt("Research docs").await.expect("run");
@@ -1412,7 +1412,7 @@ async fn e2e_memory_and_claude_plugin_preserve_static_prefix_and_enforce_hooks()
             max_entries_per_scope: 50,
         })
         .claude_plugin(plug_dir.clone())
-        .provider(faux1.clone())
+        .provider(Arc::clone(&faux1) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build session 1");
 
@@ -1441,7 +1441,7 @@ async fn e2e_memory_and_claude_plugin_preserve_static_prefix_and_enforce_hooks()
             max_entries_per_scope: 50,
         })
         .claude_plugin(plug_dir.clone())
-        .provider(faux2.clone())
+        .provider(Arc::clone(&faux2) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build session 2");
 
@@ -1493,13 +1493,17 @@ async fn e2e_ask_user_channel_broker_and_allow_always_permission_flow() {
         .sandbox(false)
         .persist_session(false)
         .ask_user(true)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
     let broker = carnot::ChannelInteractionBroker::new(Arc::clone(&agent));
-    agent.set_question_broker(broker.clone()).await;
-    agent.set_permission_broker(broker.clone()).await;
+    agent
+        .set_question_broker(Arc::clone(&broker) as Arc<dyn carnot::UserQuestionBroker>)
+        .await;
+    agent
+        .set_permission_broker(Arc::clone(&broker) as Arc<dyn carnot::PermissionBroker>)
+        .await;
 
     // Background responder mimicking an ACP/RPC/HTTP UI client
     let mut evs = agent.subscribe();
@@ -1573,7 +1577,7 @@ async fn e2e_mid_tool_abort_persists_paired_tool_result_and_keeps_session_usable
     let agent = CarnotBuilder::new(dir.clone())
         .sandbox(false)
         .persist_session(false)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
@@ -1649,7 +1653,7 @@ async fn e2e_session_fork_and_resume_fork_preserve_original_and_prefix_hash() {
     let agent = CarnotBuilder::new(dir.clone())
         .config(cfg)
         .persist_session(true)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
@@ -1688,7 +1692,7 @@ async fn e2e_session_fork_and_resume_fork_preserve_original_and_prefix_hash() {
         .resume_session(orig_path.clone())
         .fork_session(true)
         .persist_session(true)
-        .provider(faux2.clone())
+        .provider(Arc::clone(&faux2) as Arc<dyn carnot::Provider>)
         .build()
         .expect("resume forked");
     let rf_id = agent2.session_id().await;
@@ -1731,7 +1735,7 @@ async fn e2e_subagent_fork_vs_fresh_and_cross_provider_registry_routing() {
                 "alt-model-v2": {
                     "provider": "alt-faux",
                     "label": "Alt Model v2",
-                    "context_window": 128000,
+                    "context_window": 128_000,
                     "max_output_tokens": 8192
                 }
             }
@@ -1795,7 +1799,7 @@ async fn e2e_subagent_fork_vs_fresh_and_cross_provider_registry_routing() {
         .persist_session(false)
         .subagent(true)
         .provider_config(custom_cat_path.clone())
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
@@ -1937,7 +1941,7 @@ async fn e2e_orchestration_dirty_parent_with_untracked_file_lands_worker_diff_cl
         .sandbox(false)
         .persist_session(false)
         .subagent(true)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
@@ -2021,7 +2025,7 @@ async fn e2e_orchestration_headless_waits_for_running_worker_and_delegates_permi
     }
 
     impl Provider for RoleRoutedProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
 
@@ -2097,8 +2101,8 @@ async fn e2e_orchestration_headless_waits_for_running_worker_and_delegates_permi
     ]));
 
     let routed = Arc::new(RoleRoutedProvider {
-        parent: parent_faux.clone(),
-        worker: worker_faux.clone(),
+        parent: Arc::clone(&parent_faux),
+        worker: Arc::clone(&worker_faux),
     });
     let broker = Arc::new(TaggingBroker {
         seen_calls: std::sync::Mutex::new(Vec::new()),
@@ -2110,7 +2114,9 @@ async fn e2e_orchestration_headless_waits_for_running_worker_and_delegates_permi
         .provider(routed)
         .build()
         .expect("build");
-    agent.set_permission_broker(broker.clone()).await;
+    agent
+        .set_permission_broker(Arc::clone(&broker) as Arc<dyn carnot::PermissionBroker>)
+        .await;
 
     let out = agent
         .prompt("Run background security check")
@@ -2181,7 +2187,7 @@ async fn e2e_orchestration_second_land_and_monorepo_subdir() {
         worker: Arc<FauxProvider>,
     }
     impl Provider for MonorepoSplit {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -2312,8 +2318,8 @@ async fn e2e_orchestration_second_land_and_monorepo_subdir() {
         .persist_session(false)
         .subagent(true)
         .provider(Arc::new(MonorepoSplit {
-            parent: parent_faux.clone(),
-            worker: worker_faux.clone(),
+            parent: Arc::clone(&parent_faux),
+            worker: Arc::clone(&worker_faux),
         }))
         .build()
         .expect("build");
@@ -2358,7 +2364,7 @@ async fn e2e_orchestration_worker_message_single_delivery_and_untrusted() {
         worker: Arc<FauxProvider>,
     }
     impl Provider for Split {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -2419,8 +2425,8 @@ async fn e2e_orchestration_worker_message_single_delivery_and_untrusted() {
         .persist_session(false)
         .subagent(true)
         .provider(Arc::new(Split {
-            parent: parent_faux.clone(),
-            worker: worker_faux.clone(),
+            parent: Arc::clone(&parent_faux),
+            worker: Arc::clone(&worker_faux),
         }))
         .build()
         .expect("build");
@@ -2512,12 +2518,23 @@ async fn e2e_orchestration_fleet_drop_acyclic_and_cleans_worktree() {
 
     let mut cfg = CarnotConfig::new(repo_dir.clone());
     cfg.modules.sandbox = false;
-    let sub_mod = Arc::new(SubagentModule::new(cfg.clone(), faux.clone(), Vec::new()));
+    let sub_mod = Arc::new(SubagentModule::new(
+        cfg.clone(),
+        Arc::clone(&faux) as Arc<dyn carnot::Provider>,
+        Vec::new(),
+    ));
     let weak_fleet = Arc::downgrade(&sub_mod.fleet().expect("fleet alive"));
     let cas = Arc::new(carnot::CasStore::open(&repo_dir).expect("cas"));
     let tools = carnot::ToolRegistry::with_canonical_lid_tools(&cfg, cas);
     let agent = Arc::new(
-        carnot::Agent::new(cfg, faux, tools, vec![sub_mod.clone()], false).expect("agent"),
+        carnot::Agent::new(
+            cfg,
+            faux,
+            tools,
+            vec![Arc::clone(&sub_mod) as Arc<dyn carnot::Module>],
+            false,
+        )
+        .expect("agent"),
     );
     sub_mod.attach_parent(&agent);
 
@@ -2563,7 +2580,7 @@ async fn e2e_orchestration_unified_fleet_budget_parent_plus_worker_and_sync_erro
         fail_sync_worker: bool,
     }
     impl Provider for BudgetRouter {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -2705,7 +2722,7 @@ async fn e2e_orchestration_wait_any_blocks_with_idle_keep_alive_worker() {
         w2: Arc<FauxProvider>,
     }
     impl Provider for DelayedSlowWorker {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -2769,7 +2786,7 @@ async fn e2e_orchestration_wait_any_blocks_with_idle_keep_alive_worker() {
         .persist_session(false)
         .subagent(true)
         .provider(Arc::new(DelayedSlowWorker {
-            parent: parent_faux.clone(),
+            parent: Arc::clone(&parent_faux),
             w1: Arc::new(FauxProvider::new(vec![ScriptedTurn::text("W1_DONE")])),
             w2: Arc::new(FauxProvider::new(vec![ScriptedTurn::text(
                 "W2_SLOW_DONE_88",
@@ -2868,6 +2885,45 @@ async fn e2e_orchestration_user_steer_wakes_wait_and_worker_halted_reason_surfac
     use carnot::Provider;
     use std::time::Instant;
 
+    #[derive(Debug)]
+    struct MultiRouter {
+        parent: Arc<FauxProvider>,
+        slow_worker: Arc<FauxProvider>,
+        sync_worker: Arc<FauxProvider>,
+    }
+    impl Provider for MultiRouter {
+        fn name(&self) -> &'static str {
+            "faux"
+        }
+        fn stream(
+            &self,
+            req: carnot_ai::ProviderRequest,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> carnot_ai::BoxFuture<
+            '_,
+            carnot::Result<tokio::sync::mpsc::Receiver<carnot_ai::StreamEvent>>,
+        > {
+            let first = req
+                .messages
+                .first()
+                .map(|m| m.text_concat())
+                .unwrap_or_default();
+            if first.contains("SLOW_STEER_WORKER") {
+                let target = Arc::clone(&self.slow_worker);
+                return Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    target.stream(req, cancel).await
+                });
+            }
+            if first.contains("SYNC_HALT_WORKER") {
+                let target = Arc::clone(&self.sync_worker);
+                return Box::pin(async move { target.stream(req, cancel).await });
+            }
+            let target = Arc::clone(&self.parent);
+            Box::pin(async move { target.stream(req, cancel).await })
+        }
+    }
+
     let dir = std::env::temp_dir().join(format!("carnot-steer-wake-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).expect("mkdir");
     fs::write(dir.join("x.txt"), "hello").expect("write");
@@ -2909,52 +2965,13 @@ async fn e2e_orchestration_user_steer_wakes_wait_and_worker_halted_reason_surfac
         json!({"file_path": "x.txt"}),
     )])]));
 
-    #[derive(Debug)]
-    struct MultiRouter {
-        parent: Arc<FauxProvider>,
-        slow_worker: Arc<FauxProvider>,
-        sync_worker: Arc<FauxProvider>,
-    }
-    impl Provider for MultiRouter {
-        fn name(&self) -> &str {
-            "faux"
-        }
-        fn stream(
-            &self,
-            req: carnot_ai::ProviderRequest,
-            cancel: tokio_util::sync::CancellationToken,
-        ) -> carnot_ai::BoxFuture<
-            '_,
-            carnot::Result<tokio::sync::mpsc::Receiver<carnot_ai::StreamEvent>>,
-        > {
-            let first = req
-                .messages
-                .first()
-                .map(|m| m.text_concat())
-                .unwrap_or_default();
-            if first.contains("SLOW_STEER_WORKER") {
-                let target = Arc::clone(&self.slow_worker);
-                return Box::pin(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                    target.stream(req, cancel).await
-                });
-            }
-            if first.contains("SYNC_HALT_WORKER") {
-                let target = Arc::clone(&self.sync_worker);
-                return Box::pin(async move { target.stream(req, cancel).await });
-            }
-            let target = Arc::clone(&self.parent);
-            Box::pin(async move { target.stream(req, cancel).await })
-        }
-    }
-
     let agent = Arc::new(
         CarnotBuilder::new(dir.clone())
             .sandbox(false)
             .persist_session(false)
             .subagent(true)
             .provider(Arc::new(MultiRouter {
-                parent: parent_faux.clone(),
+                parent: Arc::clone(&parent_faux),
                 slow_worker: Arc::new(FauxProvider::new(vec![ScriptedTurn::text("too late")])),
                 sync_worker: worker_faux,
             }))
@@ -3007,7 +3024,7 @@ async fn e2e_orchestration_pre_tool_use_hook_applies_inside_worker() {
         worker: Arc<FauxProvider>,
     }
     impl Provider for HookSplit {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -3082,7 +3099,7 @@ async fn e2e_orchestration_pre_tool_use_hook_applies_inside_worker() {
         })
         .provider(Arc::new(HookSplit {
             parent: parent_faux,
-            worker: worker_faux.clone(),
+            worker: Arc::clone(&worker_faux),
         }))
         .build()
         .expect("build");
@@ -3113,7 +3130,7 @@ async fn e2e_prompt_with_cancel_aborts_before_provider_call() {
     let agent = CarnotBuilder::new(dir.clone())
         .sandbox(false)
         .persist_session(false)
-        .provider(faux.clone())
+        .provider(Arc::clone(&faux) as Arc<dyn carnot::Provider>)
         .build()
         .expect("build");
 
@@ -3146,7 +3163,7 @@ async fn e2e_forked_worker_shares_exact_prefix_hash_and_cache_key_with_extension
         worker: Arc<FauxProvider>,
     }
     impl Provider for ForkExtSplit {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -3202,8 +3219,8 @@ async fn e2e_forked_worker_shares_exact_prefix_hash_and_cache_key_with_extension
         .memory_config(MemoryConfig::default())
         .web_config(WebConfig::default())
         .provider(Arc::new(ForkExtSplit {
-            parent: parent_faux.clone(),
-            worker: worker_faux.clone(),
+            parent: Arc::clone(&parent_faux),
+            worker: Arc::clone(&worker_faux),
         }))
         .build()
         .expect("build");
@@ -3257,7 +3274,7 @@ async fn e2e_runtime_prefix_freeze_and_live_worker_updated_events() {
         worker: Arc<FauxProvider>,
     }
     impl Provider for EvSplit {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -3387,7 +3404,7 @@ async fn e2e_adversarial_strict_schema_empty_defaults_on_all_core_tools() {
         worker: Arc<FauxProvider>,
     }
     impl Provider for StrictSplit {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -3478,7 +3495,7 @@ async fn e2e_adversarial_strict_schema_empty_defaults_on_all_core_tools() {
         .persist_session(false)
         .subagent(true)
         .provider(Arc::new(StrictSplit {
-            parent: parent_faux.clone(),
+            parent: Arc::clone(&parent_faux),
             worker: worker_faux,
         }))
         .build()
@@ -3531,7 +3548,7 @@ async fn e2e_adversarial_nested_fork_of_fork_and_mid_tool_sanitization() {
         worker: Arc<FauxProvider>,
     }
     impl Provider for NestedSplit {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "faux"
         }
         fn stream(
@@ -3582,8 +3599,8 @@ async fn e2e_adversarial_nested_fork_of_fork_and_mid_tool_sanitization() {
         .persist_session(false)
         .subagent(true)
         .provider(Arc::new(NestedSplit {
-            parent: parent_faux.clone(),
-            worker: worker_faux.clone(),
+            parent: Arc::clone(&parent_faux),
+            worker: Arc::clone(&worker_faux),
         }))
         .build()
         .expect("build");

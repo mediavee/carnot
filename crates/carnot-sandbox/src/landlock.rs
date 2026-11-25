@@ -28,7 +28,7 @@ pub const LANDLOCK_EXEC_ARG: &str = "__carnot-landlock-exec";
 static LANDLOCK_HELPER: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LandlockSpec {
+pub(crate) struct LandlockSpec {
     pub workspace_root: PathBuf,
     pub extra_writable_roots: Vec<PathBuf>,
     pub frozen_git_write_dirs: Vec<PathBuf>,
@@ -38,7 +38,7 @@ pub struct LandlockSpec {
 }
 
 impl LandlockSpec {
-    pub fn from_policy(policy: &SandboxPolicy, cwd: &Path, shell_cmd: &str) -> Self {
+    pub(crate) fn from_policy(policy: &SandboxPolicy, cwd: &Path, shell_cmd: &str) -> Self {
         Self {
             workspace_root: policy.workspace_root.clone(),
             extra_writable_roots: policy.extra_writable_roots.clone(),
@@ -98,8 +98,9 @@ pub(crate) fn build_linux_landlock_command(
 
 #[cfg(target_os = "linux")]
 pub fn detect_landlock_abi() -> Option<u32> {
-    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHED.get_or_init(probe_landlock_abi_uncached)
+    static CACHED: std::sync::LazyLock<Option<u32>> =
+        std::sync::LazyLock::new(probe_landlock_abi_uncached);
+    *CACHED
 }
 
 #[cfg(not(target_os = "linux"))]

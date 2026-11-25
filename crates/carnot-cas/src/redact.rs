@@ -1,69 +1,61 @@
 //! Zero-allocation-fast-path credential redaction shared by CAS disk spilling and `PolicyGuard`.
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
-fn secret_redaction_patterns() -> &'static [(Regex, &'static str)] {
-    static PATS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-    PATS.get_or_init(|| {
-        vec![
-            (
-                Regex::new(r"sk-ant-[A-Za-z0-9_-]{20,}").expect("re"),
-                "[REDACTED:ANTHROPIC_KEY]",
-            ),
-            (
-                Regex::new(r"sk-or-v1-[A-Za-z0-9]{24,}").expect("re"),
-                "[REDACTED:OPENROUTER_KEY]",
-            ),
-            (
-                Regex::new(r"sk-(?:proj-)?[A-Za-z0-9_-]{24,}").expect("re"),
-                "[REDACTED:API_KEY]",
-            ),
-            (
-                Regex::new(r"AIza[0-9A-Za-z_-]{35}").expect("re"),
-                "[REDACTED:GOOGLE_KEY]",
-            ),
-            (
-                Regex::new(r"xai-[A-Za-z0-9_-]{24,}").expect("re"),
-                "[REDACTED:XAI_KEY]",
-            ),
-            (
-                Regex::new(r"gh[pousr]_[A-Za-z0-9]{20,}").expect("re"),
-                "[REDACTED:GITHUB_TOKEN]",
-            ),
-            (
-                Regex::new(r"xox[baprs]-[A-Za-z0-9-]{20,}").expect("re"),
-                "[REDACTED:SLACK_TOKEN]",
-            ),
-            (
-                Regex::new(r"AKIA[0-9A-Z]{16}").expect("re"),
-                "[REDACTED:AWS_ACCESS_KEY]",
-            ),
-            (
-                Regex::new(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]{20,}").expect("re"),
-                "Authorization: Bearer [REDACTED:BEARER_TOKEN]",
-            ),
-            (
-                Regex::new(
-                    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-                )
-                .expect("re"),
-                "[REDACTED:PRIVATE_KEY]",
-            ),
-        ]
-    })
+const SECRET_SPECS: &[(&str, &str)] = &[
+    (r"sk-ant-[A-Za-z0-9_-]{20,}", "[REDACTED:ANTHROPIC_KEY]"),
+    (r"sk-or-v1-[A-Za-z0-9]{24,}", "[REDACTED:OPENROUTER_KEY]"),
+    (r"sk-(?:proj-)?[A-Za-z0-9_-]{24,}", "[REDACTED:API_KEY]"),
+    (r"AIza[0-9A-Za-z_-]{35}", "[REDACTED:GOOGLE_KEY]"),
+    (r"xai-[A-Za-z0-9_-]{24,}", "[REDACTED:XAI_KEY]"),
+    (r"gh[pousr]_[A-Za-z0-9]{20,}", "[REDACTED:GITHUB_TOKEN]"),
+    (r"xox[baprs]-[A-Za-z0-9-]{20,}", "[REDACTED:SLACK_TOKEN]"),
+    (r"AKIA[0-9A-Z]{16}", "[REDACTED:AWS_ACCESS_KEY]"),
+    (
+        r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]{20,}",
+        "Authorization: Bearer [REDACTED:BEARER_TOKEN]",
+    ),
+    (
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        "[REDACTED:PRIVATE_KEY]",
+    ),
+];
+
+struct SecretRedactor {
+    set: RegexSet,
+    patterns: Vec<(Regex, &'static str)>,
 }
 
+static REDACTOR: LazyLock<SecretRedactor> = LazyLock::new(|| {
+    let set = RegexSet::new(SECRET_SPECS.iter().map(|(pat, _)| *pat))
+        .expect("static secret redaction RegexSet must compile");
+    let patterns = SECRET_SPECS
+        .iter()
+        .map(|(pat, repl)| {
+            (
+                Regex::new(pat).expect("static secret redaction Regex must compile"),
+                *repl,
+            )
+        })
+        .collect();
+    SecretRedactor { set, patterns }
+});
+
 /// Redacts well-known API keys, bearer tokens, and PEM private keys from `input`.
-/// Returns `Cow::Borrowed` with zero allocation when no pattern matches.
+/// Uses a single-pass `RegexSet` pre-check so clean text returns `Cow::Borrowed`
+/// with zero allocations and without running individual replacement regexes.
 pub fn redact_secrets_cow(input: &str) -> Cow<'_, str> {
+    let matches = REDACTOR.set.matches(input);
+    if !matches.matched_any() {
+        return Cow::Borrowed(input);
+    }
     let mut current: Cow<'_, str> = Cow::Borrowed(input);
-    for (re, repl) in secret_redaction_patterns() {
-        if re.is_match(current.as_ref()) {
-            let replaced = re.replace_all(current.as_ref(), *repl).into_owned();
-            current = Cow::Owned(replaced);
-        }
+    for idx in matches {
+        let (ref re, repl) = REDACTOR.patterns[idx];
+        let replaced = re.replace_all(current.as_ref(), repl).into_owned();
+        current = Cow::Owned(replaced);
     }
     current
 }

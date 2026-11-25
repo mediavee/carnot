@@ -399,8 +399,7 @@ impl Tool for EditTool {
                     Ok(h) => h.hash,
                     Err(e) => {
                         return Ok(ToolOutput::err_text(format!(
-                            "Edit aborted: failed to snapshot {} into CAS before writing: {e}",
-                            raw_path
+                            "Edit aborted: failed to snapshot {raw_path} into CAS before writing: {e}"
                         )));
                     }
                 };
@@ -419,7 +418,7 @@ impl Tool for EditTool {
                 }
 
                 // Silent Tier-0 tree-sitter ERROR-node delta: 0 extra bytes on clean edit!
-                let mut reply = format!("Edited {} ({total_replacements} replacement(s)).", raw_path);
+                let mut reply = format!("Edited {raw_path} ({total_replacements} replacement(s)).");
                 for note in &fuzzy_notes {
                     reply.push('\n');
                     reply.push_str(note);
@@ -631,8 +630,7 @@ fn reindent_replacement(matched_slice: &[&str], needle_lines: &[&str], new_s: &s
         .zip(needle_lines.iter())
         .filter(|(f, n)| !f.trim().is_empty() && !n.trim().is_empty())
         .min_by_key(|(_, n)| leading_ws(n).len())
-        .map(|(f, n)| (leading_ws(f), leading_ws(n)))
-        .unwrap_or(("", ""));
+        .map_or(("", ""), |(f, n)| (leading_ws(f), leading_ws(n)));
 
     new_s
         .split('\n')

@@ -26,7 +26,7 @@ pub enum SessionEntry {
         version: u32,
         session_id: String,
         /// Stable provider cache-routing key inherited across `--fork`, `/fork`, and forked
-        /// subagents so OpenAI `prompt_cache_key` shards stay warm on forked branches.
+        /// subagents so `OpenAI` `prompt_cache_key` shards stay warm on forked branches.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_key_id: Option<String>,
         created_unix_ms: u64,
@@ -132,7 +132,7 @@ pub fn compute_static_prefix_hash(
             defer_loading: t.defer_loading,
         })
         .collect();
-    canonical_tools.sort_by(|a, b| a.name.cmp(&b.name));
+    canonical_tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let tools_json = serde_json::to_vec(&canonical_tools)?;
     hasher.update(&tools_json);
     Ok(hasher.finalize().to_hex().to_string())
@@ -141,8 +141,7 @@ pub fn compute_static_prefix_hash(
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Lightweight metadata read from line 1 of a persisted session JSONL (used by ACP `session/list`).
@@ -316,8 +315,7 @@ impl SessionStore {
             let line_end = raw[offset..]
                 .iter()
                 .position(|&b| b == b'\n')
-                .map(|rel| offset + rel + 1)
-                .unwrap_or(raw.len());
+                .map_or(raw.len(), |rel| offset + rel + 1);
             let is_last = line_end == raw.len();
             let slice = &raw[offset..line_end];
             let trimmed = std::str::from_utf8(slice).map(str::trim);
@@ -462,9 +460,12 @@ impl SessionStore {
     }
 
     /// Builds a new `SessionStore` seeded from a parent conversation snapshot while optionally
-    /// inheriting the parent's `cache_key_id` so provider prompt-cache shards (e.g. OpenAI
+    /// inheriting the parent's `cache_key_id` so provider prompt-cache shards (e.g. `OpenAI`
     /// `prompt_cache_key`) stay hot on the forked branch.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "forked session constructor forwards all explicit snapshot fields without bundling a throwaway struct"
+    )]
     pub fn from_forked_snapshot_with_cache_key(
         session_dir: Option<&Path>,
         workspace_root: Option<PathBuf>,
@@ -779,7 +780,7 @@ impl SessionStore {
     }
 
     pub fn tokens_since_checkpoint(&self) -> u64 {
-        let start = self.checkpoint_index.map(|i| i + 1).unwrap_or(0);
+        let start = self.checkpoint_index.map_or(0, |i| i + 1);
         self.active_messages
             .get(start..)
             .unwrap_or(&[])

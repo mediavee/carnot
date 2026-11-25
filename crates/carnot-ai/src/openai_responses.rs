@@ -1,4 +1,4 @@
-//! Stateless OpenAI Responses API adapter (`api = "openai-responses"`).
+//! Stateless `OpenAI` Responses API adapter (`api = "openai-responses"`).
 //!
 //! Protocol contract:
 //! - Stateless by default (`store: false`, `include: ["reasoning.encrypted_content"]`) — never uses
@@ -19,7 +19,7 @@ use carnot_core::{
     CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ProviderWebCapabilities,
     ReasoningEffort, Result, Role, StopReason, ToolResultBlock, Usage,
 };
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -374,48 +374,44 @@ impl Provider for OpenAiResponsesProvider {
                 let mut stream_eof = false;
 
                 loop {
-                    if !stream_eof {
-                        let next_chunk = tokio::select! {
-                            _ = cancel.cancelled() => {
-                                let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
-                                return;
-                            }
-                            res = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => res,
-                        };
-
-                        let chunk_opt = match next_chunk {
-                            Ok(opt) => opt,
-                            Err(_) => {
-                                let _ = tx
-                                    .send(StreamEvent::Error {
-                                        message: "stream idle timeout (300s)".into(),
-                                        retryable: true,
-                                    })
-                                    .await;
-                                return;
-                            }
-                        };
-                        match chunk_opt {
-                            Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
-                            Some(Err(_)) => {
-                                let _ = tx
-                                    .send(StreamEvent::Error {
-                                        message: "stream read error".into(),
-                                        retryable: true,
-                                    })
-                                    .await;
-                                return;
-                            }
-                            None => {
-                                stream_eof = true;
-                                if raw_buf.is_empty() {
-                                    break;
-                                }
-                                raw_buf.extend_from_slice(b"\n\n");
-                            }
-                        }
-                    } else {
+                    if stream_eof {
                         break;
+                    }
+                    let next_chunk = tokio::select! {
+                        () = cancel.cancelled() => {
+                            let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
+                            return;
+                        }
+                        res = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => res,
+                    };
+
+                    let Ok(chunk_opt) = next_chunk else {
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: "stream idle timeout (300s)".into(),
+                                retryable: true,
+                            })
+                            .await;
+                        return;
+                    };
+                    match chunk_opt {
+                        Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
+                        Some(Err(_)) => {
+                            let _ = tx
+                                .send(StreamEvent::Error {
+                                    message: "stream read error".into(),
+                                    retryable: true,
+                                })
+                                .await;
+                            return;
+                        }
+                        None => {
+                            stream_eof = true;
+                            if raw_buf.is_empty() {
+                                break;
+                            }
+                            raw_buf.extend_from_slice(b"\n\n");
+                        }
                     }
 
                     while let Some((end, delim_len)) = find_sse_frame_end(&raw_buf) {
@@ -446,8 +442,10 @@ impl Provider for OpenAiResponsesProvider {
                                     let _ = tx.send(StreamEvent::TextDelta(d.to_string())).await;
                                 }
                             }
-                            Some("response.reasoning_summary_text.delta")
-                            | Some("response.reasoning_text.delta") => {
+                            Some(
+                                "response.reasoning_summary_text.delta"
+                                | "response.reasoning_text.delta",
+                            ) => {
                                 if let Some(d) = v.get("delta").and_then(Value::as_str) {
                                     thinking_acc.push_str(d);
                                     let _ =
@@ -507,13 +505,15 @@ impl Provider for OpenAiResponsesProvider {
                                             let args = item
                                                 .get("arguments")
                                                 .and_then(Value::as_str)
-                                                .map(str::to_string)
-                                                .unwrap_or_else(|| {
-                                                    fn_calls
-                                                        .get(&idx)
-                                                        .map(|e| e.2.clone())
-                                                        .unwrap_or_default()
-                                                });
+                                                .map_or_else(
+                                                    || {
+                                                        fn_calls
+                                                            .get(&idx)
+                                                            .map(|e| e.2.clone())
+                                                            .unwrap_or_default()
+                                                    },
+                                                    str::to_string,
+                                                );
                                             fn_calls.insert(
                                                 idx,
                                                 (cid.clone(), name.clone(), args.clone()),
@@ -532,7 +532,7 @@ impl Provider for OpenAiResponsesProvider {
                                     }
                                 }
                             }
-                            Some("response.completed") | Some("response.incomplete") => {
+                            Some("response.completed" | "response.incomplete") => {
                                 saw_completed = true;
                                 if let Some(resp_obj) = v.get("response") {
                                     if let Some(u) = resp_obj.get("usage") {
@@ -570,7 +570,7 @@ impl Provider for OpenAiResponsesProvider {
                                     }
                                 }
                             }
-                            Some("response.failed") | Some("error") => {
+                            Some("response.failed" | "error") => {
                                 let code = v
                                     .pointer("/response/error/code")
                                     .or_else(|| v.pointer("/error/code"))
@@ -676,8 +676,7 @@ fn parse_tool_args_json(args: &str) -> (Value, Option<String>) {
     } else {
         let err = serde_json::from_str::<Value>(trimmed)
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "invalid JSON".into());
+            .map_or_else(|| "invalid JSON".into(), |e| e.to_string());
         (
             json!({}),
             Some(format!("malformed tool JSON ({err}): {trimmed}")),

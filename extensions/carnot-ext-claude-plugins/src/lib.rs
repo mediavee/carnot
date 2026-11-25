@@ -631,7 +631,7 @@ impl ClaudePluginsModule {
 }
 
 impl Module for ClaudePluginsModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "claude_plugins"
     }
 
@@ -783,7 +783,7 @@ mod tests {
                 assert!(!s.command.contains("${CLAUDE_PLUGIN_ROOT}"));
                 assert_eq!(s.args[1], ws.to_string_lossy());
             }
-            other => panic!("expected stdio mcp config, got {other:?}"),
+            McpServerConfig::Http(other) => panic!("expected stdio mcp config, got {other:?}"),
         }
 
         // Turn-1 catalog lists skill + command + agent (0 static tokens!)

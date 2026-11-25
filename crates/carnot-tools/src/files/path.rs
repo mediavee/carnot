@@ -65,8 +65,7 @@ fn resolve_with_symlinks(candidate: &Path, depth: usize) -> std::result::Result<
         canon
     } else if existing
         .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+        .is_ok_and(|m| m.file_type().is_symlink())
     {
         let link_target = fs::read_link(existing)
             .map_err(|e| format!("cannot read symlink `{}`: {e}", existing.display()))?;

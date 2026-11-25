@@ -15,7 +15,7 @@ use carnot_core::{
     CacheTtl, CarnotError, ContentBlock, ContentOrigin, Message, ProviderWebCapabilities,
     ReasoningEffort, Result, Role, StopReason, ToolResultBlock, Usage,
 };
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -75,14 +75,17 @@ impl AnthropicProvider {
         Self::with_base_url(api_key, base_url)
     }
 
-    pub fn with_base_url(api_key: String, base_url: String) -> Self {
+    pub fn with_base_url(api_key: String, mut base_url: String) -> Self {
+        while base_url.ends_with('/') {
+            base_url.pop();
+        }
         let catalog = ProviderCatalog::embedded().unwrap_or_default();
         let mut headers = BTreeMap::new();
         headers.insert("anthropic-version".into(), "2023-06-01".into());
         let spec = ResolvedProviderSpec {
             provider_id: "anthropic".into(),
             api: API_ID.into(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             fallback_base_urls: Vec::new(),
             project_id: None,
             auth: ResolvedAuth::Header {
@@ -95,8 +98,8 @@ impl AnthropicProvider {
             betas: Vec::new(),
             cache_diagnosis_beta: Some("cache-diagnosis-2026-04-07".into()),
             native_tool_search: true,
-            compat: Default::default(),
-            usage_map: Default::default(),
+            compat: crate::catalog::CompatFlags::default(),
+            usage_map: crate::catalog::UsageMap::default(),
             body_patch: None,
             subprocess: None,
             catalog_models: catalog.models,
@@ -107,8 +110,7 @@ impl AnthropicProvider {
     pub fn from_spec(spec: ResolvedProviderSpec) -> Self {
         let client = crate::build_http_client_for_url(&spec.base_url);
         let cache_diagnosis = std::env::var("CARNOT_CACHE_DIAGNOSIS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         Self {
             client,
             spec,
@@ -117,6 +119,7 @@ impl AnthropicProvider {
         }
     }
 
+    #[must_use]
     pub fn with_cache_diagnosis(mut self, enabled: bool) -> Self {
         self.cache_diagnosis = enabled;
         self
@@ -293,15 +296,11 @@ impl AnthropicProvider {
             }
 
             if msg.role == Role::System {
-                let prev_is_user = wire_messages
-                    .last()
-                    .map(|(r, _, _)| r == "user")
-                    .unwrap_or(false);
+                let prev_is_user = wire_messages.last().is_some_and(|(r, _, _)| r == "user");
                 let next_ok = req
                     .messages
                     .get(idx + 1)
-                    .map(|m| m.role == Role::Assistant)
-                    .unwrap_or(true);
+                    .is_none_or(|m| m.role == Role::Assistant);
                 if allow_sys_role && prev_is_user && next_ok && !wire_messages.is_empty() {
                     wire_messages.push(("system".into(), blocks, is_cp));
                 } else if let Some((r, prev_blocks, prev_cp)) = wire_messages.last_mut() {
@@ -712,24 +711,21 @@ impl Provider for AnthropicProvider {
 
                 loop {
                     let next_chunk = tokio::select! {
-                        _ = cancel.cancelled() => {
+                        () = cancel.cancelled() => {
                             let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
                             return;
                         }
                         res = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => res,
                     };
 
-                    let chunk_opt = match next_chunk {
-                        Ok(opt) => opt,
-                        Err(_) => {
-                            let _ = tx
-                                .send(StreamEvent::Error {
-                                    message: "stream idle timeout (300s)".into(),
-                                    retryable: true,
-                                })
-                                .await;
-                            return;
-                        }
+                    let Ok(chunk_opt) = next_chunk else {
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: "stream idle timeout (300s)".into(),
+                                retryable: true,
+                            })
+                            .await;
+                        return;
                     };
 
                     let Some(chunk) = chunk_opt else { break };
@@ -804,7 +800,7 @@ impl Provider for AnthropicProvider {
                 let content: Vec<ContentBlock> = state
                     .blocks
                     .into_values()
-                    .filter_map(|b| b.finish(&origin))
+                    .map(|b| b.finish(&origin))
                     .collect();
                 let _ = tx
                     .send(StreamEvent::Done {
@@ -851,14 +847,14 @@ enum BlockBuilder {
 }
 
 impl BlockBuilder {
-    fn finish(self, origin: &ContentOrigin) -> Option<ContentBlock> {
+    fn finish(self, origin: &ContentOrigin) -> ContentBlock {
         match self {
-            Self::Text(text) => Some(ContentBlock::Text { text }),
-            Self::Thinking { text, sig } => Some(ContentBlock::Thinking {
+            Self::Text(text) => ContentBlock::Text { text },
+            Self::Thinking { text, sig } => ContentBlock::Thinking {
                 thinking: text,
                 signature: sig,
                 origin: Some(origin.clone()),
-            }),
+            },
             Self::ToolUse { id, name, json_buf } => {
                 let trimmed = json_buf.trim();
                 let (input, invalid_json) = if trimmed.is_empty() {
@@ -868,21 +864,20 @@ impl BlockBuilder {
                 } else {
                     let err = serde_json::from_str::<Value>(trimmed)
                         .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "invalid JSON".into());
+                        .map_or_else(|| "invalid JSON".into(), |e| e.to_string());
                     (
                         json!({}),
                         Some(format!("malformed tool JSON ({err}): {trimmed}")),
                     )
                 };
-                Some(ContentBlock::ToolUse {
+                ContentBlock::ToolUse {
                     id,
                     name,
                     input,
                     invalid_json,
                     provider_meta: None,
                     origin: Some(origin.clone()),
-                })
+                }
             }
             Self::Opaque { mut raw, json_buf } => {
                 let trimmed = json_buf.trim();
@@ -892,10 +887,10 @@ impl BlockBuilder {
                 {
                     obj.insert("input".into(), parsed);
                 }
-                Some(ContentBlock::Opaque {
+                ContentBlock::Opaque {
                     raw,
                     origin: Some(origin.clone()),
-                })
+                }
             }
         }
     }
@@ -1049,8 +1044,11 @@ async fn handle_sse_frame(
                             sig.get_or_insert_with(String::new).push_str(s);
                         }
                     }
-                    (BlockBuilder::ToolUse { json_buf, .. }, Some("input_json_delta"))
-                    | (BlockBuilder::Opaque { json_buf, .. }, Some("input_json_delta")) => {
+                    (
+                        BlockBuilder::ToolUse { json_buf, .. }
+                        | BlockBuilder::Opaque { json_buf, .. },
+                        Some("input_json_delta"),
+                    ) => {
                         if let Some(p) = delta.get("partial_json").and_then(Value::as_str) {
                             json_buf.push_str(p);
                         }
@@ -1070,8 +1068,7 @@ async fn handle_sse_frame(
                 } else {
                     let err = serde_json::from_str::<Value>(trimmed)
                         .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "invalid JSON".into());
+                        .map_or_else(|| "invalid JSON".into(), |e| e.to_string());
                     (
                         json!({}),
                         Some(format!("malformed tool JSON ({err}): {trimmed}")),
@@ -1141,7 +1138,7 @@ mod tests {
             effort: ReasoningEffort::High,
             max_output_tokens: 32_768,
             skip_tail_cache_write: false,
-            native_web: Default::default(),
+            native_web: carnot_core::NativeWebConfig::default(),
             ephemeral_tail_notes: Vec::new(),
         };
         let body = p.build_body(&req);
@@ -1189,7 +1186,7 @@ mod tests {
             effort: ReasoningEffort::High,
             max_output_tokens: 32_768,
             skip_tail_cache_write: false,
-            native_web: Default::default(),
+            native_web: carnot_core::NativeWebConfig::default(),
             ephemeral_tail_notes: Vec::new(),
         };
         let body = p.build_body(&req);
@@ -1240,7 +1237,7 @@ mod tests {
             effort: ReasoningEffort::Low,
             max_output_tokens: 64_000,
             skip_tail_cache_write: true,
-            native_web: Default::default(),
+            native_web: carnot_core::NativeWebConfig::default(),
             ephemeral_tail_notes: Vec::new(),
         };
         let body = p.build_body(&req);
@@ -1262,7 +1259,7 @@ mod tests {
     fn exhaustive_cache_control_invariants_never_violate_anthropic_rules() {
         let p = AnthropicProvider::new("test-key".into());
         let tool_sets: Vec<(Vec<ToolSpec>, carnot_core::NativeWebConfig)> = vec![
-            (vec![], Default::default()),
+            (vec![], carnot_core::NativeWebConfig::default()),
             (
                 vec![
                     ToolSpec {
@@ -1480,7 +1477,7 @@ mod tests {
             effort: ReasoningEffort::High,
             max_output_tokens: 4096,
             skip_tail_cache_write: false,
-            native_web: Default::default(),
+            native_web: carnot_core::NativeWebConfig::default(),
             ephemeral_tail_notes: vec!["[ephemeral] unattended turn".into()],
         };
         let b1 = p.build_body(&req_t1);

@@ -3,7 +3,7 @@
 //! Supports three cleanly separated modes:
 //!   - **`WebMode::Auto` (default):** negotiates with the active provider's `ProviderWebCapabilities`
 //!     (`providers.json`). Uses zero-key native server tools (`web_search` / `web_fetch` on Anthropic,
-//!     `web_search` on OpenAI Responses, `googleSearch` / `urlContext` on Gemini 3) whenever supported,
+//!     `web_search` on `OpenAI` Responses, `googleSearch` / `urlContext` on Gemini 3) whenever supported,
 //!     and seamlessly falls back to local SSRF-hardened `WebFetch` and API-backed `WebSearch` for any
 //!     capability not supported natively — with zero duplicate tools!
 //!   - **`WebMode::Native`:** requires provider-native server tools (fails fast if unsupported).
@@ -23,7 +23,7 @@ use carnot_core::{
 use carnot_ext::Module;
 use carnot_mcp::ssrf::{build_ssrf_safe_client, validate_public_url};
 use carnot_tools::{BoxFuture, Tool};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt;
@@ -251,7 +251,7 @@ impl WebModule {
 }
 
 impl Module for WebModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "web"
     }
 
@@ -346,7 +346,7 @@ impl Tool for WebFetchTool {
                     "url": { "type": "string", "description": "Public http:// or https:// URL" },
                     "format": { "type": "string", "enum": ["markdown", "text", "raw"], "description": "Output format (default: markdown)" },
                     "raw": { "type": "boolean", "description": "Shorthand for format='raw'" },
-                    "max_chars": { "type": "integer", "minimum": 256, "maximum": 100000, "description": "Optional character cap on returned text" }
+                    "max_chars": { "type": "integer", "minimum": 256, "maximum": 100_000, "description": "Optional character cap on returned text" }
                 }
             }),
             defer_loading: true,
@@ -482,7 +482,7 @@ impl Tool for WebFetchTool {
             };
 
             let (final_url, content_type, mut body, truncated_cap) = tokio::select! {
-                _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                () = cancel.cancelled() => return Err(CarnotError::Cancelled),
                 res = fetch_fut => match res {
                     Ok(v) => v,
                     Err(msg) => return Ok(ToolOutput::err_text(msg)),

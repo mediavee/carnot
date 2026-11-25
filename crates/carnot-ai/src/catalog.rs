@@ -126,7 +126,7 @@ impl ProviderEntry {
         for rule in &self.model_routes {
             for prefix in &rule.prefixes {
                 if is_route_prefix_match(model, prefix)
-                    && best.map(|(len, _)| prefix.len() > len).unwrap_or(true)
+                    && best.is_none_or(|(len, _)| prefix.len() > len)
                 {
                     best = Some((prefix.len(), rule));
                 }
@@ -218,12 +218,13 @@ impl std::fmt::Debug for ResolvedAuth {
 }
 
 fn percent_encode_component(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
@@ -316,10 +317,10 @@ pub struct CompatFlags {
     pub requires_reasoning_content_on_assistant_messages: Option<bool>,
     #[serde(default)]
     pub supports_prompt_cache_key: Option<bool>,
-    /// OpenAI 24-hour prompt cache retention (`"prompt_cache_retention": "24h"`).
+    /// `OpenAI` 24-hour prompt cache retention (`"prompt_cache_retention": "24h"`).
     #[serde(default)]
     pub supports_prompt_cache_retention: Option<bool>,
-    /// OpenAI / Responses `xhigh` reasoning effort support.
+    /// `OpenAI` / Responses `xhigh` reasoning effort support.
     #[serde(default)]
     pub supports_xhigh_reasoning: Option<bool>,
     /// Anthropic `eager_input_streaming: true` on `Edit`/`Write` (default true on official Anthropic).
@@ -350,11 +351,11 @@ pub struct CompatFlags {
     #[serde(default)]
     pub system_preamble: Option<String>,
     /// Provider + model natively supports server-side web search (Anthropic `web_search`,
-    /// OpenAI Responses `web_search`, Gemini `googleSearch`).
+    /// `OpenAI` Responses `web_search`, Gemini `googleSearch`).
     #[serde(default)]
     pub supports_native_web_search: Option<bool>,
     /// Provider + model natively supports server-side URL fetch (Anthropic `web_fetch`,
-    /// OpenAI Responses `web_search`, Gemini `urlContext`).
+    /// `OpenAI` Responses `web_search`, Gemini `urlContext`).
     #[serde(default)]
     pub supports_native_web_fetch: Option<bool>,
     /// Optional server-side web search tool type override (Anthropic default: `web_search_20250305`).
@@ -367,7 +368,7 @@ pub struct CompatFlags {
     #[serde(default)]
     pub native_web_fetch_beta: Option<String>,
     /// OpenAI-compatible gateway supports Anthropic/Gemini `cache_control` breakpoints inside
-    /// content-part arrays (e.g., OpenRouter routing to `anthropic/*` or `google/gemini*`).
+    /// content-part arrays (e.g., `OpenRouter` routing to `anthropic/*` or `google/gemini*`).
     #[serde(default)]
     pub supports_cache_control: Option<bool>,
     /// Optional model-ID prefixes restricting when `supports_cache_control` is emitted (when empty/unset,
@@ -388,6 +389,7 @@ pub struct CompatFlags {
 }
 
 impl CompatFlags {
+    #[must_use]
     pub fn merge_override(&self, ov: &CompatFlags) -> Self {
         Self {
             max_tokens_field: ov
@@ -505,9 +507,17 @@ fn default_input_ptr() -> String {
 fn default_output_ptr() -> String {
     "/completion_tokens".into()
 }
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default attribute requires fn() -> Option<String>"
+)]
 fn default_cache_read_ptr() -> Option<String> {
     Some("/prompt_tokens_details/cached_tokens".into())
 }
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default attribute requires fn() -> Option<String>"
+)]
 fn default_reasoning_ptr() -> Option<String> {
     Some("/completion_tokens_details/reasoning_tokens".into())
 }
@@ -595,13 +605,12 @@ fn is_model_prefix_match(model: &str, prefix: &str) -> bool {
     if !model.starts_with(prefix) {
         return false;
     }
-    match model.as_bytes().get(prefix.len()) {
-        None => true,
-        // Require a real delimiter so e.g. `gpt-5.4` matches `gpt-5.4-20260901` and
-        // `opencode-go` matches `opencode-go/deepseek-v4.1-flash`.
-        Some(b'-' | b'.' | b':' | b'@' | b'/') => true,
-        Some(_) => false,
-    }
+    // Require end-of-string or a real delimiter so e.g. `gpt-5.4` matches `gpt-5.4-20260901`
+    // and `opencode-go` matches `opencode-go/deepseek-v4.1-flash`.
+    matches!(
+        model.as_bytes().get(prefix.len()),
+        None | Some(b'-' | b'.' | b':' | b'@' | b'/')
+    )
 }
 
 fn is_route_prefix_match(model: &str, prefix: &str) -> bool {
@@ -617,11 +626,10 @@ fn is_route_prefix_match(model: &str, prefix: &str) -> bool {
     if matches!(prefix.as_bytes().last(), Some(b'-' | b'/' | b'.' | b':')) {
         return true;
     }
-    match model.as_bytes().get(prefix.len()) {
-        None => true,
-        Some(b'-' | b'.' | b':' | b'@' | b'/' | b'_') => true,
-        Some(_) => false,
-    }
+    matches!(
+        model.as_bytes().get(prefix.len()),
+        None | Some(b'-' | b'.' | b':' | b'@' | b'/' | b'_')
+    )
 }
 
 impl ResolvedProviderSpec {
@@ -693,13 +701,12 @@ pub struct ProviderSummary {
 impl ProviderCatalog {
     /// Loads the embedded default data catalog (`catalog/providers.json`), parsed once per process.
     pub fn embedded() -> Result<Self> {
-        static EMBEDDED: std::sync::OnceLock<std::result::Result<ProviderCatalog, String>> =
-            std::sync::OnceLock::new();
-        let res = EMBEDDED.get_or_init(|| {
-            serde_json::from_str(EMBEDDED_PROVIDERS_JSON)
-                .map_err(|e| format!("failed to parse embedded providers.json: {e}"))
-        });
-        match res {
+        static EMBEDDED: std::sync::LazyLock<std::result::Result<ProviderCatalog, String>> =
+            std::sync::LazyLock::new(|| {
+                serde_json::from_str(EMBEDDED_PROVIDERS_JSON)
+                    .map_err(|e| format!("failed to parse embedded providers.json: {e}"))
+            });
+        match &*EMBEDDED {
             Ok(cat) => Ok(cat.clone()),
             Err(msg) => Err(CarnotError::Provider {
                 provider: "catalog".into(),
@@ -750,28 +757,28 @@ impl ProviderCatalog {
                 && base.api == v.api
             {
                 if v.aliases.is_empty() {
-                    v.aliases = base.aliases.clone();
+                    v.aliases.clone_from(&base.aliases);
                 }
                 if v.description.is_empty() {
-                    v.description = base.description.clone();
+                    v.description.clone_from(&base.description);
                 }
                 if v.base_url.is_empty() {
-                    v.base_url = base.base_url.clone();
+                    v.base_url.clone_from(&base.base_url);
                 }
                 if v.fallback_base_urls.is_empty() {
-                    v.fallback_base_urls = base.fallback_base_urls.clone();
+                    v.fallback_base_urls.clone_from(&base.fallback_base_urls);
                 }
                 if v.base_url_envs.is_empty() {
-                    v.base_url_envs = base.base_url_envs.clone();
+                    v.base_url_envs.clone_from(&base.base_url_envs);
                 }
                 if v.project_env.is_none() {
-                    v.project_env = base.project_env.clone();
+                    v.project_env.clone_from(&base.project_env);
                 }
                 if v.default_model.is_none() {
-                    v.default_model = base.default_model.clone();
+                    v.default_model.clone_from(&base.default_model);
                 }
                 if v.auth_chain.is_empty() {
-                    v.auth_chain = base.auth_chain.clone();
+                    v.auth_chain.clone_from(&base.auth_chain);
                 }
                 if !base.headers.is_empty() {
                     let mut merged_headers = base.headers.clone();
@@ -784,24 +791,25 @@ impl ProviderCatalog {
                     v.query_params = merged_qp;
                 }
                 if v.betas.is_empty() {
-                    v.betas = base.betas.clone();
+                    v.betas.clone_from(&base.betas);
                 }
                 if v.cache_diagnosis_beta.is_none() {
-                    v.cache_diagnosis_beta = base.cache_diagnosis_beta.clone();
+                    v.cache_diagnosis_beta
+                        .clone_from(&base.cache_diagnosis_beta);
                 }
                 v.native_tool_search = v.native_tool_search.or(base.native_tool_search);
                 v.compat = base.compat.merge_override(&v.compat);
                 if v.body_patch.is_none() {
-                    v.body_patch = base.body_patch.clone();
+                    v.body_patch.clone_from(&base.body_patch);
                 }
                 if v.subprocess.is_none() {
-                    v.subprocess = base.subprocess.clone();
+                    v.subprocess.clone_from(&base.subprocess);
                 }
                 if v.oauth.is_none() {
-                    v.oauth = base.oauth.clone();
+                    v.oauth.clone_from(&base.oauth);
                 }
                 if v.model_routes.is_empty() && v.base_url == base.base_url {
-                    v.model_routes = base.model_routes.clone();
+                    v.model_routes.clone_from(&base.model_routes);
                 }
             }
             self.providers.insert(k, v);
@@ -832,7 +840,7 @@ impl ProviderCatalog {
                     v.effort_map = base.effort_map.clone();
                 }
                 if v.body_patch.is_none() {
-                    v.body_patch = base.body_patch.clone();
+                    v.body_patch.clone_from(&base.body_patch);
                 }
             }
             self.models.insert(k, v);
@@ -910,7 +918,7 @@ impl ProviderCatalog {
         Some(entry.api.clone())
     }
 
-    /// Resolves base_url, auth credentials, project_id, model routes, and model overrides for a provider.
+    /// Resolves `base_url`, auth credentials, `project_id`, model routes, and model overrides for a provider.
     pub fn resolve_spec(
         &self,
         name_or_alias: &str,
@@ -961,8 +969,7 @@ impl ProviderCatalog {
 
         let auth_chain = route
             .filter(|r| !r.auth_chain.is_empty())
-            .map(|r| r.auth_chain.as_slice())
-            .unwrap_or(entry.auth_chain.as_slice());
+            .map_or(entry.auth_chain.as_slice(), |r| r.auth_chain.as_slice());
         let auth = resolve_auth_chain(canonical_id, auth_chain, entry.oauth.as_ref())?;
 
         // Model-level API override > provider model_route API > provider default API
@@ -1107,9 +1114,7 @@ fn probe_auth_chain(
             continue;
         }
         if let Some(ref env_name) = entry.env
-            && std::env::var(env_name)
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
+            && std::env::var(env_name).is_ok_and(|v| !v.trim().is_empty())
         {
             return Some(format!("env:{env_name}"));
         }

@@ -86,7 +86,7 @@ struct Cli {
     #[arg(short = 'p', long)]
     prompt: Option<String>,
 
-    /// Read prompt from a file path (avoids exposing prompt text in /proc/<pid>/cmdline or ARG_MAX limits)
+    /// Read prompt from a file path (avoids exposing prompt text in /proc/<pid>/cmdline or `ARG_MAX` limits)
     #[arg(long = "prompt-file")]
     prompt_file: Option<PathBuf>,
 
@@ -110,7 +110,7 @@ struct Cli {
     #[arg(long)]
     provider: Option<String>,
 
-    /// Model identifier (defaults to the selected provider's catalog default_model)
+    /// Model identifier (defaults to the selected provider's catalog `default_model`)
     #[arg(short = 'm', long)]
     model: Option<String>,
 
@@ -154,7 +154,7 @@ struct Cli {
     #[arg(long = "skills-dir")]
     skills_dirs: Vec<PathBuf>,
 
-    /// Explicitly trust workspace-local `.mcp.json` (disabled by default to prevent MCPoison RCE)
+    /// Explicitly trust workspace-local `.mcp.json` (disabled by default to prevent `MCPoison` RCE)
     #[arg(long)]
     trust_workspace_mcp: bool,
 
@@ -279,7 +279,7 @@ struct Cli {
     #[arg(long = "system-prompt")]
     system_prompt: Option<String>,
 
-    /// Read static system prompt override from a file path (avoids ARG_MAX limits)
+    /// Read static system prompt override from a file path (avoids `ARG_MAX` limits)
     #[arg(long = "system-prompt-file")]
     system_prompt_file: Option<PathBuf>,
 
@@ -351,7 +351,7 @@ enum Commands {
         #[command(subcommand)]
         action: McpCommands,
     },
-    /// Authenticate with OAuth 2.0 providers (PKCE, Device Code, OpenRouter PKCE) & manage `~/.carnot/auth.json`
+    /// Authenticate with OAuth 2.0 providers (PKCE, Device Code, `OpenRouter` PKCE) & manage `~/.carnot/auth.json`
     Auth {
         #[command(subcommand)]
         action: AuthCommands,
@@ -368,7 +368,7 @@ enum McpCommands {
 
 #[derive(Debug, Clone, Subcommand)]
 enum AuthCommands {
-    /// Log in to a provider via OAuth 2.0 (PKCE, Device Code, or OpenRouter PKCE) or store a token securely (`0600`)
+    /// Log in to a provider via OAuth 2.0 (PKCE, Device Code, or `OpenRouter` PKCE) or store a token securely (`0600`)
     Login {
         /// Provider name or alias from providers.json (e.g. `openrouter`, `gemini`, `anthropic`, `openai`)
         provider: String,
@@ -393,7 +393,7 @@ enum AuthCommands {
     },
     /// Show secret-safe authentication & OAuth token status across all configured providers
     Status,
-    /// Force-refresh a stored OAuth token immediately using its refresh_token
+    /// Force-refresh a stored OAuth token immediately using its `refresh_token`
     Refresh {
         /// Provider name or alias from providers.json
         provider: String,
@@ -493,16 +493,14 @@ fn main() {
                 match ProviderRegistry::load_default(&cli.provider_configs) {
                     Ok(reg) => {
                         if let Some(reference) = resolve {
-                            match resolve_model_spec_in_registry(&reg, reference, None) {
-                                Some((prov, model)) => {
-                                    println!("{prov}/{model}");
-                                    return;
-                                }
-                                None => {
-                                    eprintln!("models error: could not resolve `{reference}`");
-                                    std::process::exit(1);
-                                }
+                            if let Some((prov, model)) =
+                                resolve_model_spec_in_registry(&reg, reference, None)
+                            {
+                                println!("{prov}/{model}");
+                                return;
                             }
+                            eprintln!("models error: could not resolve `{reference}`");
+                            std::process::exit(1);
                         }
                         let models = list_rpc_models(&reg, *all);
                         if *json {
@@ -517,8 +515,7 @@ fn main() {
                             for m in models {
                                 let ctx = m
                                     .context_window
-                                    .map(|c| format!("{}k", c / 1000))
-                                    .unwrap_or_else(|| "-".into());
+                                    .map_or_else(|| "-".into(), |c| format!("{}k", c / 1000));
                                 println!("{:<20} {:<38} {:>10}", m.provider, m.id, ctx);
                             }
                         }
@@ -562,7 +559,7 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
     if let Some(ref cmd) = cli.command {
         match cmd {
             Commands::Doctor => {
-                return run_doctor(&cli, &cwd).await;
+                return run_doctor(&cli, &cwd);
             }
             Commands::Mcp { action } => {
                 if let Err(e) = run_mcp_cmd(&cli, &cwd, action).await {
@@ -666,7 +663,9 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 cli: cli.clone(),
                 session_mcps: tokio::sync::Mutex::new(Vec::new()),
             });
-            let rc = match serve_acp_stdio_with_host(agent, host.clone()).await {
+            let rc = match serve_acp_stdio_with_host(agent, Arc::clone(&host) as Arc<dyn AcpHost>)
+                .await
+            {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("acp error: {e}");
@@ -706,7 +705,9 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                     let reg_opt = ProviderRegistry::load_default(&cli.provider_configs).ok();
                     let default_provider = cli.resolved_provider(reg_opt.as_ref());
                     #[cfg(feature = "tui")]
-                    let rc = if !want_plain {
+                    let rc = if want_plain {
+                        repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
+                    } else {
                         tui::run_tui(
                             agent,
                             tui::TuiLaunchInfo {
@@ -716,8 +717,6 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                             },
                         )
                         .await
-                    } else {
-                        repl::run_repl(agent, default_provider, cli.provider_configs.clone()).await
                     };
                     #[cfg(not(feature = "tui"))]
                     let rc = {
@@ -799,15 +798,16 @@ async fn async_main(cli: Cli, cwd: PathBuf) -> i32 {
                 }
             };
             let run_res = if let Some(secs) = cli.timeout_secs {
-                match tokio::time::timeout(Duration::from_secs(secs.max(1)), run_fut).await {
-                    Ok(res) => res,
-                    Err(_) => {
-                        agent.abort().await;
-                        Err(carnot::CarnotError::Tool {
-                            tool: "cli".into(),
-                            message: format!("session timed out after {secs}s"),
-                        })
-                    }
+                if let Ok(res) =
+                    tokio::time::timeout(Duration::from_secs(secs.max(1)), run_fut).await
+                {
+                    res
+                } else {
+                    agent.abort().await;
+                    Err(carnot::CarnotError::Tool {
+                        tool: "cli".into(),
+                        message: format!("session timed out after {secs}s"),
+                    })
                 }
             } else {
                 run_fut.await
@@ -855,7 +855,7 @@ async fn wait_termination_signal() -> i32 {
         let mut sigterm = signal(SignalKind::terminate()).ok();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => 130,
-            _ = async {
+            () = async {
                 if let Some(ref mut s) = sigterm {
                     s.recv().await;
                 } else {
@@ -941,10 +941,10 @@ impl Cli {
     /// Merges `~/.carnot/config.toml` defaults into `Cli` without overriding explicit CLI flags.
     fn apply_user_config(&mut self, cfg: &config::UserConfig) -> Result<(), String> {
         if self.provider.is_none() {
-            self.provider = cfg.provider.clone();
+            self.provider.clone_from(&cfg.provider);
         }
         if self.model.is_none() {
-            self.model = cfg.model.clone();
+            self.model.clone_from(&cfg.model);
         }
         if self.effort.is_none()
             && let Some(ref e) = cfg.effort
@@ -983,7 +983,7 @@ impl Cli {
             self.no_session = true;
         }
         if self.session_dir.is_none() {
-            self.session_dir = cfg.session_dir.clone();
+            self.session_dir.clone_from(&cfg.session_dir);
         }
         if self.max_turns.is_none() {
             self.max_turns = cfg.max_turns;
@@ -1000,7 +1000,7 @@ impl Cli {
         if self.exclude_tools.is_empty()
             && let Some(ref tools) = cfg.exclude_tools
         {
-            self.exclude_tools = tools.clone();
+            self.exclude_tools.clone_from(tools);
         }
         if !self.no_mcp && cfg.extensions.mcp == Some(false) {
             self.no_mcp = true;
@@ -1031,7 +1031,7 @@ impl Cli {
                 _ => {}
             }
             if self.memory_dir.is_none() {
-                self.memory_dir = cfg.extensions.memory_dir.clone();
+                self.memory_dir.clone_from(&cfg.extensions.memory_dir);
             }
         }
         Ok(())
@@ -1072,24 +1072,24 @@ impl Cli {
     /// Resolves `--provider`, or auto-selects the first configured cloud provider before falling
     /// back to `"anthropic"`.
     fn resolved_provider(&self, reg: Option<&ProviderRegistry>) -> String {
+        const PREFERRED: &[&str] = &[
+            "anthropic",
+            "openai",
+            "openai-responses",
+            "gemini",
+            "grok",
+            "muse",
+            "mistral",
+            "opencode",
+            "opencode-go",
+            "openrouter",
+            "deepseek",
+        ];
         if let Some(ref explicit) = self.provider {
             return explicit.clone();
         }
         if let Some(r) = reg {
             let summaries = r.summaries();
-            const PREFERRED: &[&str] = &[
-                "anthropic",
-                "openai",
-                "openai-responses",
-                "gemini",
-                "grok",
-                "muse",
-                "mistral",
-                "opencode",
-                "opencode-go",
-                "openrouter",
-                "deepseek",
-            ];
             for pref in PREFERRED {
                 if summaries.iter().any(|s| s.id == *pref && s.configured) {
                     return (*pref).to_string();
@@ -1107,7 +1107,7 @@ impl Cli {
     }
 }
 
-async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
+fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
     let prefix = assert_prefix_invariance(|_date, _cwd, _sid| {
         (static_system_prompt().to_string(), canonical_tool_specs())
     });
@@ -1118,8 +1118,7 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
             let canonical_id = r
                 .catalog()
                 .find_provider(&target_prov)
-                .map(|(id, _)| id.to_string())
-                .unwrap_or_else(|| target_prov.clone());
+                .map_or_else(|| target_prov.clone(), |(id, _)| id.to_string());
             let summary = r
                 .summaries()
                 .into_iter()
@@ -1197,7 +1196,7 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
         "arch": std::env::consts::ARCH,
         "workspace": cwd,
         "config_file": active_config,
-        "prefix_invariance": prefix.as_ref().map(|h| json!({"pass": true, "blake3": h})).unwrap_or_else(|e| json!({"pass": false, "error": e.to_string()})),
+        "prefix_invariance": prefix.as_ref().map_or_else(|e| json!({"pass": false, "error": e.to_string()}), |h| json!({"pass": true, "blake3": h})),
         "provider": provider_status,
         "model": selected_model,
         "context_window": context_window,
@@ -1210,7 +1209,7 @@ async fn run_doctor(cli: &Cli, cwd: &std::path::Path) -> i32 {
         "skills": { "count": skills_names.len(), "names": skills_names },
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-    if prefix.is_ok() { 0 } else { 1 }
+    i32::from(prefix.is_err())
 }
 
 async fn run_mcp_cmd(cli: &Cli, cwd: &std::path::Path, action: &McpCommands) -> carnot::Result<()> {
@@ -1273,10 +1272,10 @@ impl AcpHost for CliAcpHost {
                 let desc = cat
                     .find_provider(&m.provider)
                     .map(|(_, e)| {
-                        if !e.description.is_empty() {
-                            e.description.clone()
-                        } else {
+                        if e.description.is_empty() {
                             m.provider.clone()
+                        } else {
+                            e.description.clone()
                         }
                     })
                     .or(Some(m.provider));
@@ -1397,8 +1396,7 @@ pub(crate) fn resolve_model_spec_in_registry(
     let (wanted_prov, raw_model) = if let Some(ov) = provider_override {
         let canon = cat
             .find_provider(ov)
-            .map(|(id, _)| id.to_string())
-            .unwrap_or_else(|| ov.to_string());
+            .map_or_else(|| ov.to_string(), |(id, _)| id.to_string());
         (Some(canon), trimmed)
     } else if let Some((lhs, rhs)) = trimmed.split_once('/')
         && let Some((canon, _)) = cat.find_provider(lhs)
@@ -1440,8 +1438,7 @@ pub(crate) fn resolve_model_spec_in_registry(
         if let Some(ver) = family_version_tuple(&m.id, raw_model) {
             let better = best
                 .as_ref()
-                .map(|(bcfg, bv, _, _)| (m.configured, &ver) > (*bcfg, bv))
-                .unwrap_or(true);
+                .is_none_or(|(bcfg, bv, _, _)| (m.configured, &ver) > (*bcfg, bv));
             if better {
                 best = Some((m.configured, ver, m.provider.clone(), m.id.clone()));
             }
@@ -1608,14 +1605,12 @@ async fn build_agent_full(
     }
     #[cfg(feature = "ext-hooks")]
     {
-        let user_hooks_exists = std::env::var_os("HOME")
-            .map(|h| {
-                PathBuf::from(h)
-                    .join(".carnot")
-                    .join("hooks.json")
-                    .is_file()
-            })
-            .unwrap_or(false);
+        let user_hooks_exists = std::env::var_os("HOME").is_some_and(|h| {
+            PathBuf::from(h)
+                .join(".carnot")
+                .join("hooks.json")
+                .is_file()
+        });
         if !cli.hooks_files.is_empty()
             || cli.claude_hooks
             || cli.trust_workspace_hooks
@@ -1642,7 +1637,7 @@ async fn build_agent_full(
     if cli.memory_enabled() {
         let mut mc = carnot::MemoryConfig::default();
         if let Some(ref dir) = cli.memory_dir {
-            mc.root_dir = dir.clone();
+            mc.root_dir.clone_from(dir);
         }
         b = b.memory_config(mc);
     }
@@ -1674,9 +1669,10 @@ async fn build_agent_full(
     }
     let default_sdir = || {
         cli.session_dir.clone().unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".carnot").join("sessions"))
-                .unwrap_or_else(|| cwd.join(".carnot").join("sessions"))
+            std::env::var_os("HOME").map_or_else(
+                || cwd.join(".carnot").join("sessions"),
+                |h| PathBuf::from(h).join(".carnot").join("sessions"),
+            )
         })
     };
     if let Some(ref res) = cli.resume {
@@ -1685,7 +1681,10 @@ async fn build_agent_full(
             p
         } else {
             let sdir = default_sdir();
-            if res.ends_with(".jsonl") {
+            if std::path::Path::new(res)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+            {
                 sdir.join(res)
             } else {
                 sdir.join(format!("{res}.jsonl"))
@@ -1735,9 +1734,7 @@ async fn run_auth_cmd(cli: &Cli, action: &AuthCommands) -> i32 {
             for s in summaries {
                 let entry_opt = catalog.find_provider(&s.id).map(|(_, e)| e);
                 let entry_oauth = entry_opt.and_then(|e| e.oauth.as_ref());
-                let profile = entry_opt
-                    .map(|e| e.oauth_profile(&s.id))
-                    .unwrap_or(s.id.as_str());
+                let profile = entry_opt.map_or(s.id.as_str(), |e| e.oauth_profile(&s.id));
                 let tok = stored.get(profile);
                 rows.push(json!({
                     "provider": s.id,
@@ -1747,8 +1744,8 @@ async fn run_auth_cmd(cli: &Cli, action: &AuthCommands) -> i32 {
                     "auth_source": s.auth_source,
                     "oauth_flow": entry_oauth.map(|o| format!("{:?}", o.flow).to_lowercase()),
                     "oauth_stored": tok.is_some(),
-                    "oauth_expired": tok.map(|t| t.is_expired()),
-                    "oauth_expires_in_secs": tok.and_then(|t| t.seconds_until_expiry()),
+                    "oauth_expired": tok.map(carnot::OAuthStoredToken::is_expired),
+                    "oauth_expires_in_secs": tok.and_then(carnot::OAuthStoredToken::seconds_until_expiry),
                     "oauth_refreshable": tok.map(|t| t.can_refresh(entry_oauth)),
                 }));
             }
@@ -1768,12 +1765,11 @@ async fn run_auth_cmd(cli: &Cli, action: &AuthCommands) -> i32 {
             client_id,
             token_stdin,
         } => {
-            let (canonical_id, entry) = match catalog.find_provider(provider) {
-                Some((id, e)) => (id.to_string(), e.clone()),
-                None => {
-                    eprintln!("auth error: unknown provider `{provider}` (run `carnot providers`)");
-                    return 1;
-                }
+            let (canonical_id, entry) = if let Some((id, e)) = catalog.find_provider(provider) {
+                (id.to_string(), e.clone())
+            } else {
+                eprintln!("auth error: unknown provider `{provider}` (run `carnot providers`)");
+                return 1;
             };
             let profile = entry.oauth_profile(&canonical_id).to_string();
 
@@ -1890,12 +1886,11 @@ async fn run_auth_cmd(cli: &Cli, action: &AuthCommands) -> i32 {
             }
         }
         AuthCommands::Refresh { provider } => {
-            let (canonical_id, entry) = match catalog.find_provider(provider) {
-                Some((id, e)) => (id.to_string(), e.clone()),
-                None => {
-                    eprintln!("auth error: unknown provider `{provider}`");
-                    return 1;
-                }
+            let (canonical_id, entry) = if let Some((id, e)) = catalog.find_provider(provider) {
+                (id.to_string(), e.clone())
+            } else {
+                eprintln!("auth error: unknown provider `{provider}`");
+                return 1;
             };
             let profile = entry.oauth_profile(&canonical_id).to_string();
             match carnot::refresh_stored_token(&profile, entry.oauth.as_ref(), &store).await {
@@ -1916,10 +1911,10 @@ async fn run_auth_cmd(cli: &Cli, action: &AuthCommands) -> i32 {
             }
         }
         AuthCommands::Logout { provider } => {
-            let profile = catalog
-                .find_provider(provider)
-                .map(|(id, e)| e.oauth_profile(id).to_string())
-                .unwrap_or_else(|| provider.to_string());
+            let profile = catalog.find_provider(provider).map_or_else(
+                || provider.clone(),
+                |(id, e)| e.oauth_profile(id).to_string(),
+            );
             match store.remove(&profile) {
                 Ok(true) => {
                     println!(
@@ -1959,15 +1954,15 @@ fn resolve_one_shot_prompt(
         let buf = read_stdin().map_err(|e| format!("reading prompt from stdin: {e}"))?;
         return Ok(Some(buf));
     }
-    let piped = if !stdin_is_tty {
+    let piped = if stdin_is_tty {
+        None
+    } else {
         let buf = read_stdin().map_err(|e| format!("reading prompt from stdin: {e}"))?;
         if buf.trim().is_empty() {
             None
         } else {
             Some(buf)
         }
-    } else {
-        None
     };
 
     match (cli.prompt.as_deref(), piped) {
@@ -1997,7 +1992,7 @@ fn detect_image_mime(path: &std::path::Path, bytes: &[u8]) -> Option<&'static st
     match path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .as_deref()
     {
         Some("png") => Some("image/png"),

@@ -54,8 +54,7 @@ impl ApiAdapter for FauxApiAdapter {
                         let id = tc
                             .get("id")
                             .and_then(|v| v.as_str())
-                            .map(ToString::to_string)
-                            .unwrap_or_else(|| format!("faux-call-{idx}"));
+                            .map_or_else(|| format!("faux-call-{idx}"), ToString::to_string);
                         let name = tc
                             .get("name")
                             .and_then(|v| v.as_str())
@@ -91,7 +90,7 @@ impl ApiAdapter for FauxApiAdapter {
                     stop_reason,
                     output_tokens: item
                         .get("output_tokens")
-                        .and_then(|v| v.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .unwrap_or(24),
                 });
             }
@@ -173,6 +172,7 @@ impl FauxProvider {
         }
     }
 
+    #[must_use]
     pub fn with_web_capabilities(mut self, caps: ProviderWebCapabilities) -> Self {
         self.web_caps = caps;
         self
@@ -187,7 +187,7 @@ impl FauxProvider {
 }
 
 impl Provider for FauxProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "faux"
     }
 
@@ -208,9 +208,7 @@ impl Provider for FauxProvider {
                 .map(|t| {
                     t.name.len()
                         + t.description.len()
-                        + serde_json::to_vec(&t.input_schema)
-                            .map(|b| b.len())
-                            .unwrap_or(0)
+                        + serde_json::to_vec(&t.input_schema).map_or(0, |b| b.len())
                 })
                 .sum();
             let static_est: u64 =
@@ -231,11 +229,11 @@ impl Provider for FauxProvider {
                 let mut prev_h = self
                     .last_prefix_hash
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut prev_tok = self
                     .cached_prefix_tokens
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let same_static = prev_h.as_deref() == Some(request.prefix_hash.as_str());
                 let cr = if same_static {
                     (*prev_tok).min(est_ctx)

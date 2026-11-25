@@ -22,6 +22,7 @@ impl ResilientProvider {
         }
     }
 
+    #[must_use]
     pub fn with_retries(mut self, attempts: u32, base_backoff_ms: u64) -> Self {
         self.max_attempts_per_provider = attempts.max(1);
         self.base_backoff_ms = base_backoff_ms;
@@ -31,17 +32,13 @@ impl ResilientProvider {
 
 impl Provider for ResilientProvider {
     fn name(&self) -> &str {
-        self.providers
-            .first()
-            .map(|p| p.name())
-            .unwrap_or("resilient")
+        self.providers.first().map_or("resilient", |p| p.name())
     }
 
     fn supports_native_tool_search(&self) -> bool {
         self.providers
             .first()
-            .map(|p| p.supports_native_tool_search())
-            .unwrap_or(false)
+            .is_some_and(|p| p.supports_native_tool_search())
     }
 
     fn web_capabilities(&self, model: &str) -> carnot_core::ProviderWebCapabilities {
@@ -54,18 +51,17 @@ impl Provider for ResilientProvider {
     fn effort_preserves_cache(&self, model: &str) -> bool {
         self.providers
             .first()
-            .map(|p| p.effort_preserves_cache(model))
-            .unwrap_or(false)
+            .is_some_and(|p| p.effort_preserves_cache(model))
     }
 
     fn rolling_cache_ttl_ms(&self, model: &str, ttl: carnot_core::CacheTtl) -> u64 {
-        self.providers
-            .first()
-            .map(|p| p.rolling_cache_ttl_ms(model, ttl))
-            .unwrap_or(match ttl {
+        self.providers.first().map_or(
+            match ttl {
                 carnot_core::CacheTtl::Long => 3_610_000,
                 carnot_core::CacheTtl::Short | carnot_core::CacheTtl::Hybrid => 310_000,
-            })
+            },
+            |p| p.rolling_cache_ttl_ms(model, ttl),
+        )
     }
 
     fn stream(
@@ -117,11 +113,10 @@ impl Provider for ResilientProvider {
                             // Proportional +-20% jitter desynchronizes 429 retry storms cleanly
                             let nanos = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.subsec_nanos() as u64)
-                                .unwrap_or(0);
+                                .map_or(0, |d| u64::from(d.subsec_nanos()));
                             let jitter_band = (base_delay / 5).max(1);
                             let jitter_offset = (nanos
-                                ^ (attempt as u64).wrapping_mul(0x9e37_79b9))
+                                ^ u64::from(attempt).wrapping_mul(0x9e37_79b9))
                                 % (jitter_band * 2);
                             let delay = base_delay
                                 .saturating_sub(jitter_band)
@@ -135,8 +130,8 @@ impl Provider for ResilientProvider {
                                 "transient provider error; retrying"
                             );
                             tokio::select! {
-                                _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
-                                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                                () = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                                () = tokio::time::sleep(Duration::from_millis(delay)) => {}
                             }
                         }
                         Err(other) => return Err(other),

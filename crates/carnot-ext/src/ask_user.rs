@@ -12,6 +12,7 @@ use carnot_core::{
 };
 use carnot_tools::{BoxFuture, Tool};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
@@ -38,7 +39,7 @@ impl AskUserModule {
 }
 
 impl Module for AskUserModule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ask_user"
     }
 
@@ -71,8 +72,7 @@ fn parse_questions_input(input: &Value) -> std::result::Result<Vec<UserQuestion>
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("q{}", idx + 1));
+                .map_or_else(|| format!("q{}", idx + 1), str::to_string);
             let header = q
                 .get("header")
                 .and_then(Value::as_str)
@@ -168,7 +168,7 @@ fn format_answers(questions: &[UserQuestion], answers: &[UserQuestionAnswer]) ->
             }
             None => "(unanswered)".to_string(),
         };
-        out.push_str(&format!("- `{}` ({}): {}\n", q.id, q.question, value));
+        let _ = writeln!(out, "- `{}` ({}): {value}", q.id, q.question);
     }
     out.trim_end().to_string()
 }
@@ -233,7 +233,7 @@ impl Tool for AskUserTool {
 
             let req_id = format!("ask-{}", self.next_req_id.fetch_add(1, Ordering::Relaxed));
             let answers = tokio::select! {
-                _ = cancel.cancelled() => return Err(CarnotError::Cancelled),
+                () = cancel.cancelled() => return Err(CarnotError::Cancelled),
                 res = broker.ask(&req_id, &questions) => match res {
                     Ok(ans) => ans,
                     Err(e) => return Ok(ToolOutput::err_text(format!("AskUser failed: {e}"))),

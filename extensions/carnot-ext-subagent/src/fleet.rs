@@ -23,6 +23,7 @@ use carnot_ext::{
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -159,7 +160,10 @@ impl WorkerHandle {
     /// Atomically transitions `Idle | Failed(_)` -> `Running` under `state_lock`.
     /// Returns `true` if this caller claimed the transition and should spawn the turn.
     pub fn try_begin_turn(&self) -> bool {
-        let _g = self.state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self
+            .state_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.cancel.is_cancelled() {
             return false;
         }
@@ -176,7 +180,10 @@ impl WorkerHandle {
     /// can never be overwritten back to `Running`, `Idle`, or `Failed`.
     /// Returns `true` if the new state was applied, `false` if the worker was already `Closed`.
     pub fn set_state(&self, next: WorkerState) -> bool {
-        let _g = self.state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self
+            .state_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if matches!(self.state(), WorkerState::Closed) && !matches!(next, WorkerState::Closed) {
             return false;
         }
@@ -197,8 +204,7 @@ impl WorkerHandle {
         let activity = self
             .last_activity
             .lock()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| "starting".into());
+            .map_or_else(|_| "starting".into(), |g| g.clone());
         parent.emit_event(AgentEvent::WorkerUpdated {
             worker: self.name.clone(),
             state: self.state().label().to_string(),
@@ -211,7 +217,7 @@ impl WorkerHandle {
     }
 
     pub fn has_worktree(&self) -> bool {
-        self.worktree.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.worktree.lock().is_ok_and(|g| g.is_some())
     }
 
     pub fn progress_line(&self) -> String {
@@ -222,8 +228,7 @@ impl WorkerHandle {
         let last = self
             .last_activity
             .lock()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| "starting".into());
+            .map_or_else(|_| "starting".into(), |g| g.clone());
         let st = self.state();
         let state_str = match st {
             WorkerState::Running => "running",
@@ -271,7 +276,10 @@ impl WorkerHandle {
     /// Atomically checks & lands this worker's worktree changes onto the parent repository,
     /// advancing the worktree baseline commit on success so future lands are incremental.
     pub fn land_worktree(&self) -> Result<LandOutcome> {
-        let mut guard = self.worktree.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .worktree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(wt) = guard.as_mut() else {
             return Err(CarnotError::Tool {
                 tool: "Subagent".into(),
@@ -339,8 +347,7 @@ impl Fleet {
         let max_concurrent = std::env::var("CARNOT_MAX_WORKERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 16))
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_WORKERS);
+            .map_or(DEFAULT_MAX_CONCURRENT_WORKERS, |n| n.clamp(1, 16));
         Self {
             workers: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(0),
@@ -365,7 +372,7 @@ impl Fleet {
     pub fn running_count(&self) -> usize {
         self.workers
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .filter(|w| w.state().is_running())
             .count()
@@ -376,7 +383,10 @@ impl Fleet {
     }
 
     pub fn insert(&self, worker: Arc<WorkerHandle>) -> Result<()> {
-        let mut map = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active_running = map.values().filter(|w| w.state().is_running()).count();
         if active_running >= self.max_concurrent {
             return Err(CarnotError::Tool {
@@ -427,7 +437,7 @@ impl Fleet {
     pub fn get(&self, name: &str) -> Option<Arc<WorkerHandle>> {
         self.workers
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(name)
             .cloned()
     }
@@ -435,7 +445,7 @@ impl Fleet {
     pub fn remove(&self, name: &str) -> Option<Arc<WorkerHandle>> {
         self.workers
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(name)
     }
 
@@ -443,7 +453,10 @@ impl Fleet {
     /// worker's transition to `Running`. Returns `Err(max_concurrent)` if the concurrency cap is
     /// already full, `Ok(true)` if claimed, or `Ok(false)` if the worker is already running/closed.
     pub fn try_claim_wake(&self, worker: &WorkerHandle) -> std::result::Result<bool, usize> {
-        let map = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active_running = map.values().filter(|w| w.state().is_running()).count();
         if active_running >= self.max_concurrent {
             return Err(self.max_concurrent);
@@ -467,7 +480,7 @@ impl Fleet {
             let mut q = self
                 .coordinator_inbox
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if q.len() >= MAX_INBOX_MESSAGES {
                 q.pop_front();
             }
@@ -480,7 +493,7 @@ impl Fleet {
         !self
             .coordinator_inbox
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty()
     }
 
@@ -490,7 +503,7 @@ impl Fleet {
         }
         self.workers
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .any(|w| w.report_unread.load(Ordering::Acquire))
     }
@@ -501,7 +514,7 @@ impl Fleet {
         let mut q = self
             .coordinator_inbox
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         q.drain(..).collect()
     }
 
@@ -513,7 +526,10 @@ impl Fleet {
         let mut reports = Vec::new();
         let mut remove_oneshot = Vec::new();
         {
-            let map = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            let map = self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (name, w) in map.iter() {
                 if w.report_unread.swap(false, Ordering::AcqRel)
                     && let Ok(guard) = w.last_report.lock()
@@ -538,7 +554,10 @@ impl Fleet {
     /// Drops the `workers` lock before inspecting each worker handle so locks never nest.
     pub fn list_overview(&self) -> (Vec<String>, f64, usize) {
         let snapshot: Vec<Arc<WorkerHandle>> = {
-            let map = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            let map = self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.values().cloned().collect()
         };
         let rows: Vec<String> = snapshot.iter().map(|w| w.progress_line()).collect();
@@ -573,9 +592,9 @@ impl Fleet {
                 return false;
             }
             tokio::select! {
-                _ = cancel.cancelled() => return false,
-                _ = &mut notified => {}
-                _ = tokio::time::sleep(remaining) => {
+                () = cancel.cancelled() => return false,
+                () = &mut notified => {}
+                () = tokio::time::sleep(remaining) => {
                     return self.wait_condition_met(targets, wait_all, &initially_running);
                 }
             }
@@ -583,7 +602,10 @@ impl Fleet {
     }
 
     fn snapshot_running_targets(&self, targets: &[String]) -> Vec<String> {
-        let map = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let iter: Vec<&Arc<WorkerHandle>> = if targets.is_empty() {
             map.values().collect()
         } else {
@@ -602,7 +624,10 @@ impl Fleet {
         initially_running: &[String],
     ) -> bool {
         let has_inbox = self.has_unread_inbox();
-        let map = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let selected: Vec<&Arc<WorkerHandle>> = if targets.is_empty() {
             map.values().collect()
         } else {
@@ -638,7 +663,10 @@ impl Fleet {
 
     fn kill_all_inner(&self, blocking_sync: bool) {
         let all: Vec<Arc<WorkerHandle>> = {
-            let mut map = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut *map).into_values().collect()
         };
         for w in all {
@@ -699,7 +727,7 @@ pub fn spawn_worker_turn(
             let la = Arc::clone(&worker.last_activity);
             let worker_obs = Arc::downgrade(&worker);
             let budget_obs = Arc::clone(&budget);
-            let fleet_obs = fleet_weak.clone();
+            let fleet_obs = Weak::clone(&fleet_weak);
             let parent_obs = parent_agent.clone();
             let obs_task = tokio::spawn(async move {
                 loop {
@@ -834,21 +862,23 @@ pub fn spawn_worker_turn(
                         summary
                     );
                     if let Some(ref hr) = outcome.halted_reason {
-                        text.push_str(&format!("\n[subagent-halted] {hr}"));
+                        let _ = write!(text, "\n[subagent-halted] {hr}");
                     }
                     if let Some(ref st) = changed_stat {
-                        text.push_str(&format!("\n[subagent-workspace-changes]\n{st}"));
+                        let _ = write!(text, "\n[subagent-workspace-changes]\n{st}");
                     }
                     if let Some(ref dh) = diff_handle {
                         if worker.keep_alive {
-                            text.push_str(&format!(
+                            let _ = write!(
+                                text,
                                 "\n[subagent-worktree] Worktree kept alive — call Subagent{{\"job\":\"{}\",\"land\":true}} to apply atomically (patch also saved in `{dh}`)",
                                 worker.name
-                            ));
+                            );
                         } else {
-                            text.push_str(&format!(
+                            let _ = write!(
+                                text,
                                 "\n[subagent-diff-patch] Saved isolated worktree diff to `{dh}` (apply via `git apply {dh}`)"
-                            ));
+                            );
                         }
                     }
                     let rep = WorkerReport {
@@ -923,10 +953,9 @@ pub fn spawn_worker_turn(
                 if worker.try_begin_turn() {
                     current_prompt = late_msg;
                     continue;
-                } else {
-                    // Re-queue if another wake already claimed the turn
-                    worker.agent.follow_up(late_msg).await;
                 }
+                // Re-queue if another wake already claimed the turn
+                worker.agent.follow_up(late_msg).await;
             }
             break;
         }

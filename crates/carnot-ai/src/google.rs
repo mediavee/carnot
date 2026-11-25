@@ -28,7 +28,7 @@ use carnot_core::{
     CarnotError, ContentBlock, ContentOrigin, Message, ProviderWebCapabilities, ReasoningEffort,
     Result, Role, StopReason, ToolResultBlock, Usage,
 };
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,7 +96,7 @@ impl GoogleProvider {
         }
     }
 
-    /// Builds the inner Gemini GenerateContent request payload.
+    /// Builds the inner Gemini `GenerateContent` request payload.
     pub fn build_inner_body(&self, req: &ProviderRequest) -> Value {
         let compat = self.spec.effective_compat(&req.model);
         let api_id = self.api_id();
@@ -257,10 +257,10 @@ impl GoogleProvider {
                         }));
                         parts.extend(inline_imgs);
                     }
-                    ContentBlock::Opaque { .. } => {
+                    ContentBlock::Opaque { .. } | ContentBlock::Text { .. } => {
                         // Drop foreign opaques (e.g. Anthropic `redacted_thinking`, OpenAI `reasoning`)
+                        // and empty text blocks.
                     }
-                    _ => {}
                 }
             }
 
@@ -552,48 +552,44 @@ impl Provider for GoogleProvider {
                 let mut stream_eof = false;
 
                 loop {
-                    if !stream_eof {
-                        let next_chunk = tokio::select! {
-                            _ = cancel.cancelled() => {
-                                let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
-                                return;
-                            }
-                            res = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => res,
-                        };
-
-                        let chunk_opt = match next_chunk {
-                            Ok(opt) => opt,
-                            Err(_) => {
-                                let _ = tx
-                                    .send(StreamEvent::Error {
-                                        message: "stream idle timeout (300s)".into(),
-                                        retryable: true,
-                                    })
-                                    .await;
-                                return;
-                            }
-                        };
-                        match chunk_opt {
-                            Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
-                            Some(Err(_)) => {
-                                let _ = tx
-                                    .send(StreamEvent::Error {
-                                        message: "stream read error".into(),
-                                        retryable: true,
-                                    })
-                                    .await;
-                                return;
-                            }
-                            None => {
-                                stream_eof = true;
-                                if raw_buf.is_empty() {
-                                    break;
-                                }
-                                raw_buf.extend_from_slice(b"\n\n");
-                            }
-                        }
-                    } else {
+                    if stream_eof {
                         break;
+                    }
+                    let next_chunk = tokio::select! {
+                        () = cancel.cancelled() => {
+                            let _ = tx.send(StreamEvent::Error { message: "cancelled".into(), retryable: false }).await;
+                            return;
+                        }
+                        res = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => res,
+                    };
+
+                    let Ok(chunk_opt) = next_chunk else {
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: "stream idle timeout (300s)".into(),
+                                retryable: true,
+                            })
+                            .await;
+                        return;
+                    };
+                    match chunk_opt {
+                        Some(Ok(bytes)) => raw_buf.extend_from_slice(&bytes),
+                        Some(Err(_)) => {
+                            let _ = tx
+                                .send(StreamEvent::Error {
+                                    message: "stream read error".into(),
+                                    retryable: true,
+                                })
+                                .await;
+                            return;
+                        }
+                        None => {
+                            stream_eof = true;
+                            if raw_buf.is_empty() {
+                                break;
+                            }
+                            raw_buf.extend_from_slice(b"\n\n");
+                        }
                     }
 
                     while let Some((end, delim_len)) = find_sse_frame_end(&raw_buf) {
@@ -722,12 +718,14 @@ impl Provider for GoogleProvider {
                                             .get("id")
                                             .and_then(Value::as_str)
                                             .filter(|s| !s.is_empty())
-                                            .map(str::to_string)
-                                            .unwrap_or_else(|| {
-                                                let seq = SYNTHETIC_CALL_SEQ
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                format!("call_{name}_{seq}")
-                                            });
+                                            .map_or_else(
+                                                || {
+                                                    let seq = SYNTHETIC_CALL_SEQ
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    format!("call_{name}_{seq}")
+                                                },
+                                                str::to_string,
+                                            );
                                         let input =
                                             fc.get("args").cloned().unwrap_or_else(|| json!({}));
                                         let provider_meta =
@@ -793,9 +791,10 @@ impl Provider for GoogleProvider {
                     .filter(|(_, uri)| !text_acc.contains(uri.as_str()))
                     .collect();
                 if !missing_sources.is_empty() && tool_blocks.is_empty() {
+                    use std::fmt::Write as _;
                     let mut footer = String::from("\n\nSources:\n");
                     for (title, uri) in missing_sources {
-                        footer.push_str(&format!("- [{title}]({uri})\n"));
+                        let _ = writeln!(footer, "- [{title}]({uri})");
                     }
                     text_acc.push_str(&footer);
                     let _ = tx.send(StreamEvent::TextDelta(footer)).await;

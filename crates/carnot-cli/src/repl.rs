@@ -37,7 +37,7 @@ impl Theme {
         }
     }
 
-    fn paint(&self, code: &str, text: &str) -> String {
+    fn paint(self, code: &str, text: &str) -> String {
         if self.color {
             format!("\x1b[{code}m{text}\x1b[0m")
         } else {
@@ -54,7 +54,7 @@ fn spawn_stdin_reader() -> SharedStdinRx {
         loop {
             let mut buf = String::new();
             match lock.read_line(&mut buf) {
-                Ok(0) => {
+                Ok(0) | Err(_) => {
                     let _ = tx.blocking_send(None);
                     break;
                 }
@@ -62,10 +62,6 @@ fn spawn_stdin_reader() -> SharedStdinRx {
                     if tx.blocking_send(Some(buf)).is_err() {
                         break;
                     }
-                }
-                Err(_) => {
-                    let _ = tx.blocking_send(None);
-                    break;
                 }
             }
         }
@@ -404,7 +400,7 @@ pub(crate) fn parse_effort(s: &str) -> Option<ReasoningEffort> {
     }
 }
 
-pub async fn run_repl(
+pub(crate) async fn run_repl(
     agent: Arc<Agent>,
     default_provider: String,
     provider_configs: Vec<PathBuf>,
@@ -483,7 +479,7 @@ pub async fn run_repl(
         if let Some(cmd) = trimmed.strip_prefix('/') {
             let mut parts = cmd.split_whitespace();
             let verb = parts.next().unwrap_or("");
-            let rest = cmd.strip_prefix(verb).map(str::trim).unwrap_or("");
+            let rest = cmd.strip_prefix(verb).map_or("", str::trim);
             match verb {
                 "exit" | "quit" | "q" => return 0,
                 "help" | "h" => {

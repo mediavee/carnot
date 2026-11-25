@@ -134,10 +134,10 @@ pub fn extract_and_validate_tool_schema(
         &mut header_params,
         &mut seen_lower,
     )?;
-    header_params.sort_by(|a, b| a.header_name.cmp(&b.header_name));
+    header_params.sort_unstable_by(|a, b| a.header_name.cmp(&b.header_name));
 
     let minified = minify_and_canonicalize_schema(raw_schema);
-    let serialized_len = serde_json::to_vec(&minified).map(|b| b.len()).unwrap_or(0);
+    let serialized_len = serde_json::to_vec(&minified).map_or(0, |b| b.len());
     if serialized_len > MAX_SCHEMA_BYTES {
         return Err(format!(
             "minified schema exceeds {} KiB limit ({} bytes)",
@@ -375,8 +375,7 @@ fn cache_dir() -> Option<PathBuf> {
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Loads a cached schema entry and returns `(entry, is_stale)` honoring `SEP-2549` `ttlMs`.
@@ -412,7 +411,9 @@ pub fn save_cached_schema(cache_key: &str, mut schema: CachedServerSchema) {
         return;
     }
     schema.format_version = CACHE_SCHEMA_FORMAT_VERSION;
-    schema.tools.sort_by(|a, b| a.wire_name.cmp(&b.wire_name));
+    schema
+        .tools
+        .sort_unstable_by(|a, b| a.wire_name.cmp(&b.wire_name));
     schema.cached_at_ms = now_ms();
     let target = dir.join(format!("{cache_key}.json"));
     let tmp = dir.join(format!(".{cache_key}.tmp-{}", uuid::Uuid::new_v4()));

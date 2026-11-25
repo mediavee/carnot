@@ -60,8 +60,7 @@ fn extract_primary_region(html: &str) -> &str {
         let inner_start = open_pos + gt_rel + 1;
         let end = lower[inner_start..]
             .rfind("</body>")
-            .map(|r| inner_start + r)
-            .unwrap_or(html.len());
+            .map_or(html.len(), |r| inner_start + r);
         return &html[inner_start..end];
     }
     html
@@ -144,15 +143,15 @@ fn render_html_fragment(html: &str, base_url: Option<&Url>) -> String {
 
             match tag_name.as_str() {
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                    if !is_closing {
+                    if is_closing {
+                        ensure_blank_line(&mut out);
+                    } else {
                         let lvl = tag_name.as_bytes()[1].saturating_sub(b'0').clamp(1, 6) as usize;
                         ensure_blank_line(&mut out);
                         for _ in 0..lvl {
                             out.push('#');
                         }
                         out.push(' ');
-                    } else {
-                        ensure_blank_line(&mut out);
                     }
                 }
                 "p" | "div" | "section" | "article" | "main" | "blockquote" | "tr" => {
@@ -172,11 +171,11 @@ fn render_html_fragment(html: &str, base_url: Option<&Url>) -> String {
                     out.push_str("---\n\n");
                 }
                 "li" => {
-                    if !is_closing {
+                    if is_closing {
                         ensure_newline(&mut out);
-                        out.push_str("- ");
                     } else {
                         ensure_newline(&mut out);
+                        out.push_str("- ");
                     }
                 }
                 "td" | "th" => {
@@ -185,16 +184,16 @@ fn render_html_fragment(html: &str, base_url: Option<&Url>) -> String {
                     }
                 }
                 "pre" => {
-                    if !is_closing {
-                        in_pre = true;
-                        ensure_blank_line(&mut out);
-                        out.push_str("```\n");
-                    } else {
+                    if is_closing {
                         in_pre = false;
                         if !out.ends_with('\n') {
                             out.push('\n');
                         }
                         out.push_str("```\n\n");
+                    } else {
+                        in_pre = true;
+                        ensure_blank_line(&mut out);
+                        out.push_str("```\n");
                     }
                 }
                 "code" => {
@@ -222,7 +221,8 @@ fn render_html_fragment(html: &str, base_url: Option<&Url>) -> String {
                             if clean_lbl == href {
                                 out.push_str(&href);
                             } else {
-                                out.push_str(&format!("[{clean_lbl}]({href})"));
+                                use std::fmt::Write as _;
+                                let _ = write!(out, "[{clean_lbl}]({href})");
                             }
                         }
                     }
@@ -230,7 +230,7 @@ fn render_html_fragment(html: &str, base_url: Option<&Url>) -> String {
                 _ => {}
             }
         } else {
-            let next_lt = html[i..].find('<').map(|r| i + r).unwrap_or(html.len());
+            let next_lt = html[i..].find('<').map_or(html.len(), |r| i + r);
             if skip_depth == 0 {
                 let raw_text = &html[i..next_lt];
                 let decoded = decode_entities(raw_text);
@@ -250,7 +250,8 @@ fn render_html_fragment(html: &str, base_url: Option<&Url>) -> String {
     if let Some((href, label)) = active_link.take() {
         let clean_lbl = collapse_ws(&label);
         if !clean_lbl.is_empty() {
-            out.push_str(&format!("[{clean_lbl}]({href})"));
+            use std::fmt::Write as _;
+            let _ = write!(out, "[{clean_lbl}]({href})");
         }
     }
     out
@@ -412,7 +413,7 @@ fn normalize_markdown(s: &str) -> String {
             out.push(trimmed.to_string());
         }
     }
-    while out.last().is_some_and(|l| l.is_empty()) {
+    while out.last().is_some_and(std::string::String::is_empty) {
         out.pop();
     }
     out.join("\n")

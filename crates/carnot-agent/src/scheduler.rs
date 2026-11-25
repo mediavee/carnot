@@ -29,13 +29,10 @@ pub(crate) struct ScheduledCall {
 pub(crate) fn partition_conflict_free_waves(calls: Vec<ScheduledCall>) -> Vec<Vec<ScheduledCall>> {
     let mut waves: Vec<Vec<ScheduledCall>> = Vec::new();
     for call in calls {
-        let can_join_last = waves
-            .last()
-            .map(|w| {
-                w.iter()
-                    .all(|prev| !prev.effects.conflicts_with(&call.effects))
-            })
-            .unwrap_or(false);
+        let can_join_last = waves.last().is_some_and(|w| {
+            w.iter()
+                .all(|prev| !prev.effects.conflicts_with(&call.effects))
+        });
         if can_join_last && let Some(last) = waves.last_mut() {
             last.push(call);
         } else {
