@@ -1,0 +1,21 @@
+[package]
+name = "carnot-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional interactive full-screen Ratatui terminal UI for Carnot"
+
+[lints]
+workspace = true
+
+[dependencies]
+carnot.workspace = true
+carnot-ext.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "carnot-ext-claude-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Claude Code plugin discovery and compatibility extension for Carnot"
+
+[lints]
+workspace = true
+
+[dependencies]
+carnot-core.workspace = true
+carnot-ext.workspace = true
+carnot-ext-hooks.workspace = true
+carnot-mcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true

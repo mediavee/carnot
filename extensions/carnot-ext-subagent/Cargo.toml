@@ -1,0 +1,24 @@
+[package]
+name = "carnot-ext-subagent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Disposable-context parallel subagent extension for Carnot"
+
+[lints]
+workspace = true
+
+[dependencies]
+carnot-agent.workspace = true
+carnot-ai.workspace = true
+carnot-cas.workspace = true
+carnot-core.workspace = true
+carnot-ext.workspace = true
+carnot-sandbox.workspace = true
+carnot-tools.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true

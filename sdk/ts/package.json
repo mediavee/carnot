@@ -1,0 +1,32 @@
+{
+  "name": "@mediavee/carnot-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-dependency TypeScript HTTP/SSE SDK for Carnot",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mediavee/carnot.git",
+    "directory": "sdk/ts"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

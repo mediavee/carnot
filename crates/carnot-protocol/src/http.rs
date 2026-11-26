@@ -1,0 +1,1005 @@
+//! Hardened embedded HTTP/1.1 + SSE API server over `tokio::net::TcpListener`.
+//!
+//! Security & concurrency invariants:
+//!   - Bearer token authentication (`CARNOT_HTTP_TOKEN` or auto-generated 256-bit token saved in
+//!     `~/.carnot/server.token` with mode `0600`) required on all `/v1/*` routes.
+//!   - Strict `Host` & `Origin` localhost checks + `Content-Type: application/json` enforcement on
+//!     POST routes (blocks browser CSRF & DNS rebinding).
+//!   - Bounded header count (64), header line size (8 KiB), and 15 s request read timeout.
+//!   - Returns `409 Conflict` if a second `POST /v1/prompt` arrives while a run is active.
+//!   - Lossless SSE streaming from `EventLog` with `id: <seq>` & `Last-Event-ID` replay on `GET /v1/events`.
+
+use crate::interaction::ChannelInteractionBroker;
+use carnot_agent::Agent;
+use carnot_core::{AgentEvent, CacheTtl, ContentBlock, Result, UserQuestionAnswer};
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+const MAX_HEADERS: usize = 64;
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+const REQUEST_READ_TIMEOUT_SECS: u64 = 15;
+const SSE_KEEPALIVE_SECS: u64 = 30;
+
+/// Starts the HTTP/SSE server using `CARNOT_HTTP_TOKEN` or a newly generated 256-bit token saved at
+/// `~/.carnot/server.token` (`0600`).
+pub async fn serve_http(agent: Arc<Agent>, addr: &str) -> Result<()> {
+    let token = match std::env::var("CARNOT_HTTP_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => {
+            let t = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            if let Some(tok_path) = default_token_path() {
+                if let Some(parent) = tok_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = write_token_0600(&tok_path, &t) {
+                    tracing::warn!(
+                        token_file = %tok_path.display(),
+                        error = %e,
+                        "failed to write carnot HTTP Bearer token file"
+                    );
+                } else {
+                    tracing::info!(token_file = %tok_path.display(), "carnot HTTP Bearer token written (mode 0600)");
+                }
+            }
+            t
+        }
+    };
+    serve_http_with_token(agent, addr, token).await
+}
+
+pub async fn serve_http_with_token(agent: Arc<Agent>, addr: &str, token: String) -> Result<()> {
+    let broker = ChannelInteractionBroker::new(Arc::clone(&agent));
+    agent
+        .set_question_broker(Arc::clone(&broker) as Arc<dyn carnot_ext::UserQuestionBroker>)
+        .await;
+
+    let listener = TcpListener::bind(addr).await?;
+    let expected_token = Arc::new(token);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let prompt_gate = Arc::new(tokio::sync::Mutex::new(()));
+    tracing::info!(%addr, "carnot HTTP/SSE server listening (Bearer auth + CSRF protection enabled)");
+    loop {
+        tokio::select! {
+            accept_res = listener.accept() => {
+                let (stream, _) = match accept_res {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "HTTP listener accept error; continuing");
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                let ag = Arc::clone(&agent);
+                let br = Arc::clone(&broker);
+                let tok = Arc::clone(&expected_token);
+                let pgate = Arc::clone(&prompt_gate);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = handle_conn(ag, br, pgate, stream, &tok).await;
+                });
+            }
+            () = shutdown_signal() => {
+                tracing::info!("carnot HTTP/SSE server shutting down gracefully");
+                agent.abort().await;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn default_token_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".carnot").join("server.token"))
+}
+
+fn write_token_0600(path: &PathBuf, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(format!("{token}\n").as_bytes())?;
+    f.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn is_valid_optional_port(rest: &str) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    rest.strip_prefix(':').is_some_and(|p| {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+    })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim();
+    if h.is_empty()
+        || h.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || b.is_ascii_control()
+                || matches!(b, b'@' | b'/' | b'?' | b'#')
+        })
+    {
+        return false;
+    }
+    let lower = h.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("[::1]") {
+        return is_valid_optional_port(rest);
+    }
+    if let Some(rest) = lower.strip_prefix("127.0.0.1") {
+        return is_valid_optional_port(rest);
+    }
+    if let Some(rest) = lower.strip_prefix("localhost") {
+        return is_valid_optional_port(rest);
+    }
+    false
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    let o = origin.trim();
+    let Some(authority) = o
+        .strip_prefix("http://")
+        .or_else(|| o.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    is_loopback_host(authority)
+}
+
+async fn read_bounded_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::with_capacity(128);
+    let n = reader
+        .take((MAX_HEADER_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > MAX_HEADER_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP header line exceeds 8 KiB limit",
+        ));
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).to_string()))
+}
+
+async fn handle_conn(
+    agent: Arc<Agent>,
+    broker: Arc<ChannelInteractionBroker>,
+    prompt_gate: Arc<tokio::sync::Mutex<()>>,
+    stream: TcpStream,
+    expected_token: &str,
+) -> std::io::Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Read ONLY the request line and bounded headers BEFORE checking auth / Host / Origin.
+    // Never allocate or read the request body for unauthenticated or forbidden requests!
+    let req_head = tokio::time::timeout(Duration::from_secs(REQUEST_READ_TIMEOUT_SECS), async {
+        let Some(req_line) = read_bounded_line(&mut reader).await? else {
+            return Ok(None);
+        };
+        let parts: Vec<&str> = req_line.split_whitespace().collect();
+        let method = parts.first().copied().unwrap_or("").to_string();
+        let raw_path = parts.get(1).copied().unwrap_or("/");
+        let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
+
+        let mut content_len: usize = 0;
+        let mut header_err: Option<(u16, &'static str)> = None;
+        let mut last_event_id: Option<u64> = None;
+        let mut auth_header: Option<String> = None;
+        let mut content_type: Option<String> = None;
+        let mut origin: Option<String> = None;
+        let mut host: Option<String> = None;
+        let mut saw_end_of_headers = false;
+
+        for _ in 0..=MAX_HEADERS {
+            let Some(h) = read_bounded_line(&mut reader).await? else {
+                saw_end_of_headers = true;
+                break;
+            };
+            if h.trim().is_empty() {
+                saw_end_of_headers = true;
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                let val = v.trim();
+                if k.eq_ignore_ascii_case("content-length") {
+                    match val.parse::<usize>() {
+                        Ok(n) if n > MAX_BODY_BYTES => {
+                            header_err = Some((413, "payload exceeds 8 MiB limit"));
+                        }
+                        Ok(n) => content_len = n,
+                        Err(_) => {
+                            header_err = Some((400, "invalid Content-Length header"));
+                        }
+                    }
+                } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                    if val.to_ascii_lowercase().contains("chunked") {
+                        header_err = Some((501, "chunked Transfer-Encoding is not supported"));
+                    }
+                } else if k.eq_ignore_ascii_case("last-event-id") {
+                    last_event_id = val.parse().ok();
+                } else if k.eq_ignore_ascii_case("authorization") {
+                    auth_header = Some(val.to_string());
+                } else if k.eq_ignore_ascii_case("content-type") {
+                    content_type = Some(val.to_string());
+                } else if k.eq_ignore_ascii_case("origin") {
+                    origin = Some(val.to_string());
+                } else if k.eq_ignore_ascii_case("host") {
+                    host = Some(val.to_string());
+                }
+            }
+        }
+        if !saw_end_of_headers {
+            header_err = Some((431, "too many request headers"));
+        }
+
+        Ok::<_, std::io::Error>(Some((
+            method,
+            path,
+            content_len,
+            header_err,
+            last_event_id,
+            auth_header,
+            content_type,
+            origin,
+            host,
+        )))
+    })
+    .await;
+
+    let Ok(Ok(Some((
+        method,
+        path,
+        content_len,
+        header_err,
+        last_event_id,
+        auth_header,
+        content_type,
+        origin,
+        host,
+    )))) = req_head
+    else {
+        return Ok(());
+    };
+
+    if let Some((status, msg)) = header_err {
+        return write_json(&mut write_half, status, &json!({"error": msg})).await;
+    }
+
+    // Host & Origin anti-CSRF / anti-DNS-rebinding guards (fail-closed: Host is required in HTTP/1.1).
+    match host {
+        Some(ref h) if is_loopback_host(h) => {}
+        Some(_) => {
+            return write_json(&mut write_half, 403, &json!({"error": "forbidden host"})).await;
+        }
+        None => {
+            return write_json(
+                &mut write_half,
+                400,
+                &json!({"error": "missing Host header"}),
+            )
+            .await;
+        }
+    }
+    if let Some(ref o) = origin
+        && !is_allowed_origin(o)
+    {
+        return write_json(&mut write_half, 403, &json!({"error": "forbidden origin"})).await;
+    }
+
+    if method == "GET" && path == "/health" {
+        return write_json(
+            &mut write_half,
+            200,
+            &json!({"status": "ok", "engine": "carnot", "version": env!("CARGO_PKG_VERSION")}),
+        )
+        .await;
+    }
+
+    // Require Bearer token on all `/v1/*` routes BEFORE allocating or reading any request body.
+    let authorized = auth_header
+        .as_deref()
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .is_some_and(|tok| constant_time_eq(tok.trim().as_bytes(), expected_token.as_bytes()));
+    if !authorized {
+        return write_json(&mut write_half, 401, &json!({"error": "unauthorized"})).await;
+    }
+
+    // Enforce `application/json` on POST requests with a body (blocks `fetch(..., {mode:"no-cors"})` CSRF!)
+    if method == "POST" && content_len > 0 {
+        let is_json = content_type
+            .as_deref()
+            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/json"));
+        if !is_json {
+            return write_json(
+                &mut write_half,
+                415,
+                &json!({"error": "Content-Type must be application/json"}),
+            )
+            .await;
+        }
+    }
+
+    let mut body = Vec::new();
+    if content_len > 0 {
+        body.resize(content_len, 0u8);
+        let read_res = tokio::time::timeout(
+            Duration::from_secs(REQUEST_READ_TIMEOUT_SECS),
+            reader.read_exact(&mut body),
+        )
+        .await;
+        if !matches!(read_res, Ok(Ok(_))) {
+            return write_json(
+                &mut write_half,
+                408,
+                &json!({"error": "request body timeout"}),
+            )
+            .await;
+        }
+    }
+
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/v1/metrics") => {
+            let met = agent.metrics().await;
+            let sid = agent.session_id().await;
+            let ph = agent.prefix_hash().await;
+            let seq = agent.latest_event_seq();
+            let (ctx_tokens, ctx_breakdown) = agent.current_context_with_breakdown().await;
+            let ctx_window = agent.current_context_window().await;
+            let ttl = agent.current_cache_ttl().await;
+            write_json(
+                &mut write_half,
+                200,
+                &json!({
+                    "session_id": sid,
+                    "prefix_hash": ph,
+                    "latest_seq": seq,
+                    "cache_ttl": ttl.as_str(),
+                    "cache_hit_rate": met.cache_hit_rate(),
+                    "prefix_retention_rate": met.prefix_retention_rate(),
+                    "context_tokens": ctx_tokens,
+                    "context_window": ctx_window,
+                    "context_breakdown": ctx_breakdown,
+                    "metrics": met,
+                }),
+            )
+            .await
+        }
+        ("POST", "/v1/cache-ttl") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let raw = payload
+                .get("ttl")
+                .or_else(|| payload.get("cache_ttl"))
+                .or_else(|| payload.get("retention"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match CacheTtl::parse(raw) {
+                Some(ttl) => {
+                    agent.set_cache_ttl(ttl).await;
+                    write_json(&mut write_half, 200, &json!({"cache_ttl": ttl.as_str()})).await
+                }
+                None => {
+                    write_json(
+                        &mut write_half,
+                        400,
+                        &json!({"error": format!("invalid cache_ttl `{raw}` (expected short|hybrid|long)")}),
+                    )
+                    .await
+                }
+            }
+        }
+        ("GET", "/v1/goal") => match agent.goal_controller() {
+            Some(ctrl) => write_json(&mut write_half, 200, &ctrl.status_json()).await,
+            None => {
+                write_json(
+                    &mut write_half,
+                    501,
+                    &json!({"error": "goal extension not enabled on this agent"}),
+                )
+                .await
+            }
+        },
+        ("POST", "/v1/goal") => match agent.goal_controller() {
+            Some(ctrl) => {
+                let payload: Value = match serde_json::from_slice::<Value>(&body) {
+                    Ok(v) if v.is_object() => v,
+                    Ok(_) => {
+                        return write_json(
+                            &mut write_half,
+                            400,
+                            &json!({"error": "POST /v1/goal body must be a JSON object"}),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        return write_json(
+                            &mut write_half,
+                            400,
+                            &json!({"error": format!("invalid JSON body: {e}")}),
+                        )
+                        .await;
+                    }
+                };
+                let criterion = payload
+                    .get("criterion")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let verify_commands: Vec<String> = payload
+                    .get("verify_commands")
+                    .or_else(|| payload.get("commands"))
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let max_iterations = payload
+                    .get("max_iterations")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                let verifier_model = payload
+                    .get("verifier_model")
+                    .or_else(|| payload.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let st = ctrl.set_goal(criterion, verify_commands, max_iterations, verifier_model);
+                write_json(&mut write_half, 200, &st).await
+            }
+            None => {
+                write_json(
+                    &mut write_half,
+                    501,
+                    &json!({"error": "goal extension not enabled on this agent"}),
+                )
+                .await
+            }
+        },
+        ("DELETE", "/v1/goal") => match agent.goal_controller() {
+            Some(ctrl) => write_json(&mut write_half, 200, &ctrl.clear_goal()).await,
+            None => {
+                write_json(
+                    &mut write_half,
+                    501,
+                    &json!({"error": "goal extension not enabled on this agent"}),
+                )
+                .await
+            }
+        },
+        ("GET", "/v1/events") => {
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+            write_half.write_all(hdr.as_bytes()).await?;
+            write_half.flush().await?;
+
+            let mut ev_stream = agent.subscribe_from(last_event_id.unwrap_or(0));
+            loop {
+                if let Ok(env) =
+                    tokio::time::timeout(Duration::from_secs(SSE_KEEPALIVE_SECS), ev_stream.next())
+                        .await
+                {
+                    if let Ok(line) = serde_json::to_string(&env) {
+                        let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
+                        if write_half.write_all(frame.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = write_half.flush().await;
+                    }
+                } else {
+                    if write_half.write_all(b": keepalive\n\n").await.is_err() {
+                        break;
+                    }
+                    let _ = write_half.flush().await;
+                }
+            }
+            Ok(())
+        }
+        ("POST", "/v1/steer") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let msg = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            agent.steer(msg).await;
+            write_json(&mut write_half, 200, &json!({"queued": true})).await
+        }
+        ("POST", "/v1/follow-up") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let msg = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            agent.follow_up(msg).await;
+            write_json(&mut write_half, 200, &json!({"queued": true})).await
+        }
+        ("GET", "/v1/pending") => {
+            let pending = broker.list_pending().await;
+            write_json(&mut write_half, 200, &pending).await
+        }
+        ("POST", "/v1/permissions") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let req_id = payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let decision = payload
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or("deny");
+            let reason = payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let resolved = broker.respond_permission(req_id, decision, reason).await;
+            let status = if resolved { 200 } else { 404 };
+            write_json(&mut write_half, status, &json!({"resolved": resolved})).await
+        }
+        ("POST", "/v1/questions") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let req_id = payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let answers: Vec<UserQuestionAnswer> = payload
+                .get("answers")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let resolved = broker.respond_question(req_id, answers).await;
+            let status = if resolved { 200 } else { 404 };
+            write_json(&mut write_half, status, &json!({"resolved": resolved})).await
+        }
+        ("POST", "/v1/abort") => {
+            agent.abort().await;
+            write_json(&mut write_half, 200, &json!({"aborted": true})).await
+        }
+        ("POST", "/v1/compact") => {
+            if agent.is_busy() {
+                return write_json(
+                    &mut write_half,
+                    409,
+                    &json!({"error": "agent run already in progress; cancel before compacting"}),
+                )
+                .await;
+            }
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let focus = payload
+                .get("focus")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match agent.compact_now_with_focus(focus).await {
+                Ok((before, after, semantic)) => {
+                    write_json(
+                        &mut write_half,
+                        200,
+                        &json!({
+                            "tokens_before": before,
+                            "tokens_after": after,
+                            "semantic_llm": semantic,
+                        }),
+                    )
+                    .await
+                }
+                Err(e) => write_json(&mut write_half, 500, &json!({"error": e.to_string()})).await,
+            }
+        }
+        ("POST", "/v1/undo") => match agent.undo_last_edit() {
+            Ok(path) => {
+                write_json(
+                    &mut write_half,
+                    200,
+                    &json!({"reverted": path.map(|p| p.display().to_string())}),
+                )
+                .await
+            }
+            Err(e) => write_json(&mut write_half, 409, &json!({"error": e.to_string()})).await,
+        },
+        ("POST", "/v1/prompt") => {
+            let Ok(prompt_guard) = prompt_gate.try_lock_owned() else {
+                return write_json(
+                    &mut write_half,
+                    409,
+                    &json!({"error": "agent run already in progress; use /v1/steer or /v1/abort"}),
+                )
+                .await;
+            };
+            if agent.is_busy() {
+                drop(prompt_guard);
+                return write_json(
+                    &mut write_half,
+                    409,
+                    &json!({"error": "agent run already in progress; use /v1/steer or /v1/abort"}),
+                )
+                .await;
+            }
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let prompt = payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut image_blocks = Vec::new();
+            if let Some(images) = payload.get("images").and_then(Value::as_array) {
+                for img in images {
+                    let media_type = img
+                        .get("media_type")
+                        .or_else(|| img.get("mimeType"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png");
+                    if let Some(data) = img
+                        .get("data_base64")
+                        .or_else(|| img.get("data"))
+                        .and_then(Value::as_str)
+                        && !data.is_empty()
+                    {
+                        image_blocks.push(ContentBlock::Image {
+                            media_type: media_type.to_string(),
+                            data_base64: data.to_string(),
+                        });
+                    }
+                }
+            }
+            let stream_sse = payload
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if stream_sse {
+                let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                write_half.write_all(hdr.as_bytes()).await?;
+                write_half.flush().await?;
+
+                let start_seq = agent.latest_event_seq();
+                let mut ev_stream = agent.subscribe_from(start_seq);
+                let ag_run = Arc::clone(&agent);
+                let run_task = tokio::spawn(async move {
+                    let _prompt_guard = prompt_guard;
+                    if image_blocks.is_empty() {
+                        ag_run.prompt(prompt).await
+                    } else {
+                        let mut blocks = Vec::with_capacity(1 + image_blocks.len());
+                        if !prompt.is_empty() {
+                            blocks.push(ContentBlock::Text { text: prompt });
+                        }
+                        blocks.extend(image_blocks);
+                        ag_run.prompt_blocks(blocks).await
+                    }
+                });
+
+                loop {
+                    if let Ok(env) = tokio::time::timeout(
+                        Duration::from_secs(SSE_KEEPALIVE_SECS),
+                        ev_stream.next(),
+                    )
+                    .await
+                    {
+                        let is_done = matches!(
+                            env.event,
+                            AgentEvent::RunSettled { .. } | AgentEvent::Error { .. }
+                        );
+                        if let Ok(line) = serde_json::to_string(&env) {
+                            let frame = format!("id: {}\ndata: {line}\n\n", env.seq);
+                            if write_half.write_all(frame.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
+                        if is_done {
+                            break;
+                        }
+                    } else {
+                        if write_half.write_all(b": keepalive\n\n").await.is_err() {
+                            break;
+                        }
+                        let _ = write_half.flush().await;
+                    }
+                }
+                let _ = run_task.await;
+                Ok(())
+            } else {
+                let res = if image_blocks.is_empty() {
+                    agent.prompt(prompt).await
+                } else {
+                    let mut blocks = Vec::with_capacity(1 + image_blocks.len());
+                    if !prompt.is_empty() {
+                        blocks.push(ContentBlock::Text { text: prompt });
+                    }
+                    blocks.extend(image_blocks);
+                    agent.prompt_blocks(blocks).await
+                };
+                match res {
+                    Ok(o) => {
+                        write_json(
+                            &mut write_half,
+                            200,
+                            &json!({
+                                "final_text": o.final_text,
+                                "metrics": o.metrics,
+                                "halted_reason": o.halted_reason,
+                            }),
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        write_json(&mut write_half, 500, &json!({"error": e.to_string()})).await
+                    }
+                }
+            }
+        }
+        _ => write_json(&mut write_half, 404, &json!({"error": "not found"})).await,
+    }
+}
+
+async fn write_json(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+    status: u16,
+    body: &Value,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        431 => "Request Header Fields Too Large",
+        501 => "Not Implemented",
+        _ => "Internal Server Error",
+    };
+    let hdr = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    );
+    w.write_all(hdr.as_bytes()).await?;
+    w.write_all(&bytes).await?;
+    w.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carnot_ai::faux::{FauxProvider, ScriptedTurn};
+    use carnot_cas::CasStore;
+    use carnot_core::CarnotConfig;
+    use carnot_tools::ToolRegistry;
+    use std::fmt::Write as _;
+
+    async fn send_raw(addr: std::net::SocketAddr, req: &str) -> String {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        s.write_all(req.as_bytes()).await.expect("write");
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    #[tokio::test]
+    async fn http_server_enforces_bearer_auth_csrf_and_streams_events() {
+        let dir = std::env::temp_dir().join(format!("carnot-http-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut cfg = CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let tools = ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let faux = Arc::new(FauxProvider::new(vec![ScriptedTurn::text(
+            "hello from http",
+        )]));
+        let agent = Arc::new(Agent::new(cfg, faux, tools, Vec::new(), false).expect("agent"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let tok = Arc::new("secret-test-token".to_string());
+        let broker = ChannelInteractionBroker::new(Arc::clone(&agent));
+        let ag_bg = Arc::clone(&agent);
+        let br_bg = Arc::clone(&broker);
+        let tok_bg = Arc::clone(&tok);
+        let pgate_bg = Arc::new(tokio::sync::Mutex::new(()));
+        let srv = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let a = Arc::clone(&ag_bg);
+                let b = Arc::clone(&br_bg);
+                let t = Arc::clone(&tok_bg);
+                let pg = Arc::clone(&pgate_bg);
+                tokio::spawn(async move {
+                    let _ = handle_conn(a, b, pg, stream, &t).await;
+                });
+            }
+        });
+
+        // 1. Missing Bearer token -> 401 Unauthorized
+        let r401 = send_raw(addr, "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        assert!(
+            r401.starts_with("HTTP/1.1 401"),
+            "expected 401, got: {r401}"
+        );
+
+        // 2. Non-loopback Host & spoofed loopback authorities -> 403 Forbidden (DNS rebinding / CSRF guard)
+        for bad_host in [
+            "evil.example.com",
+            "127.0.0.1:80@evil.com",
+            "[::1]evil.com",
+            "localhost.evil.com",
+        ] {
+            let r403 = send_raw(
+                addr,
+                &format!(
+                    "GET /v1/status HTTP/1.1\r\nHost: {bad_host}\r\nAuthorization: Bearer secret-test-token\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                r403.starts_with("HTTP/1.1 403"),
+                "expected 403 for Host `{bad_host}`, got: {r403}"
+            );
+        }
+        assert!(!is_allowed_origin("http://127.0.0.1:80@evil.com"));
+        assert!(!is_allowed_origin("http://[::1]evil.com"));
+        assert!(is_allowed_origin("http://127.0.0.1:7744"));
+        assert!(is_allowed_origin("http://[::1]:7744"));
+        assert!(is_allowed_origin("https://localhost"));
+
+        // 2b. >MAX_HEADERS -> 431 Request Header Fields Too Large
+        let mut many_hdrs = String::from("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        for i in 0..70 {
+            let _ = write!(many_hdrs, "X-Pad-{i}: v\r\n");
+        }
+        many_hdrs.push_str("\r\n");
+        let r431 = send_raw(addr, &many_hdrs).await;
+        assert!(
+            r431.starts_with("HTTP/1.1 431"),
+            "expected 431 for >64 headers, got: {r431}"
+        );
+
+        // 3. /health returns 200 OK without auth, and /v1/metrics returns 200 OK with valid Bearer
+        let rhealth = send_raw(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        assert!(
+            rhealth.starts_with("HTTP/1.1 200"),
+            "expected 200, got: {rhealth}"
+        );
+        assert!(rhealth.contains("\"engine\":\"carnot\""));
+
+        let r200 = send_raw(
+            addr,
+            "GET /v1/metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r200.starts_with("HTTP/1.1 200"),
+            "expected 200, got: {r200}"
+        );
+        assert!(r200.contains("\"turns\":0"));
+
+        // 4. POST /v1/prompt with stream=true streams SSE frames with monotone `id:` and `hello from http`
+        let body = r#"{"prompt":"hi","stream":true}"#;
+        let prompt_req = format!(
+            "POST /v1/prompt HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let sse = send_raw(addr, &prompt_req).await;
+        assert!(
+            sse.starts_with("HTTP/1.1 200"),
+            "expected 200 SSE, got: {sse}"
+        );
+        assert!(sse.contains("text/event-stream"));
+        assert!(sse.contains("hello from http"));
+        assert!(sse.contains("id: "));
+
+        // 5. Invalid Content-Length -> 400 Bad Request, oversized Content-Length -> 413 Payload Too Large
+        let r400 = send_raw(
+            addr,
+            "POST /v1/steer HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\nContent-Type: application/json\r\nContent-Length: notanumber\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r400.starts_with("HTTP/1.1 400"),
+            "expected 400, got: {r400}"
+        );
+
+        let r413 = send_raw(
+            addr,
+            "POST /v1/steer HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\nContent-Type: application/json\r\nContent-Length: 99999999\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r413.starts_with("HTTP/1.1 413"),
+            "expected 413, got: {r413}"
+        );
+
+        // 6. Transfer-Encoding: chunked -> 501 Not Implemented (never silently empty!)
+        let r501 = send_raw(
+            addr,
+            "POST /v1/steer HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r501.starts_with("HTTP/1.1 501"),
+            "expected 501, got: {r501}"
+        );
+
+        // 7. POST /v1/undo returns 200 with reverted: null when stack is empty
+        let rundo = send_raw(
+            addr,
+            "POST /v1/undo HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-test-token\r\n\r\n",
+        )
+        .await;
+        assert!(
+            rundo.starts_with("HTTP/1.1 200"),
+            "expected 200, got: {rundo}"
+        );
+        assert!(rundo.contains("\"reverted\":null"));
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

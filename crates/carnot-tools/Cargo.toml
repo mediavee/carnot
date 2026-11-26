@@ -1,0 +1,47 @@
+[package]
+name = "carnot-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core filesystem, search, and shell tools for Carnot"
+
+[lints]
+workspace = true
+
+[features]
+default = ["syntax"]
+syntax = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-typescript",
+]
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+carnot-cas.workspace = true
+carnot-core.workspace = true
+carnot-sandbox.workspace = true
+globset.workspace = true
+ignore.workspace = true
+portable-pty.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

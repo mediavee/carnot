@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: Format, Clippy & Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check minimal builds (no tree-sitter / no default CLI features)
+        run: |
+          cargo check -p carnot-tools --no-default-features
+          cargo check -p carnot-cli --no-default-features
+      - name: Clippy default
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy all-features (core + all extensions)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rustdoc gate (zero warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --all-features --lib
+      - name: TypeScript SDK build & Node ESM import check
+        run: |
+          npx --yes -p typescript tsc -p sdk/ts/tsconfig.json
+          node -e "import('./sdk/ts/dist/index.js').then(m => { if (typeof m.CarnotHttpClient !== 'function') process.exit(1); })"
+
+  msrv:
+    name: MSRV (Rust 1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace under declared MSRV
+        run: cargo check --workspace --all-features --locked
+
+  windows:
+    name: Windows compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace on Windows
+        run: cargo check --workspace --all-features --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace test suite (default features)
+        run: cargo test --workspace
+      - name: Run workspace test suite (all features)
+        run: cargo test --workspace --all-features
+      - name: Prefix invariance, doctor & Python SDK RPC smoke test
+        run: |
+          cargo build --bin carnot --features all-ext
+          ./target/debug/carnot audit-prefix
+          ./target/debug/carnot doctor
+          python3 -m py_compile sdk/python/carnot_sdk.py
+          CARNOT_BIN="$PWD/target/debug/carnot" python3 -m unittest discover -s sdk/python -v

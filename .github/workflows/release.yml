@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Dry-run version label (e.g. 0.1.0-rc1; does not publish a GitHub Release)"
+        required: false
+        default: "0.1.0-dryrun"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify version, lint & test suite
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "${TAG_VER}" != "${CARGO_VER}" ]; then
+            echo "Tag version (${TAG_VER}) does not match Cargo.toml (${CARGO_VER})" >&2
+            exit 1
+          fi
+      - name: Check formatting, minimal builds, clippy & rustdoc
+        run: |
+          cargo fmt --all -- --check
+          cargo check -p carnot-tools --no-default-features
+          cargo check -p carnot-cli --no-default-features
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --lib
+      - name: Run full workspace test suite
+        run: cargo test --workspace --all-features --quiet
+
+  verify-windows:
+    name: Verify Windows compile
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace on Windows
+        run: cargo check --workspace --all-features --locked
+
+  prepare-release:
+    name: Create draft GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, verify-windows]
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Ensure draft release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Carnot ${GITHUB_REF_NAME}" \
+              --draft \
+              --generate-notes
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    if: |
+      always() &&
+      needs.verify.result == 'success' &&
+      needs.verify-windows.result == 'success' &&
+      (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped')
+    needs: [verify, verify-windows, prepare-release]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            cross_arm64: false
+            musl: false
+            native_test: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            cross_arm64: false
+            musl: true
+            native_test: true
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            cross_arm64: true
+            musl: false
+            native_test: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross_arm64: false
+            musl: false
+            native_test: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross_arm64: false
+            musl: false
+            native_test: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ARM64 Linux cross-compiler
+        if: matrix.cross_arm64
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build, smoke-test & package release archive
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="${{ github.event.inputs.version || '0.1.0-dryrun' }}"
+          fi
+          ARCHIVE="carnot-${VER}-${{ matrix.target }}.tar.gz"
+          cargo build --release --target ${{ matrix.target }} --bin carnot --features all-ext
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/carnot" staging/carnot
+          cp LICENSE-MIT LICENSE-APACHE README.md staging/
+          chmod 0755 staging/carnot
+          if [ "${{ matrix.native_test }}" = "true" ]; then
+            ./staging/carnot --version
+            ./staging/carnot audit-prefix
+          fi
+          tar -C staging -czf "${ARCHIVE}" carnot LICENSE-MIT LICENSE-APACHE README.md
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          fi
+          cat "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
+      - name: Upload archive directly to draft GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${ARCHIVE}" "${ARCHIVE}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  publish:
+    name: Generate SHA256SUMS & publish Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Assemble SHA256SUMS & publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p sums
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.sha256' \
+            --dir sums
+          LC_ALL=C sort -k2 sums/*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "${GITHUB_REF_NAME}" SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --latest

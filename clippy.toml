@@ -1,0 +1,6 @@
+# BeautifulRust-aligned Clippy configuration for Carnot.
+#
+# In tests, unwrap/expect/printing are standard assertion mechanisms.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
