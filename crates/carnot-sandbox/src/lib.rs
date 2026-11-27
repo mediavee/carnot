@@ -988,14 +988,33 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn blocks_symlink_write_escape_to_dot_git_and_outside_workspace() {
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+
         let sb = detect_sandbox_backend();
         if !sb.available || sb.backend == "landlock" {
             return;
         }
-        let base = std::env::temp_dir().join(format!("carnot-sb-escape-{}", uuid::Uuid::new_v4()));
-        let ws = base.join("ws");
-        let outside = base.join("outside.txt");
+        let id = uuid::Uuid::new_v4();
+        let ws_base = std::env::temp_dir().join(format!("carnot-sb-escape-ws-{id}"));
+        let ws = ws_base.join("ws");
+        // Place the outside target outside `/tmp` (since Linux `bwrap` mounts a writable `--tmpfs /tmp`)
+        // and outside `ws` so both Seatbelt and `bwrap` must block writes through the symlink.
+        let outside_base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()))
+            .join(format!(".carnot-sb-escape-out-{id}"));
+        let outside = outside_base.join("outside.txt");
+        let _cleanup = Cleanup(ws_base.clone(), outside_base.clone());
+
         std::fs::create_dir_all(&ws).expect("ws");
+        std::fs::create_dir_all(&outside_base).expect("outside_base");
         std::fs::write(&outside, "original").expect("outside");
         let init = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1031,6 +1050,5 @@ mod tests {
             "original",
             "outside file must remain untouched"
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 }
