@@ -88,7 +88,7 @@ ignore = "0.4"
 portable-pty = "0.9"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 regex = "1.13"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2", "gzip", "deflate", "brotli"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2", "gzip"] }
 rustix = { version = "1.1", default-features = false, features = ["process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -131,7 +131,7 @@ carnot-ext-codemode = { version = "0.1.0", path = "extensions/carnot-ext-codemod
 carnot-ext-goal = { version = "0.1.0", path = "extensions/carnot-ext-goal" }
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
