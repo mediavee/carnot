@@ -11,12 +11,18 @@ description = "ACP, JSON-RPC stdio, HTTP/SSE, and host-extension server transpor
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 carnot-agent.workspace = true
 carnot-ai.workspace = true
 carnot-core.workspace = true
 carnot-ext.workspace = true
 carnot-session.workspace = true
 carnot-tools.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
