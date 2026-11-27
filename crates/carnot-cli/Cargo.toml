@@ -18,7 +18,7 @@ name = "carnot"
 path = "src/main.rs"
 
 [features]
-default = ["tui", "all-ext"]
+default = ["tui", "default-ext"]
 tui = ["dep:carnot-tui"]
 ext-web = ["carnot/ext-web"]
 ext-lsp = ["carnot/ext-lsp"]
@@ -28,15 +28,18 @@ ext-claude-plugins = ["carnot/ext-claude-plugins"]
 ext-memory = ["carnot/ext-memory"]
 ext-codemode = ["carnot/ext-codemode"]
 ext-goal = ["carnot/ext-goal"]
-all-ext = [
+default-ext = [
     "ext-web",
     "ext-lsp",
     "ext-subagent",
     "ext-hooks",
     "ext-claude-plugins",
     "ext-memory",
-    "ext-codemode",
     "ext-goal",
+]
+all-ext = [
+    "default-ext",
+    "ext-codemode",
 ]
 
 [dependencies]

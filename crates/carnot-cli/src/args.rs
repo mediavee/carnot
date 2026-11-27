@@ -227,13 +227,11 @@ pub(crate) struct Cli {
     #[arg(long = "memory-dir")]
     pub(crate) memory_dir: Option<PathBuf>,
 
-    /// Enable isolated `QuickJS` `CodeMode` tool-orchestration extension (enabled by default in standalone `carnot` profile)
-    #[cfg(feature = "ext-codemode")]
+    /// Enable isolated `QuickJS` `CodeMode` tool-orchestration extension (requires `--features ext-codemode` / `all-ext`)
     #[arg(long)]
     pub(crate) codemode: bool,
 
     /// Disable isolated `QuickJS` `CodeMode` extension
-    #[cfg(feature = "ext-codemode")]
     #[arg(long = "no-codemode")]
     pub(crate) no_codemode: bool,
 
@@ -586,7 +584,6 @@ impl Cli {
                 self.memory_dir.clone_from(&cfg.extensions.memory_dir);
             }
         }
-        #[cfg(feature = "ext-codemode")]
         match cfg.extensions.codemode {
             Some(false) if !self.codemode => self.no_codemode = true,
             Some(true) if !self.no_codemode => self.codemode = true,

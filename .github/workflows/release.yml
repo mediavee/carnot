@@ -151,7 +151,7 @@ jobs:
             VER="${{ github.event.inputs.version || '0.1.0-dryrun' }}"
           fi
           ARCHIVE="carnot-${VER}-${{ matrix.target }}.tar.gz"
-          cargo build --release --target ${{ matrix.target }} --bin carnot --features all-ext
+          cargo build --release --target ${{ matrix.target }} --bin carnot
           mkdir -p staging
           cp "target/${{ matrix.target }}/release/carnot" staging/carnot
           cp LICENSE-MIT LICENSE-APACHE README.md staging/

@@ -166,6 +166,13 @@ pub(crate) async fn build_agent_full(
         cm_cfg.defer_loading = !cli.codemode && !bash_excluded && !has_mcp;
         b = b.codemode_config(cm_cfg);
     }
+    #[cfg(not(feature = "ext-codemode"))]
+    if cli.codemode && !cli.no_codemode {
+        return Err(carnot::CarnotError::Extension {
+            extension: "codemode".into(),
+            message: "this `carnot` binary was compiled without the optional `ext-codemode` (QuickJS) feature; rebuild with `--features ext-codemode` or `--features all-ext`".into(),
+        });
+    }
     #[cfg(feature = "ext-goal")]
     {
         let mut gc = carnot::GoalConfig::default();
