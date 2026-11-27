@@ -246,7 +246,7 @@ fn format_hits_markdown(query: &str, backend: SearchBackend, hits: &[SearchHit])
 
 #[derive(Debug)]
 pub struct WebSearchTool {
-    client: reqwest::Client,
+    client: std::sync::OnceLock<reqwest::Client>,
     cas: Arc<CasStore>,
     cas_enabled: bool,
     spill_threshold: usize,
@@ -281,7 +281,7 @@ impl WebSearchTool {
         blocked_domains: Vec<String>,
     ) -> Result<Self> {
         Ok(Self {
-            client: build_api_client()?,
+            client: std::sync::OnceLock::new(),
             cas,
             cas_enabled,
             spill_threshold,
@@ -289,6 +289,17 @@ impl WebSearchTool {
             allowed_domains,
             blocked_domains,
         })
+    }
+
+    fn client(&self) -> std::result::Result<&reqwest::Client, String> {
+        if let Some(c) = self.client.get() {
+            return Ok(c);
+        }
+        let built = build_api_client().map_err(|e| e.to_string())?;
+        let _ = self.client.set(built);
+        self.client
+            .get()
+            .ok_or_else(|| "failed to initialize WebSearch HTTP client".into())
     }
 
     fn resolve_backend(
@@ -386,6 +397,7 @@ impl Tool for WebSearchTool {
             };
 
             let req_fut = async {
+                let client = self.client()?;
                 let resp = match backend {
                     SearchBackend::Searxng => {
                         let base = cred.trim_end_matches('/');
@@ -399,14 +411,13 @@ impl Tool for WebSearchTool {
                             &[("q", query), ("format", "json")],
                         )
                         .map_err(|e| format!("Invalid SearXNG URL: {e}"))?;
-                        self.client
+                        client
                             .get(url)
                             .send()
                             .await
                             .map_err(|e| format!("SearXNG request failed: {e}"))?
                     }
-                    SearchBackend::Exa => self
-                        .client
+                    SearchBackend::Exa => client
                         .post("https://api.exa.ai/search")
                         .header("x-api-key", &cred)
                         .json(&json!({
@@ -417,8 +428,7 @@ impl Tool for WebSearchTool {
                         .send()
                         .await
                         .map_err(|e| format!("Exa request failed: {e}"))?,
-                    SearchBackend::Tavily => self
-                        .client
+                    SearchBackend::Tavily => client
                         .post("https://api.tavily.com/search")
                         .json(&json!({
                             "api_key": cred,
@@ -436,7 +446,7 @@ impl Tool for WebSearchTool {
                             &[("q", query), ("count", count.as_str())],
                         )
                         .map_err(|e| format!("Invalid Brave URL: {e}"))?;
-                        self.client
+                        client
                             .get(url)
                             .header("X-Subscription-Token", &cred)
                             .header("Accept", "application/json")

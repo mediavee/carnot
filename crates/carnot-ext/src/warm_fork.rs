@@ -382,12 +382,50 @@ impl IsolatedForkWorktree {
         Ok(LandOutcome::Applied { stat: final_stat })
     }
 
+    /// Fast check whether any orphaned `wt-*` fork worktree directories exist on disk.
+    /// Returns `false` in microseconds with zero subprocesses when `~/.carnot/forks` is absent or empty.
+    pub fn has_stale_fork_candidates() -> bool {
+        let Ok(base) = forks_base_dir() else {
+            return false;
+        };
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with("wt-"))
+        })
+    }
+
     /// Removes orphaned fork worktrees left behind after an unclean process termination (`SIGKILL`),
     /// skipping any fork whose recorded owner PID is still alive. Returns the count removed.
     pub fn prune_stale_forks(parent_workspace: &Path) -> usize {
         let Ok(base) = forks_base_dir() else {
             return 0;
         };
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return 0;
+        };
+        let stale: Vec<(PathBuf, PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let fork_id = name.to_str()?.strip_prefix("wt-")?;
+                let wt_path = entry.path();
+                let target_path = base.join(format!("target-{fork_id}"));
+                let pid_path = target_path.join(".carnot-owner-pid");
+                let owner_alive = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .is_some_and(is_process_alive);
+                (!owner_alive).then_some((wt_path, target_path))
+            })
+            .collect();
+        if stale.is_empty() {
+            return 0;
+        }
         let repo_root = carnot_sandbox::host_safe_git_command(parent_workspace)
             .args(["rev-parse", "--show-toplevel"])
             .output()
@@ -395,28 +433,8 @@ impl IsolatedForkWorktree {
             .filter(|o| o.status.success())
             .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
 
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            return 0;
-        };
         let mut pruned = 0usize;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            let Some(fork_id) = name_str.strip_prefix("wt-") else {
-                continue;
-            };
-            let wt_path = entry.path();
-            let target_path = base.join(format!("target-{fork_id}"));
-            let pid_path = target_path.join(".carnot-owner-pid");
-            let owner_alive = std::fs::read_to_string(&pid_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .is_some_and(is_process_alive);
-            if owner_alive {
-                continue;
-            }
+        for (wt_path, target_path) in stale {
             if let Some(ref rr) = repo_root {
                 let _ = carnot_sandbox::host_safe_git_command(rr)
                     .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])

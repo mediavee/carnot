@@ -87,6 +87,9 @@ pub(crate) async fn build_agent_full(
         .ask_user(interactive_surface)
         .trust_workspace_mcp(cli.trust_workspace_mcp)
         .trust_workspace_extensions(cli.trust_workspace_extensions);
+    if let Some(reg) = reg_opt {
+        b = b.provider_registry(reg);
+    }
     if let Some(ref sd) = cli.session_dir {
         b = b.session_dir(sd.clone());
     }

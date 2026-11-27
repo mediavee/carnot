@@ -123,6 +123,7 @@ pub struct CarnotBuilder {
     config: CarnotConfig,
     explicit_model: bool,
     provider: Option<Arc<dyn Provider>>,
+    provider_registry: Option<ProviderRegistry>,
     extra_adapters: Vec<Arc<dyn ApiAdapter>>,
     extra_modules: Vec<Arc<dyn Module>>,
     extra_tools: Vec<Arc<dyn Tool>>,
@@ -158,6 +159,7 @@ impl CarnotBuilder {
             config: CarnotConfig::new(workspace_root),
             explicit_model: false,
             provider: None,
+            provider_registry: None,
             extra_adapters: Vec::new(),
             extra_modules: Vec::new(),
             extra_tools: Vec::new(),
@@ -515,6 +517,12 @@ impl CarnotBuilder {
         self
     }
 
+    /// Reuses an already-loaded `ProviderRegistry` so callers avoid loading the layered catalog twice.
+    pub fn provider_registry(mut self, registry: ProviderRegistry) -> Self {
+        self.provider_registry = Some(registry);
+        self
+    }
+
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.extra_tools.push(tool);
         self
@@ -587,7 +595,10 @@ impl CarnotBuilder {
     }
 
     fn build_with_mcp(mut self, cas: &Arc<CasStore>, mcp: &McpManager) -> Result<Arc<Agent>> {
-        let mut registry = ProviderRegistry::load_default(&self.config.provider_config_paths)?;
+        let mut registry = match self.provider_registry.take() {
+            Some(reg) => reg,
+            None => ProviderRegistry::load_default(&self.config.provider_config_paths)?,
+        };
         for adapter in self.extra_adapters {
             registry.register_adapter(adapter);
         }
@@ -727,7 +738,8 @@ impl CarnotBuilder {
                     Arc::clone(&provider),
                     inherited_for_child,
                 )
-                .with_provider_configs(self.config.provider_config_paths.clone()),
+                .with_provider_configs(self.config.provider_config_paths.clone())
+                .with_provider_catalog(registry.catalog_arc()),
             );
             modules.push(Arc::clone(&sm) as Arc<dyn Module>);
             Some(sm)

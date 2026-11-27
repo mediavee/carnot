@@ -269,7 +269,7 @@ impl Module for WebModule {
 
 #[derive(Debug)]
 pub struct WebFetchTool {
-    client: reqwest::Client,
+    client: std::sync::OnceLock<reqwest::Client>,
     cas: Arc<CasStore>,
     cas_enabled: bool,
     spill_threshold: usize,
@@ -316,6 +316,17 @@ impl WebFetchTool {
             allowed_domains,
             blocked_domains,
         })
+    }
+
+    fn client(&self) -> std::result::Result<&reqwest::Client, String> {
+        if let Some(c) = self.client.get() {
+            return Ok(c);
+        }
+        let built = build_ssrf_safe_client(FETCH_TIMEOUT_SECS)?;
+        let _ = self.client.set(built);
+        self.client
+            .get()
+            .ok_or_else(|| "failed to initialize WebFetch HTTP client".into())
     }
 
     fn check_domain(&self, url: &url::Url) -> std::result::Result<(), String> {
@@ -396,10 +407,10 @@ impl Tool for WebFetchTool {
             };
 
             let fetch_fut = async {
+                let client = self.client()?;
                 let mut resp = None;
                 for hop in 0..=MAX_REDIRECTS {
-                    let r = self
-                        .client
+                    let r = client
                         .get(current.clone())
                         .header(
                             "User-Agent",

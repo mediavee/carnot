@@ -699,15 +699,17 @@ pub struct ProviderSummary {
 }
 
 impl ProviderCatalog {
-    /// Loads the embedded default data catalog (`catalog/providers.json`), parsed once per process.
-    pub fn embedded() -> Result<Self> {
-        static EMBEDDED: std::sync::LazyLock<std::result::Result<ProviderCatalog, String>> =
+    /// Loads the embedded default data catalog (`catalog/providers.json`), parsed once per process
+    /// and shared via `Arc` with zero cloning on repeated calls.
+    pub fn embedded_arc() -> Result<Arc<Self>> {
+        static EMBEDDED: std::sync::LazyLock<std::result::Result<Arc<ProviderCatalog>, String>> =
             std::sync::LazyLock::new(|| {
                 serde_json::from_str(EMBEDDED_PROVIDERS_JSON)
+                    .map(Arc::new)
                     .map_err(|e| format!("failed to parse embedded providers.json: {e}"))
             });
         match &*EMBEDDED {
-            Ok(cat) => Ok(cat.clone()),
+            Ok(cat) => Ok(Arc::clone(cat)),
             Err(msg) => Err(CarnotError::Provider {
                 provider: "catalog".into(),
                 message: msg.clone(),
@@ -717,20 +719,35 @@ impl ProviderCatalog {
         }
     }
 
-    /// Loads embedded defaults, overlays `~/.carnot/providers.json` if present, then overlays
-    /// any explicit `extra_paths` (e.g. `--provider-config`).
-    pub fn load_layered(extra_paths: &[PathBuf]) -> Result<Self> {
-        let mut catalog = Self::embedded()?;
-        if let Some(home) = std::env::var_os("HOME") {
-            let user_path = PathBuf::from(home).join(".carnot").join("providers.json");
-            if user_path.is_file() {
-                catalog.merge_file(&user_path)?;
-            }
+    /// Loads the embedded default data catalog (`catalog/providers.json`), parsed once per process.
+    pub fn embedded() -> Result<Self> {
+        Ok((*Self::embedded_arc()?).clone())
+    }
+
+    /// Loads embedded defaults as a shared `Arc`, avoiding any catalog clone when neither
+    /// `~/.carnot/providers.json` nor `extra_paths` overlay it.
+    pub fn load_layered_arc(extra_paths: &[PathBuf]) -> Result<Arc<Self>> {
+        let user_path = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".carnot").join("providers.json"))
+            .filter(|p| p.is_file());
+        if user_path.is_none() && extra_paths.is_empty() {
+            return Self::embedded_arc();
+        }
+        let mut catalog = (*Self::embedded_arc()?).clone();
+        if let Some(p) = user_path {
+            catalog.merge_file(&p)?;
         }
         for p in extra_paths {
             catalog.merge_file(p)?;
         }
-        Ok(catalog)
+        Ok(Arc::new(catalog))
+    }
+
+    /// Loads embedded defaults, overlays `~/.carnot/providers.json` if present, then overlays
+    /// any explicit `extra_paths` (e.g. `--provider-config`).
+    pub fn load_layered(extra_paths: &[PathBuf]) -> Result<Self> {
+        let arc = Self::load_layered_arc(extra_paths)?;
+        Ok(Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     pub fn merge_file(&mut self, path: &Path) -> Result<()> {

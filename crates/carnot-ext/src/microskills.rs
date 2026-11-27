@@ -385,31 +385,119 @@ fn walk_overview(
     }
 }
 
+fn parse_git_head(head_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(head_path).ok()?;
+    let trimmed = raw.trim();
+    if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+        if !branch.is_empty() {
+            return Some(branch.to_string());
+        }
+    } else if !trimmed.is_empty() {
+        return Some(trimmed.chars().take(12).collect());
+    }
+    None
+}
+
+/// Zero-subprocess git branch probe: walks ancestors for `.git` (supporting normal repos,
+/// nested subdirectories, and worktree/submodule `.git` files with `gitdir: ...`).
 fn fast_git_branch(root: &Path) -> Option<String> {
-    let head_path = root.join(".git").join("HEAD");
-    if let Ok(raw) = fs::read_to_string(&head_path) {
-        let trimmed = raw.trim();
-        if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
-            if !branch.is_empty() {
-                return Some(branch.to_string());
+    let mut cur = Some(root);
+    while let Some(dir) = cur {
+        let dot_git = dir.join(".git");
+        if let Ok(meta) = fs::metadata(&dot_git) {
+            if meta.is_dir() {
+                return parse_git_head(&dot_git.join("HEAD"));
             }
-        } else if !trimmed.is_empty() {
-            return Some(trimmed.chars().take(12).collect());
+            if meta.is_file() {
+                let raw = fs::read_to_string(&dot_git).ok()?;
+                let gitdir_str = raw.trim().strip_prefix("gitdir:")?.trim();
+                if gitdir_str.is_empty() {
+                    return None;
+                }
+                let gitdir = Path::new(gitdir_str);
+                let resolved = if gitdir.is_absolute() {
+                    gitdir.to_path_buf()
+                } else {
+                    dir.join(gitdir)
+                };
+                return parse_git_head(&resolved.join("HEAD"));
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+fn collect_workspace_facts(
+    root: &Path,
+    extra_skills_dirs: &[PathBuf],
+    load_context_files: bool,
+    load_skills: bool,
+) -> String {
+    let mut facts: Vec<String> = Vec::new();
+    facts.push(format!("cwd: {}", root.display()));
+
+    let userland = if cfg!(target_os = "macos") {
+        "macOS (BSD userland: `sed -i ''`, no GNU-only flags)"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "linux") {
+        "Linux (GNU userland)"
+    } else {
+        std::env::consts::OS
+    };
+    facts.push(format!("platform: {userland}"));
+
+    let (overview, has_py_file) = build_project_overview(root);
+
+    if root.join("Cargo.toml").exists() && has_binary_on_path("cargo") {
+        facts.push("toolchain: rust/cargo (`cargo check`, `cargo test`)".into());
+    }
+    if root.join("package.json").exists() {
+        if root.join("bun.lock").exists() && has_binary_on_path("bun") {
+            facts.push("toolchain: bun (`bun test`)".into());
+        } else if root.join("pnpm-lock.yaml").exists() && has_binary_on_path("pnpm") {
+            facts.push("toolchain: pnpm (`pnpm test`)".into());
+        } else if has_binary_on_path("node") {
+            facts.push("toolchain: node (`node --test`, `npm test`)".into());
         }
     }
-    let out = carnot_sandbox::host_safe_git_command(root)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    if (has_py_file
+        || root.join("pyproject.toml").exists()
+        || root.join("pytest.ini").exists()
+        || root.join("setup.py").exists()
+        || root.join("requirements.txt").exists())
+        && has_binary_on_path("python3")
+    {
+        let cmd = if has_binary_on_path("pytest") {
+            "pytest` or `python3 -m unittest"
+        } else {
+            "python3 -m unittest"
+        };
+        facts.push(format!("toolchain: python3 (`{cmd}`)"));
     }
-    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if branch.is_empty() {
-        None
-    } else {
-        Some(branch)
+    if root.join("go.mod").exists() && has_binary_on_path("go") {
+        facts.push("toolchain: go (`go test ./...`)".into());
     }
+
+    if let Some(branch) = fast_git_branch(root) {
+        facts.push(format!("git_branch: {branch}"));
+    }
+
+    let mut out = format!("[workspace-facts]\n{}", facts.join("\n"));
+    if let Some(files_map) = overview {
+        out.push_str("\nfiles:\n");
+        out.push_str(&files_map);
+    }
+    if load_context_files && let Some(instr) = load_repo_instructions(root) {
+        out.push_str("\n\n");
+        out.push_str(&instr);
+    }
+    if load_skills && let Some(skills) = load_agent_skills(root, extra_skills_dirs) {
+        out.push_str("\n\n");
+        out.push_str(&skills);
+    }
+    out
 }
 
 impl Module for ExecMicroSkillsModule {
@@ -423,75 +511,26 @@ impl Module for ExecMicroSkillsModule {
         let load_context_files = config.load_context_files;
         let load_skills = config.load_skills;
         Box::pin(async move {
-            let res = tokio::task::spawn_blocking(move || {
-                let mut facts: Vec<String> = Vec::new();
-                facts.push(format!("cwd: {}", root.display()));
-
-                let userland = if cfg!(target_os = "macos") {
-                    "macOS (BSD userland: `sed -i ''`, no GNU-only flags)"
-                } else if cfg!(target_os = "windows") {
-                    "Windows"
-                } else if cfg!(target_os = "linux") {
-                    "Linux (GNU userland)"
-                } else {
-                    std::env::consts::OS
-                };
-                facts.push(format!("platform: {userland}"));
-
-                let (overview, has_py_file) = build_project_overview(&root);
-
-                if root.join("Cargo.toml").exists() && has_binary_on_path("cargo") {
-                    facts.push("toolchain: rust/cargo (`cargo check`, `cargo test`)".into());
-                }
-                if root.join("package.json").exists() {
-                    if root.join("bun.lock").exists() && has_binary_on_path("bun") {
-                        facts.push("toolchain: bun (`bun test`)".into());
-                    } else if root.join("pnpm-lock.yaml").exists() && has_binary_on_path("pnpm") {
-                        facts.push("toolchain: pnpm (`pnpm test`)".into());
-                    } else if has_binary_on_path("node") {
-                        facts.push("toolchain: node (`node --test`, `npm test`)".into());
-                    }
-                }
-                if (has_py_file
-                    || root.join("pyproject.toml").exists()
-                    || root.join("pytest.ini").exists()
-                    || root.join("setup.py").exists()
-                    || root.join("requirements.txt").exists())
-                    && has_binary_on_path("python3")
-                {
-                    let cmd = if has_binary_on_path("pytest") {
-                        "pytest` or `python3 -m unittest"
-                    } else {
-                        "python3 -m unittest"
-                    };
-                    facts.push(format!("toolchain: python3 (`{cmd}`)"));
-                }
-                if root.join("go.mod").exists() && has_binary_on_path("go") {
-                    facts.push("toolchain: go (`go test ./...`)".into());
-                }
-
-                // Fast zero-subprocess git branch probe (reads `.git/HEAD` directly in ~0.01ms; falls back safely for worktrees)
-                if let Some(branch) = fast_git_branch(&root) {
-                    facts.push(format!("git_branch: {branch}"));
-                }
-
-                let mut out = format!("[workspace-facts]\n{}", facts.join("\n"));
-                if let Some(files_map) = overview {
-                    out.push_str("\nfiles:\n");
-                    out.push_str(&files_map);
-                }
-                if load_context_files && let Some(instr) = load_repo_instructions(&root) {
-                    out.push_str("\n\n");
-                    out.push_str(&instr);
-                }
-                if load_skills && let Some(skills) = load_agent_skills(&root, &extra_skills_dirs) {
-                    out.push_str("\n\n");
-                    out.push_str(&skills);
-                }
-                out
-            })
-            .await
-            .unwrap_or_default();
+            let is_multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                matches!(
+                    h.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                )
+            });
+            let res = if is_multi_thread {
+                tokio::task::spawn_blocking(move || {
+                    collect_workspace_facts(
+                        &root,
+                        &extra_skills_dirs,
+                        load_context_files,
+                        load_skills,
+                    )
+                })
+                .await
+                .unwrap_or_default()
+            } else {
+                collect_workspace_facts(&root, &extra_skills_dirs, load_context_files, load_skills)
+            };
 
             if res.is_empty() {
                 Ok(None)
@@ -537,5 +576,53 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&extra_root);
+    }
+
+    #[test]
+    fn fast_git_branch_handles_repo_subdir_worktree_and_nongit() {
+        let base = std::env::temp_dir().join(format!("carnot-git-probe-{}", uuid::Uuid::new_v4()));
+        let repo = base.join("repo");
+        let subdir = repo.join("crates/app");
+        fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+        fs::create_dir_all(&subdir).expect("mkdir subdir");
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+
+        assert_eq!(
+            fast_git_branch(&repo).as_deref(),
+            Some("main"),
+            "normal repo root should resolve branch"
+        );
+        assert_eq!(
+            fast_git_branch(&subdir).as_deref(),
+            Some("main"),
+            "nested subdirectory should resolve parent repo branch"
+        );
+
+        let wt_gitdir = base.join("gitdir-wt");
+        let wt_dir = base.join("worktree");
+        fs::create_dir_all(&wt_gitdir).expect("mkdir wt gitdir");
+        fs::create_dir_all(&wt_dir).expect("mkdir wt");
+        fs::write(wt_gitdir.join("HEAD"), "ref: refs/heads/feat/perf\n").expect("write wt HEAD");
+        fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .expect("write .git file");
+
+        assert_eq!(
+            fast_git_branch(&wt_dir).as_deref(),
+            Some("feat/perf"),
+            "worktree .git file should resolve branch without spawning git"
+        );
+
+        let nongit = base.join("plain");
+        fs::create_dir_all(&nongit).expect("mkdir plain");
+        assert_eq!(
+            fast_git_branch(&nongit),
+            None,
+            "non-git directory should return None"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

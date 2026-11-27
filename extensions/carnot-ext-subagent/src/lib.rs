@@ -33,7 +33,7 @@ use self::fleet::Fleet;
 use self::send_message::SendMessageTool;
 use self::subagent_tool::{SubagentTool, non_empty_jobs, non_empty_str};
 use carnot_agent::Agent;
-use carnot_ai::{Provider, registry::ProviderRegistry};
+use carnot_ai::{Provider, catalog::ProviderCatalog, registry::ProviderRegistry};
 use carnot_core::{CacheTtl, CarnotConfig, Result};
 use carnot_ext::{
     BoundaryAction, BoxFuture as ExtFuture, Module, ToolGateDecision, TurnBoundarySnapshot,
@@ -87,6 +87,7 @@ pub struct SubagentModule {
     worker_name: Option<String>,
     provider_name: String,
     provider_configs: Vec<PathBuf>,
+    provider_catalog: Option<Arc<ProviderCatalog>>,
     parent_agent: Arc<OnceLock<Weak<Agent>>>,
     fleet: FleetRef,
     budget: Arc<FleetBudget>,
@@ -100,7 +101,7 @@ impl SubagentModule {
         provider: Arc<dyn Provider>,
         extra_modules: Vec<Arc<dyn Module>>,
     ) -> Self {
-        Self::with_configs(config, provider, Vec::new(), extra_modules)
+        Self::with_configs(config, provider, Vec::new(), None, extra_modules)
     }
 
     #[must_use]
@@ -109,14 +110,22 @@ impl SubagentModule {
             self.subagent_tool.parent_config.clone(),
             Arc::clone(&self.subagent_tool.provider),
             provider_configs,
+            self.provider_catalog,
             self.subagent_tool.extra_modules.clone(),
         )
+    }
+
+    #[must_use]
+    pub fn with_provider_catalog(mut self, catalog: Arc<ProviderCatalog>) -> Self {
+        self.provider_catalog = Some(catalog);
+        self
     }
 
     fn with_configs(
         config: CarnotConfig,
         provider: Arc<dyn Provider>,
         provider_configs: Vec<PathBuf>,
+        provider_catalog: Option<Arc<ProviderCatalog>>,
         extra_modules: Vec<Arc<dyn Module>>,
     ) -> Self {
         let depth = config.subagent_depth;
@@ -145,6 +154,7 @@ impl SubagentModule {
             worker_name: None,
             provider_name,
             provider_configs,
+            provider_catalog,
             parent_agent,
             fleet: fleet_ref,
             budget,
@@ -192,6 +202,7 @@ impl SubagentModule {
             worker_name: Some(worker_name),
             provider_name,
             provider_configs,
+            provider_catalog: None,
             parent_agent,
             fleet: fleet_ref,
             budget,
@@ -238,9 +249,10 @@ impl Module for SubagentModule {
         let depth = self.depth;
         let is_faux = self.provider_name == "faux";
         let configs = self.provider_configs.clone();
+        let cached_catalog = self.provider_catalog.clone();
         let ws_root = cfg.workspace_root.clone();
         Box::pin(async move {
-            if depth == 0 && !is_faux {
+            if depth == 0 && !is_faux && IsolatedForkWorktree::has_stale_fork_candidates() {
                 // Opportunistically prune any orphaned fork worktrees from a prior SIGKILL'd run
                 // on a blocking thread (strictly PID-safe: never touches live Carnot instances).
                 tokio::task::spawn_blocking(move || {
@@ -250,8 +262,12 @@ impl Module for SubagentModule {
             if depth > 0 || is_faux {
                 return Ok(None);
             }
-            let Ok(reg) = ProviderRegistry::load_default(&configs) else {
-                return Ok(None);
+            let reg = match cached_catalog {
+                Some(cat) => ProviderRegistry::from_catalog_arc(cat),
+                None => match ProviderRegistry::load_default(&configs) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                },
             };
             let models = reg.available_models(true);
             if models.is_empty() {

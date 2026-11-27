@@ -57,7 +57,7 @@ pub trait ApiAdapter: Send + Sync + std::fmt::Debug {
 /// Unified registry mapping `provider_name` (via data catalog) -> `api_id` -> `ApiAdapter` -> `Provider`.
 #[derive(Debug)]
 pub struct ProviderRegistry {
-    catalog: ProviderCatalog,
+    catalog: Arc<ProviderCatalog>,
     adapters: BTreeMap<String, Arc<dyn ApiAdapter>>,
 }
 
@@ -65,11 +65,15 @@ impl ProviderRegistry {
     /// Builds a registry populated with all built-in wire protocol adapters and the layered
     /// data catalog (embedded defaults + `~/.carnot/providers.json` + explicit `extra_configs`).
     pub fn load_default(extra_configs: &[PathBuf]) -> Result<Self> {
-        let catalog = ProviderCatalog::load_layered(extra_configs)?;
-        Ok(Self::from_catalog(catalog))
+        let catalog = ProviderCatalog::load_layered_arc(extra_configs)?;
+        Ok(Self::from_catalog_arc(catalog))
     }
 
     pub fn from_catalog(catalog: ProviderCatalog) -> Self {
+        Self::from_catalog_arc(Arc::new(catalog))
+    }
+
+    pub fn from_catalog_arc(catalog: Arc<ProviderCatalog>) -> Self {
         let mut reg = Self {
             catalog,
             adapters: BTreeMap::new(),
@@ -91,6 +95,10 @@ impl ProviderRegistry {
 
     pub fn catalog(&self) -> &ProviderCatalog {
         &self.catalog
+    }
+
+    pub fn catalog_arc(&self) -> Arc<ProviderCatalog> {
+        Arc::clone(&self.catalog)
     }
 
     pub fn registered_apis(&self) -> Vec<String> {
@@ -226,6 +234,49 @@ impl ProviderRegistry {
         } else {
             (None, trimmed)
         };
+
+        // Fast O(log N) exact lookup in the catalog before probing auth/env across all providers.
+        if let Some(entry) = cat.models.get(raw_model)
+            && entry.label.is_some()
+            && let Some(prov_id) = entry.provider.as_deref()
+            && let Some((canon_prov, _)) = cat.find_provider(prov_id)
+        {
+            match wanted_prov.as_deref() {
+                Some(wp) if wp == canon_prov => {
+                    return Some((canon_prov.to_string(), raw_model.to_string()));
+                }
+                None => {
+                    return Some((canon_prov.to_string(), raw_model.to_string()));
+                }
+                Some(_) => {}
+            }
+        }
+        // Fast path for explicit provider + custom/unlisted model ID matching that provider's default_model.
+        if let Some(ref wp) = wanted_prov
+            && let Some((_, prov_entry)) = cat.find_provider(wp)
+            && prov_entry.default_model.as_deref() == Some(raw_model)
+        {
+            return Some((wp.clone(), raw_model.to_string()));
+        }
+        // Avoid probing auth/env across all providers when `raw_model` matches no catalog model
+        // (exact or family alias) and no provider's `default_model`.
+        let any_candidate = cat
+            .models
+            .keys()
+            .any(|id| id == raw_model || family_version_tuple(id, raw_model).is_some())
+            || cat
+                .providers
+                .values()
+                .filter_map(|p| p.default_model.as_deref())
+                .any(|dm| dm == raw_model || family_version_tuple(dm, raw_model).is_some());
+        if !any_candidate {
+            if let Some(wp) = wanted_prov {
+                return Some((wp, raw_model.to_string()));
+            }
+            return cat
+                .provider_for_model(raw_model)
+                .map(|p| (p.to_string(), raw_model.to_string()));
+        }
 
         let all_models = self.available_models(false);
         // 1. Exact (provider, id) match
