@@ -473,7 +473,8 @@ impl Tool for LspQueryTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "LspQuery".into(),
-            description: "Query the workspace language server for semantic `definition`, `references`, `hover`, or `diagnostics` at a file/line/character.".into(),
+            description: "Query workspace LSP for definition, references, hover, or diagnostics."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -481,8 +482,8 @@ impl Tool for LspQueryTool {
                 "properties": {
                     "action": { "type": "string", "enum": ["definition", "references", "hover", "diagnostics"] },
                     "file_path": { "type": "string" },
-                    "line": { "type": "integer", "description": "1-based line number (required for definition/references/hover)" },
-                    "character": { "type": "integer", "description": "0-based column character offset (default 0)" }
+                    "line": { "type": "integer", "description": "1-based line" },
+                    "character": { "type": "integer", "description": "0-based column" }
                 }
             }),
             defer_loading: true,

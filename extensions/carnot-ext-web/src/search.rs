@@ -351,14 +351,14 @@ impl Tool for WebSearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "WebSearch".into(),
-            description: "Search the web via configured API (SearXNG, Exa, Tavily, or Brave) and return concise ranked links + snippets.".into(),
+            description: "Search the web via SearXNG, Exa, Tavily, or Brave.".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["query"],
                 "properties": {
-                    "query": { "type": "string", "description": "Search query" },
-                    "max_results": { "type": "integer", "description": "Max results (1..10, default 5)" },
+                    "query": { "type": "string" },
+                    "max_results": { "type": "integer", "description": "1..10 (default 5)" },
                     "provider": { "type": "string", "enum": ["searxng", "exa", "tavily", "brave"] }
                 }
             }),

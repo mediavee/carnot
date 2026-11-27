@@ -303,12 +303,8 @@ impl WebFetchTool {
         allowed_domains: Vec<String>,
         blocked_domains: Vec<String>,
     ) -> Result<Self> {
-        let client = build_ssrf_safe_client(FETCH_TIMEOUT_SECS).map_err(|e| CarnotError::Tool {
-            tool: "WebFetch".into(),
-            message: e,
-        })?;
         Ok(Self {
-            client,
+            client: std::sync::OnceLock::new(),
             cas,
             cas_enabled,
             spill_threshold,
@@ -348,16 +344,16 @@ impl Tool for WebFetchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "WebFetch".into(),
-            description: "Fetch a public HTTP(S) URL (SSRF-safe, negotiates text/markdown, converts HTML to clean Markdown or plain text, large pages spilled to CAS).".into(),
+            description: "Fetch a public HTTP(S) URL as Markdown, text, or raw HTML.".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["url"],
                 "properties": {
-                    "url": { "type": "string", "description": "Public http:// or https:// URL" },
-                    "format": { "type": "string", "enum": ["markdown", "text", "raw"], "description": "Output format (default: markdown)" },
-                    "raw": { "type": "boolean", "description": "Shorthand for format='raw'" },
-                    "max_chars": { "type": "integer", "minimum": 256, "maximum": 100_000, "description": "Optional character cap on returned text" }
+                    "url": { "type": "string" },
+                    "format": { "type": "string", "enum": ["markdown", "text", "raw"] },
+                    "raw": { "type": "boolean" },
+                    "max_chars": { "type": "integer", "minimum": 256, "maximum": 100_000 }
                 }
             }),
             defer_loading: true,

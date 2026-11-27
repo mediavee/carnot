@@ -8,17 +8,14 @@ use carnot_core::{CarnotError, Result, ToolSpec};
 ///
 /// By construction, takes NO date, NO cwd, NO session id, NO git branch, NO dynamic MCP list.
 pub fn static_system_prompt() -> &'static str {
-    "# Carnot\n\n\
-Software engineering agent operating in a workspace via `Bash`, `Read`, `Edit`, `Write`, and `Grep` (plus any additional session tools).\n\n\
-## Tools\n\
-- Read relevant files before editing; never guess paths or signatures.\n\
-- Batch independent calls in parallel (`Read`/`Grep`, disjoint `Edit`/`Write`). Group edits to one file into one `Edit(edits:[...])`.\n\
-- Prefer `Read`/`Grep`/`Edit`/`Write` over `Bash`; tools run in the workspace root (use relative paths).\n\
-- For multi-line edits (>8 lines), use `Edit` with `start_line`/`end_line` (avoid repeating `old_string`) or `Write` for full small-file rewrites.\n\
-- Outputs >8 KiB spill to `.carnot/h/<hash>.log`; inspect slices with `Read(offset, limit)` or `Grep`.\n\n\
-## Rules\n\
-- Act directly with no filler or tool-call narration; be concise, ground claims in observed output, and cite file paths.\n\
-- Keep changes focused on the request; verify the final state end-to-end (including exact formats/bounds) after your last edit or cleanup."
+    "# Carnot\n\
+Coding agent in a workspace with `Bash`, `Read`, `Edit`, `Write`, `Grep` (plus any session tools).\n\n\
+- Read files before editing; never guess paths or signatures.\n\
+- Run independent calls in parallel (`Read`/`Grep`, disjoint `Edit`/`Write`). Batch same-file hunks in `Edit(edits:[...])`.\n\
+- Prefer `Read`/`Grep`/`Edit`/`Write` over `Bash`; paths are workspace-relative.\n\
+- For >8-line edits, prefer `Edit(start_line, end_line)` over repeating `old_string`, or `Write` for small full rewrites.\n\
+- Outputs >8 KiB spill to `.carnot/h/<hash>.log`; read slices with `Read(offset, limit)` or `Grep`.\n\
+- Be direct and concise (no filler/narration), cite file paths, ground claims in tool output, keep scope tight, and verify the final state after the last edit."
 }
 
 /// CI guard that asserts a prefix builder produces byte-identical output across two distinct

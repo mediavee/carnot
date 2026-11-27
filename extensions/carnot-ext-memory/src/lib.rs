@@ -683,15 +683,17 @@ impl Tool for MemorySearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "MemorySearch".into(),
-            description: "Search persistent cross-session memories (project & global) using fast BM25 + tag/title scoring. Omit `query` to list top pinned/recent memories.".into(),
+            description:
+                "Search persistent project/global memories (omit `query` to list top entries)."
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "query": { "type": "string", "description": "Keywords, file path, symbol, or topic to search (optional)" },
-                    "scope": { "type": "string", "enum": ["all", "project", "global"], "description": "Memory scope filter (default: all)" },
-                    "kind": { "type": "string", "enum": ["preference", "pitfall", "decision", "project_fact", "workflow"], "description": "Optional kind filter" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Max results (default: 6)" }
+                    "query": { "type": "string" },
+                    "scope": { "type": "string", "enum": ["all", "project", "global"] },
+                    "kind": { "type": "string", "enum": ["preference", "pitfall", "decision", "project_fact", "workflow"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
                 }
             }),
             defer_loading: true,
@@ -770,19 +772,21 @@ impl Tool for MemorySaveTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "MemorySave".into(),
-            description: "Persist, update (idempotent by `id`), or delete a durable cross-session memory entry (secrets are redacted automatically; avoid ephemeral task scratchpad notes).".into(),
+            description:
+                "Upsert or delete a durable cross-session memory entry (secrets auto-redacted)."
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "action": { "type": "string", "enum": ["upsert", "delete"], "description": "Operation (default: upsert)" },
-                    "id": { "type": "string", "description": "Stable slug identifier (derived from `title` if omitted; required for `delete`)" },
-                    "scope": { "type": "string", "enum": ["project", "global"], "description": "Target scope (default: project)" },
-                    "kind": { "type": "string", "enum": ["preference", "pitfall", "decision", "project_fact", "workflow"], "description": "Memory category (default: project_fact)" },
-                    "title": { "type": "string", "description": "Short descriptive title (required for upsert)" },
-                    "content": { "type": "string", "description": "Concise durable fact/preference/pitfall (max 2000 chars, required for upsert)" },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional search tags" },
-                    "pinned": { "type": "boolean", "description": "Pin in Turn-1 digest (use sparingly for critical rules/preferences)" }
+                    "action": { "type": "string", "enum": ["upsert", "delete"] },
+                    "id": { "type": "string", "description": "Slug ID (required for delete)" },
+                    "scope": { "type": "string", "enum": ["project", "global"] },
+                    "kind": { "type": "string", "enum": ["preference", "pitfall", "decision", "project_fact", "workflow"] },
+                    "title": { "type": "string" },
+                    "content": { "type": "string", "description": "Max 2000 chars" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "pinned": { "type": "boolean" }
                 }
             }),
             defer_loading: true,

@@ -27,15 +27,15 @@ impl Tool for SendMessageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "SendMessage".into(),
-            description: "Send a message between the coordinator and a named worker. Coordinator targets a worker name (wakes idle `keep_alive` workers with warm cache, or queues/steers running ones); workers target `coordinator` to report progress, blockers, or questions.".into(),
+            description: "Message between coordinator and a named worker (wakes idle workers or queues/steers running ones; workers message `coordinator`).".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["to", "message"],
                 "properties": {
-                    "to": { "type": "string", "description": "Target worker name (from coordinator) or `coordinator` (from a worker)" },
-                    "message": { "type": "string", "description": "Message content" },
-                    "interrupt": { "type": "boolean", "description": "When targeting a currently running worker: inject mid-turn via `steer` instead of queuing post-turn `follow_up` (default false)" }
+                    "to": { "type": "string", "description": "Worker name or `coordinator`" },
+                    "message": { "type": "string" },
+                    "interrupt": { "type": "boolean", "description": "Steer mid-turn instead of queuing" }
                 }
             }),
             defer_loading: false,

@@ -317,22 +317,22 @@ impl ToolRegistry {
     }
 }
 
-/// Returns the canonical 5-tool schema set (~650 tokens total, ultra-compact).
+/// Returns the canonical 5-tool schema set (compact, static, cache-invariant).
 pub fn canonical_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "Bash".into(),
-            description: "Run shell command in workspace sandbox (auto-yields long jobs; supports `pty: true` + `stdin`).".into(),
+            description: "Run sandboxed shell command (auto-yields long jobs; supports `pty` + `stdin`).".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "command": { "type": "string" },
-                    "cwd": { "type": "string", "description": "Subdir in workspace" },
-                    "job": { "type": "string", "description": "Collect yielded job ID" },
+                    "cwd": { "type": "string", "description": "Workspace subdir" },
+                    "job": { "type": "string", "description": "Yielded job ID" },
                     "kill": { "type": "boolean" },
-                    "pty": { "type": "boolean", "description": "Run in interactive PTY" },
-                    "stdin": { "type": "string", "description": "Send input to PTY job" },
+                    "pty": { "type": "boolean" },
+                    "stdin": { "type": "string", "description": "PTY input" },
                     "timeout": { "type": "integer", "description": "Seconds" }
                 }
             }),
@@ -340,7 +340,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Read".into(),
-            description: "Read file (`N\\ttext`), image, or directory outline. Supports `symbol` (`Type::method`/`Class.method`) and `outline: true`. Unchanged re-reads return a stub; modified re-reads return a diff.".into(),
+            description: "Read file (`N\\ttext`), image, or dir outline (`symbol`, `outline`). Unchanged re-reads stub; modified return a diff.".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -357,7 +357,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Edit".into(),
-            description: "Atomically edit a file via `start_line`+`end_line` (1-based inclusive, avoids repeating old text) OR `old_string`, with `new_string` (empty deletes). Batch all hunks to a file in `edits` (non-overlapping ranges use original line numbers).".into(),
+            description: "Atomic edit via 1-based inclusive `start_line`+`end_line` or `old_string`, with `new_string` (empty deletes). Batch hunks in `edits` (original lines).".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -390,7 +390,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Write".into(),
-            description: "Atomically write a new or full file.".into(),
+            description: "Atomically write a file.".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -404,7 +404,7 @@ pub fn canonical_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Grep".into(),
-            description: "Regex search across workspace files (skips .git/target/node_modules/binaries).".into(),
+            description: "Regex search across workspace (skips .git/target/node_modules/binaries).".into(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
