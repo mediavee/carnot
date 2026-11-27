@@ -1,85 +1,114 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 272" width="760" height="272" role="img" aria-label="Carnot cold-start latency and peak RSS memory benchmarks">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 828 496" width="828" height="496" role="img" aria-label="Carnot embedded harness footprint comparison">
   <defs>
-    <linearGradient id="accent-bar" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#FF7A36"/>
-      <stop offset="100%" stop-color="#D93818"/>
+    <linearGradient id="carnotGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#FF8A2B"/>
+      <stop offset="100%" stop-color="#EA3E14"/>
     </linearGradient>
     <style>
-      .card { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
-      .title { fill: #1f2328; font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-      .sub { fill: #656d76; font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-      .lbl { fill: #57606a; font: 500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-      .lbl-hi { fill: #1f2328; font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-      .val { fill: #57606a; font: 500 11.5px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-      .val-hi { fill: #D93818; font: 700 11.5px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-      .track { fill: #f6f8fa; }
-      .bar { fill: #c9d1d9; }
-      .divider { stroke: #d8dee4; stroke-width: 1; }
+      .font { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     </style>
   </defs>
-
-  <rect class="card" x="0.5" y="0.5" width="759" height="271" rx="12"/>
-  <line class="divider" x1="380" y1="18" x2="380" y2="254"/>
-
-  <!-- Left panel: Cold Start (median ms, lower is better) -->
-  <text class="title" x="24" y="34">Cold Start to First HTTP</text>
-  <text class="sub" x="24" y="50">Median ms · lower is better (15 runs, arm64)</text>
-
-  <text class="lbl-hi" x="24" y="84">Carnot</text>
-  <rect class="track" x="116" y="72" width="186" height="16" rx="4"/>
-  <rect fill="url(#accent-bar)" x="116" y="72" width="6" height="16" rx="3"/>
-  <text class="val-hi" x="310" y="84">7.4 ms</text>
-
-  <text class="lbl" x="24" y="118">Codex CLI</text>
-  <rect class="track" x="116" y="106" width="186" height="16" rx="4"/>
-  <rect class="bar" x="116" y="106" width="14" height="16" rx="4"/>
-  <text class="val" x="310" y="118">41.4 ms</text>
-
-  <text class="lbl" x="24" y="152">Claude Code</text>
-  <rect class="track" x="116" y="140" width="186" height="16" rx="4"/>
-  <rect class="bar" x="116" y="140" width="85" height="16" rx="4"/>
-  <text class="val" x="310" y="152">249.9 ms</text>
-
-  <text class="lbl" x="24" y="186">Pi (Node)</text>
-  <rect class="track" x="116" y="174" width="186" height="16" rx="4"/>
-  <rect class="bar" x="116" y="174" width="158" height="16" rx="4"/>
-  <text class="val" x="310" y="186">462.5 ms</text>
-
-  <text class="lbl" x="24" y="220">OpenCode</text>
-  <rect class="track" x="116" y="208" width="186" height="16" rx="4"/>
-  <rect class="bar" x="116" y="208" width="186" height="16" rx="4"/>
-  <text class="val" x="310" y="220">545.9 ms</text>
-
-  <text class="sub" x="24" y="252">34× faster startup than Claude Code · 74× faster than OpenCode</text>
-
-  <!-- Right panel: Peak RSS Memory (MiB, lower is better) -->
-  <text class="title" x="404" y="34">Peak Memory Footprint (RSS)</text>
-  <text class="sub" x="404" y="50">MiB · lower is better</text>
-
-  <text class="lbl-hi" x="404" y="84">Carnot</text>
-  <rect class="track" x="496" y="72" width="176" height="16" rx="4"/>
-  <rect fill="url(#accent-bar)" x="496" y="72" width="6" height="16" rx="3"/>
-  <text class="val-hi" x="680" y="84">10.3 MiB</text>
-
-  <text class="lbl" x="404" y="118">Codex CLI</text>
-  <rect class="track" x="496" y="106" width="176" height="16" rx="4"/>
-  <rect class="bar" x="496" y="106" width="45" height="16" rx="4"/>
-  <text class="val" x="680" y="118">133.7 MiB</text>
-
-  <text class="lbl" x="404" y="152">Pi (Node)</text>
-  <rect class="track" x="496" y="140" width="176" height="16" rx="4"/>
-  <rect class="bar" x="496" y="140" width="53" height="16" rx="4"/>
-  <text class="val" x="680" y="152">159.4 MiB</text>
-
-  <text class="lbl" x="404" y="186">Claude Code</text>
-  <rect class="track" x="496" y="174" width="176" height="16" rx="4"/>
-  <rect class="bar" x="496" y="174" width="72" height="16" rx="4"/>
-  <text class="val" x="680" y="186">216.0 MiB</text>
-
-  <text class="lbl" x="404" y="220">OpenCode</text>
-  <rect class="track" x="496" y="208" width="176" height="16" rx="4"/>
-  <rect class="bar" x="496" y="208" width="176" height="16" rx="4"/>
-  <text class="val" x="680" y="220">528.7 MiB</text>
-
-  <text class="sub" x="404" y="252">21× lower RAM than Claude Code · 13 MB single binary</text>
+  <rect width="828" height="496" rx="16" fill="#F8FAFC"/>
+  <g transform="translate(14,14)">
+    <rect width="392" height="212" rx="12" fill="#FFFFFF" stroke="rgba(15,23,42,0.10)" stroke-width="1"/>
+    <text x="16" y="28" class="font" font-size="13" font-weight="650" fill="#0F172A">Cold Start (median)</text>
+    <text x="376" y="27" text-anchor="end" class="mono" font-size="10.5" fill="#64748B">lower is better</text>
+    <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (core)</text>
+    <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="51" width="4.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">14.8 ms</text>
+    <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (full)</text>
+    <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="81" width="6.4" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">23.3 ms</text>
+    <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#475569">Codex CLI</text>
+    <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="111" width="21.3" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">78.1 ms</text>
+    <text x="16" y="151" class="font" font-size="12" font-weight="500" fill="#475569">Claude Code</text>
+    <rect x="112" y="141" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="141" width="124.6" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">456 ms</text>
+    <text x="16" y="181" class="font" font-size="12" font-weight="500" fill="#475569">OpenCode</text>
+    <rect x="112" y="171" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="171" width="178.0" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">652 ms</text>
+  </g>
+  <g transform="translate(422,14)">
+    <rect width="392" height="212" rx="12" fill="#FFFFFF" stroke="rgba(15,23,42,0.10)" stroke-width="1"/>
+    <text x="16" y="28" class="font" font-size="13" font-weight="650" fill="#0F172A">Peak Memory (RSS)</text>
+    <text x="376" y="27" text-anchor="end" class="mono" font-size="10.5" fill="#64748B">lower is better</text>
+    <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (core)</text>
+    <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="51" width="4.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">12.5 MiB</text>
+    <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (full)</text>
+    <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="81" width="4.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">13.2 MiB</text>
+    <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#475569">Codex CLI</text>
+    <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="111" width="32.0" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">132 MiB</text>
+    <text x="16" y="151" class="font" font-size="12" font-weight="500" fill="#475569">Claude Code</text>
+    <rect x="112" y="141" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="141" width="52.4" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">217 MiB</text>
+    <text x="16" y="181" class="font" font-size="12" font-weight="500" fill="#475569">OpenCode</text>
+    <rect x="112" y="171" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="171" width="178.0" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">737 MiB</text>
+  </g>
+  <g transform="translate(14,242)">
+    <rect width="392" height="212" rx="12" fill="#FFFFFF" stroke="rgba(15,23,42,0.10)" stroke-width="1"/>
+    <text x="16" y="28" class="font" font-size="13" font-weight="650" fill="#0F172A">Installed Footprint</text>
+    <text x="376" y="27" text-anchor="end" class="mono" font-size="10.5" fill="#64748B">lower is better</text>
+    <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (core)</text>
+    <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="51" width="8.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">16.5 MB</text>
+    <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (full)</text>
+    <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="81" width="8.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">16.5 MB</text>
+    <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#475569">OpenCode</text>
+    <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="111" width="110.4" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">215 MB</text>
+    <text x="16" y="151" class="font" font-size="12" font-weight="500" fill="#475569">Codex CLI</text>
+    <rect x="112" y="141" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="141" width="145.9" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">284 MB</text>
+    <text x="16" y="181" class="font" font-size="12" font-weight="500" fill="#475569">Claude Code</text>
+    <rect x="112" y="171" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="171" width="178.0" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">347 MB</text>
+  </g>
+  <g transform="translate(422,242)">
+    <rect width="392" height="212" rx="12" fill="#FFFFFF" stroke="rgba(15,23,42,0.10)" stroke-width="1"/>
+    <text x="16" y="28" class="font" font-size="13" font-weight="650" fill="#0F172A">Static Prefix Overhead</text>
+    <text x="376" y="27" text-anchor="end" class="mono" font-size="10.5" fill="#64748B">lower is better</text>
+    <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (core)</text>
+    <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="51" width="8.9" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">960 tok</text>
+    <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#0F172A">Carnot (full)</text>
+    <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="81" width="24.3" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#D93812">2 627 tok</text>
+    <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#475569">OpenCode</text>
+    <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="111" width="89.4" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">9 644 tok</text>
+    <text x="16" y="151" class="font" font-size="12" font-weight="500" fill="#475569">Codex CLI</text>
+    <rect x="112" y="141" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="141" width="90.2" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">9 730 tok</text>
+    <text x="16" y="181" class="font" font-size="12" font-weight="500" fill="#475569">Claude Code</text>
+    <rect x="112" y="171" width="178" height="12" rx="4" fill="rgba(15,23,42,0.06)"/>
+    <rect x="112" y="171" width="178.0" height="12" rx="4" fill="#CBD5E1"/>
+    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#334155">19 210 tok</text>
+  </g>
+  <text x="414.0" y="484" text-anchor="middle" class="mono" font-size="10.5" fill="#64748B">Measured locally via benchmarks/compare_harnesses.py · 15 runs + 3 warmups · Darwin arm64 (27.2.0) · $0 mock API</text>
 </svg>

@@ -4,7 +4,6 @@ Fair, Deterministic Cross-Harness Benchmark Suite.
 
 Compares:
   - Carnot (Rust)
-  - Unharnessed (Rust)
   - Pi (@mariozechner/pi-coding-agent, TypeScript/Node)
   - OpenCode (Bun/TypeScript compiled binary)
   - Claude Code (Anthropic CLI)
@@ -568,7 +567,6 @@ def build_harnesses(port: int) -> List[Dict[str, Any]]:
     base_url = f"http://127.0.0.1:{port}"
     repo_root = Path(__file__).resolve().parent.parent
     carnot_bin = os.environ.get("CARNOT_BIN") or str(repo_root / "target/release/carnot")
-    uh_bin = os.environ.get("UNHARNESSED_BIN") or (shutil.which("unharnessed") or "")
     pi_bin = os.environ.get("PI_BIN") or (shutil.which("pi") or "")
     opencode_bin = shutil.which("opencode") or ""
     claude_bin = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
@@ -620,18 +618,6 @@ def build_harnesses(port: int) -> List[Dict[str, Any]]:
 
     def setup_pi_home(home_dir: str):
         agent_dir = Path(home_dir) / ".pi" / "agent"
-        agent_dir.mkdir(parents=True, exist_ok=True)
-        models_cfg = {
-            "providers": {
-                "anthropic": {
-                    "baseUrl": base_url,
-                }
-            }
-        }
-        (agent_dir / "models.json").write_text(json.dumps(models_cfg))
-
-    def setup_uh_home(home_dir: str):
-        agent_dir = Path(home_dir) / ".unharnessed"
         agent_dir.mkdir(parents=True, exist_ok=True)
         models_cfg = {
             "providers": {
@@ -703,20 +689,6 @@ def build_harnesses(port: int) -> List[Dict[str, Any]]:
             ],
             "env": base_env,
             "setup_home": None,
-        },
-        {
-            "id": "unharnessed",
-            "label": "Unharnessed (Rust)",
-            "protocol": "anthropic-messages",
-            "binary_mb": round(resolve_real_file_mb(uh_bin), 1),
-            "closure_mb": round(resolve_real_file_mb(uh_bin), 1),
-            "cmd": lambda cwd: [
-                uh_bin, "-p", "--provider", "anthropic", "--model", "claude-sonnet-4-5-20250929",
-                "--no-session", "--no-skills", "--no-context-files", "--offline", "--cwd", cwd, "Reply OK",
-            ],
-            "env": lambda h: {**base_env(h), "UNHARNESSED_CODING_AGENT_DIR": os.path.join(h, ".unharnessed")},
-            "setup_home": setup_uh_home,
-            "warmup_timeout_s": 90.0,
         },
         {
             "id": "pi",
