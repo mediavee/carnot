@@ -996,3 +996,108 @@ async fn serve_rpc_loop(
     ev_task.abort();
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carnot_ai::faux::{FauxProvider, ScriptedTurn};
+    use carnot_cas::CasStore;
+    use carnot_core::CarnotConfig;
+    use carnot_tools::ToolRegistry;
+
+    #[test]
+    fn parse_effort_and_effort_label_roundtrip_all_variants() {
+        for (raw, expected) in [
+            ("low", ReasoningEffort::Low),
+            ("MEDIUM", ReasoningEffort::Medium),
+            (" high ", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("max", ReasoningEffort::Max),
+        ] {
+            let parsed = parse_effort(raw).expect("valid effort must parse");
+            assert_eq!(parsed, expected, "parsed effort mismatch for `{raw}`");
+            assert_eq!(
+                parse_effort(effort_label(parsed)),
+                Some(expected),
+                "effort_label must roundtrip through parse_effort"
+            );
+        }
+        assert!(
+            parse_effort("turbo").is_none(),
+            "unknown effort level must return None"
+        );
+    }
+
+    #[test]
+    fn build_prompt_blocks_extracts_multimodal_text_and_images_and_skips_empty_images() {
+        let blocks = build_prompt_blocks(&json!({
+            "prompt": "Look at this UI",
+            "images": [
+                { "mimeType": "image/jpeg", "data": "/9j/4AAQ==" },
+                { "media_type": "image/png", "data_base64": "" }
+            ]
+        }));
+        assert_eq!(
+            blocks.len(),
+            2,
+            "should include text + non-empty image and skip empty image"
+        );
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text == "Look at this UI"),
+            "first block must be prompt text"
+        );
+        assert!(
+            matches!(
+                &blocks[1],
+                ContentBlock::Image { media_type, data_base64 }
+                    if media_type == "image/jpeg" && data_base64 == "/9j/4AAQ=="
+            ),
+            "second block must be decoded image"
+        );
+
+        let empty_blocks = build_prompt_blocks(&json!({}));
+        assert_eq!(
+            empty_blocks.len(),
+            1,
+            "empty params must fall back to single empty Text block"
+        );
+        assert!(
+            matches!(&empty_blocks[0], ContentBlock::Text { text } if text.is_empty()),
+            "fallback block must be empty Text"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_payload_reports_live_session_cache_ttl_and_tools() {
+        let dir = std::env::temp_dir().join(format!("carnot-rpc-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut cfg = CarnotConfig::new(dir.clone());
+        cfg.modules.sandbox = false;
+        let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+        let tools = ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+        let faux = Arc::new(FauxProvider::new(vec![ScriptedTurn::text("ok")]));
+        let agent = Agent::new(cfg, faux, tools, Vec::new(), false).expect("agent");
+
+        agent.set_cache_ttl(CacheTtl::Long).await;
+        let st = state_payload(&agent).await;
+        assert_eq!(
+            st["cache_ttl"],
+            json!("long"),
+            "state_payload must reflect live cache_ttl"
+        );
+        assert_eq!(
+            st["busy"],
+            json!(false),
+            "idle agent must report busy=false"
+        );
+        assert!(
+            st["prefix_hash"].as_str().is_some_and(|h| h.len() == 64),
+            "prefix_hash must be a 64-char BLAKE3 hex string"
+        );
+        assert!(
+            st.get("prefix_retention_rate").is_some(),
+            "state_payload must include prefix_retention_rate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -683,3 +683,277 @@ fn parse_tool_args_json(args: &str) -> (Value, Option<String>) {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{CompatFlags, ResolvedAuth, UsageMap};
+    use carnot_core::{NativeWebConfig, ToolSpec};
+    use std::collections::BTreeMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn make_responses_spec(base_url: &str) -> ResolvedProviderSpec {
+        let compat = CompatFlags {
+            store: Some(false),
+            include_encrypted_reasoning: Some(true),
+            supports_reasoning_effort: Some(true),
+            supports_prompt_cache_key: Some(true),
+            supports_prompt_cache_retention: Some(true),
+            ..CompatFlags::default()
+        };
+        ResolvedProviderSpec {
+            provider_id: "openai-responses".into(),
+            api: API_ID.into(),
+            base_url: base_url.into(),
+            fallback_base_urls: vec![],
+            project_id: None,
+            auth: ResolvedAuth::Bearer {
+                token: "test-key".into(),
+                source: "test".into(),
+            },
+            headers: BTreeMap::new(),
+            query_params: BTreeMap::new(),
+            betas: vec![],
+            cache_diagnosis_beta: None,
+            native_tool_search: false,
+            compat,
+            usage_map: UsageMap::default(),
+            body_patch: None,
+            subprocess: None,
+            catalog_models: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn build_body_sets_stateless_store_cache_retention_and_filters_foreign_opaque_origins() {
+        let provider = OpenAiResponsesProvider::from_spec(make_responses_spec(
+            "https://mock-responses.example.internal/v1",
+        ));
+        let same_origin = ContentOrigin::new(API_ID, "openai-responses", "gpt-5.4");
+        let foreign_origin =
+            ContentOrigin::new("anthropic-messages", "anthropic", "claude-opus-5-5");
+
+        let req = ProviderRequest {
+            model: "gpt-5.4".into(),
+            static_system_prompt: "STATIC_PROMPT".into(),
+            tools: vec![ToolSpec {
+                name: "Read".into(),
+                description: "Read file".into(),
+                input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                defer_loading: false,
+            }],
+            prefix_hash: "prefix123".into(),
+            session_id: "sess-1".into(),
+            messages: vec![
+                Arc::new(Message::user_text("inspect main.rs")),
+                Arc::new(Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Opaque {
+                            raw: json!({"type": "reasoning", "id": "rs_same", "encrypted_content": "enc_ok"}),
+                            origin: Some(same_origin),
+                        },
+                        ContentBlock::Opaque {
+                            raw: json!({"type": "redacted_thinking", "data": "foreign"}),
+                            origin: Some(foreign_origin),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_1".into(),
+                            name: "Read".into(),
+                            input: json!({"path": "src/main.rs"}),
+                            invalid_json: None,
+                            provider_meta: None,
+                            origin: None,
+                        },
+                    ],
+                }),
+                Arc::new(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: vec![ToolResultBlock::text("fn main() {}")],
+                        is_error: false,
+                    }],
+                }),
+            ],
+            checkpoint_index: None,
+            max_output_tokens: 4096,
+            effort: ReasoningEffort::High,
+            cache_ttl: CacheTtl::Long,
+            skip_tail_cache_write: false,
+            native_web: NativeWebConfig::default(),
+            ephemeral_tail_notes: vec![],
+        };
+
+        let body = provider.build_body(&req);
+        assert_eq!(
+            body["store"],
+            json!(false),
+            "stateless store=false must be set"
+        );
+        assert_eq!(
+            body["instructions"],
+            json!("STATIC_PROMPT"),
+            "instructions must hold static system prompt"
+        );
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "encrypted reasoning include must be enabled"
+        );
+        assert_eq!(
+            body["prompt_cache_retention"],
+            json!("24h"),
+            "CacheTtl::Long must request 24h prompt_cache_retention"
+        );
+        assert!(
+            body["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "prompt_cache_key must be set"
+        );
+
+        let input = body["input"].as_array().expect("input array");
+        assert!(
+            input
+                .iter()
+                .any(|item| item.get("id") == Some(&json!("rs_same"))),
+            "same-origin encrypted reasoning item must be replayed"
+        );
+        assert!(
+            !input
+                .iter()
+                .any(|item| item.get("type") == Some(&json!("redacted_thinking"))),
+            "foreign-origin opaque block must be stripped"
+        );
+        assert!(
+            input
+                .iter()
+                .any(|item| item.get("type") == Some(&json!("function_call"))
+                    && item.get("name") == Some(&json!("Read"))),
+            "tool call must serialize as function_call"
+        );
+        assert!(
+            input.iter().any(
+                |item| item.get("type") == Some(&json!("function_call_output"))
+                    && item.get("output") == Some(&json!("fn main() {}"))
+            ),
+            "tool result must serialize as function_call_output"
+        );
+    }
+
+    #[test]
+    fn parse_tool_args_json_repairs_or_flags_malformed_json() {
+        let (empty_v, empty_err) = parse_tool_args_json("   ");
+        assert_eq!(empty_v, json!({}), "empty args must yield empty object");
+        assert!(empty_err.is_none(), "empty args must not flag invalid_json");
+
+        let (valid_v, valid_err) = parse_tool_args_json(r#"{"path":"a.rs"}"#);
+        assert_eq!(valid_v["path"], json!("a.rs"), "valid JSON must parse");
+        assert!(valid_err.is_none(), "valid JSON must not flag invalid_json");
+
+        let (_bad_v, bad_err) = parse_tool_args_json("{not valid json at all!!!");
+        assert!(
+            bad_err.is_some_and(|m| m.contains("malformed tool JSON")),
+            "unrepairable JSON must populate invalid_json"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_parses_sse_deltas_encrypted_reasoning_and_tool_calls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let sse_body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc_abc\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Checking file.\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"fc_1\",\"name\":\"Read\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"lib.rs\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":42,\"input_tokens_details\":{\"cached_tokens\":800},\"output_tokens_details\":{\"reasoning_tokens\":12}}}}\n\n"
+        );
+        let http_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_body}",
+            sse_body.len()
+        );
+        let srv = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 4096];
+                let _ = sock.read(&mut req_buf).await;
+                let _ = sock.write_all(http_resp.as_bytes()).await;
+            }
+        });
+
+        let provider =
+            OpenAiResponsesProvider::from_spec(make_responses_spec(&format!("http://{addr}/v1")));
+        let req = ProviderRequest {
+            model: "gpt-5.4".into(),
+            static_system_prompt: "SYS".into(),
+            tools: vec![],
+            prefix_hash: "p".into(),
+            session_id: "s".into(),
+            messages: vec![Arc::new(Message::user_text("hi"))],
+            checkpoint_index: None,
+            max_output_tokens: 1024,
+            effort: ReasoningEffort::Medium,
+            cache_ttl: CacheTtl::Short,
+            skip_tail_cache_write: false,
+            native_web: NativeWebConfig::default(),
+            ephemeral_tail_notes: vec![],
+        };
+
+        let mut rx = provider
+            .stream(req, CancellationToken::new())
+            .await
+            .expect("stream");
+        let mut done_ev = None;
+        let mut saw_text = String::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                StreamEvent::TextDelta(t) => saw_text.push_str(&t),
+                StreamEvent::Done {
+                    message,
+                    usage,
+                    stop_reason,
+                    ..
+                } => {
+                    done_ev = Some((message, usage, stop_reason));
+                }
+                _ => {}
+            }
+        }
+        let (msg, usage, stop_reason) = done_ev.expect("must emit Done event");
+        assert_eq!(saw_text, "Checking file.", "text delta must be streamed");
+        assert_eq!(
+            stop_reason,
+            StopReason::ToolUse,
+            "function_call must set StopReason::ToolUse"
+        );
+        assert_eq!(usage.cache_read_tokens, 800, "cached_tokens must be mapped");
+        assert_eq!(usage.input_tokens, 200, "uncached input = 1000 - 800");
+        assert_eq!(
+            usage.reasoning_tokens, 12,
+            "reasoning_tokens must be mapped"
+        );
+        assert!(
+            msg.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Opaque { raw, .. } if raw.get("id") == Some(&json!("rs_1")))),
+            "encrypted reasoning item must be preserved as Opaque"
+        );
+        assert!(
+            msg.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolUse { id, name, input, invalid_json: None, .. }
+                    if id == "fc_1" && name == "Read" && input["path"] == json!("lib.rs")
+            )),
+            "function_call must be reconstructed cleanly"
+        );
+        let _ = srv.await;
+    }
+}

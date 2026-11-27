@@ -957,8 +957,80 @@ mod tests {
         assert!(out_override.status.success());
         assert_eq!(
             String::from_utf8_lossy(&out_override.stdout),
-            "custom-pager"
+            "custom-pager",
+            "extra_env must override default PAGER"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_safe_git_command_neutralizes_repo_hooks_fsmonitor_and_ssh() {
+        let dir = PathBuf::from("/tmp/example-repo");
+        let cmd = host_safe_git_command(&dir);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&"core.fsmonitor=false".to_string()),
+            "host_safe_git_command must disable core.fsmonitor"
+        );
+        assert!(
+            args.contains(&"core.hooksPath=/dev/null".to_string()),
+            "host_safe_git_command must neutralize core.hooksPath"
+        );
+        assert!(
+            args.contains(&"core.sshCommand=false".to_string()),
+            "host_safe_git_command must disable core.sshCommand"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocks_symlink_write_escape_to_dot_git_and_outside_workspace() {
+        let sb = detect_sandbox_backend();
+        if !sb.available || sb.backend == "landlock" {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("carnot-sb-escape-{}", uuid::Uuid::new_v4()));
+        let ws = base.join("ws");
+        let outside = base.join("outside.txt");
+        std::fs::create_dir_all(&ws).expect("ws");
+        std::fs::write(&outside, "original").expect("outside");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&ws)
+            .status()
+            .expect("git init");
+        assert!(init.success(), "git init must succeed");
+
+        // Create symlinks inside workspace pointing to .git/config and outside workspace.
+        let git_link = ws.join("escape_git");
+        let out_link = ws.join("escape_out");
+        std::os::unix::fs::symlink(ws.join(".git/config"), &git_link).expect("symlink git");
+        std::os::unix::fs::symlink(&outside, &out_link).expect("symlink outside");
+
+        let policy = SandboxPolicy::for_workspace(ws.clone(), true, false);
+        let out = build_sandboxed_shell(
+            &policy,
+            "echo hacked >> escape_git 2>/dev/null && echo GIT_WRITABLE || echo GIT_BLOCKED; \
+             echo hacked >> escape_out 2>/dev/null && echo OUT_WRITABLE || echo OUT_BLOCKED",
+            &BTreeMap::new(),
+        )
+        .expect("cmd")
+        .output()
+        .await
+        .expect("run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GIT_BLOCKED") && stdout.contains("OUT_BLOCKED"),
+            "sandbox must block symlink writes to .git/config and outside workspace, got: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside"),
+            "original",
+            "outside file must remain untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

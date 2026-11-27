@@ -1323,4 +1323,85 @@ mod tests {
         assert_eq!(go.base_url, "https://proxy.example.internal/v1");
         assert!(go.model_routes.is_empty());
     }
+
+    #[test]
+    fn embedded_catalog_passes_integrity_validation() {
+        const KNOWN_APIS: &[&str] = &[
+            "anthropic-messages",
+            "openai-completions",
+            "openai-responses",
+            "google-generative",
+            "google-cloudcode",
+            "subprocess-jsonl",
+            "faux",
+        ];
+        let cat = ProviderCatalog::embedded().expect("embedded catalog must parse");
+        assert!(
+            !cat.providers.is_empty(),
+            "embedded catalog must declare providers"
+        );
+        let mut seen_names = std::collections::HashSet::new();
+        for (id, entry) in &cat.providers {
+            assert!(
+                KNOWN_APIS.contains(&entry.api.as_str()),
+                "provider `{id}` references unknown api `{}`",
+                entry.api
+            );
+            assert!(
+                !entry.description.trim().is_empty(),
+                "provider `{id}` must have a non-empty description"
+            );
+            assert!(
+                seen_names.insert(id.to_ascii_lowercase()),
+                "duplicate provider id `{id}`"
+            );
+            for alias in &entry.aliases {
+                assert!(
+                    seen_names.insert(alias.to_ascii_lowercase()),
+                    "provider `{id}` alias `{alias}` collides with another provider or alias"
+                );
+            }
+            if entry.api != "faux" && entry.api != "subprocess-jsonl" {
+                assert!(
+                    entry.base_url.starts_with("https://") || entry.base_url.starts_with("http://"),
+                    "provider `{id}` must have an http(s) base_url, got `{}`",
+                    entry.base_url
+                );
+            }
+            for (r_idx, rule) in entry.model_routes.iter().enumerate() {
+                assert!(
+                    !rule.prefixes.is_empty(),
+                    "provider `{id}` model_routes[{r_idx}] must declare at least one prefix"
+                );
+                if let Some(ref api) = rule.api {
+                    assert!(
+                        KNOWN_APIS.contains(&api.as_str()),
+                        "provider `{id}` model_routes[{r_idx}] references unknown api `{api}`"
+                    );
+                }
+            }
+        }
+        for (model_id, m) in &cat.models {
+            if let Some(cw) = m.context_window {
+                assert!(
+                    cw > 0,
+                    "model `{model_id}` context_window must be > 0, got {cw}"
+                );
+            }
+            if let Some(ref p) = m.pricing {
+                for (field, val) in [
+                    ("input", p.input_per_mtok),
+                    ("output", p.output_per_mtok),
+                    ("cache_read_mult", p.cache_read_mult),
+                    ("cache_write_5m_mult", p.cache_write_5m_mult),
+                    ("cache_write_1h_mult", p.cache_write_1h_mult),
+                ] {
+                    assert!(
+                        val.is_finite() && val >= 0.0,
+                        "model `{model_id}` pricing.{field} must be finite and >= 0, got {val}"
+                    );
+                }
+            }
+        }
+    }
 }

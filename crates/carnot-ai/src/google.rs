@@ -839,6 +839,7 @@ impl Provider for GoogleProvider {
 mod tests {
     use super::*;
     use crate::catalog::{CompatFlags, ResolvedAuth, UsageMap};
+    use carnot_core::CacheTtl;
     use std::collections::BTreeMap;
 
     fn make_spec(base_url: &str) -> ResolvedProviderSpec {
@@ -878,7 +879,182 @@ mod tests {
             p_v1beta.endpoint_urls("gemini-3-pro"),
             vec![
                 "https://api.example.com/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse"
-            ]
+            ],
+            "v1beta suffix must not be duplicated"
         );
+    }
+
+    #[test]
+    fn build_body_preserves_same_origin_thought_signature_strips_foreign_and_wraps_cloudcode() {
+        use carnot_core::{NativeWebConfig, ToolSpec};
+
+        let same_origin = ContentOrigin::new("google-generative", "gemini", "gemini-3-pro");
+        let foreign_origin =
+            ContentOrigin::new("anthropic-messages", "anthropic", "claude-sonnet-5-5");
+
+        let req = ProviderRequest {
+            model: "gemini-3-pro".into(),
+            static_system_prompt: "SYS_GEMINI".into(),
+            tools: vec![ToolSpec {
+                name: "Read".into(),
+                description: "Read file".into(),
+                input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                defer_loading: false,
+            }],
+            prefix_hash: "ph".into(),
+            session_id: "sess".into(),
+            messages: vec![
+                Arc::new(Message::user_text("read Cargo.toml")),
+                Arc::new(Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: "call_same".into(),
+                            name: "Read".into(),
+                            input: json!({"path": "Cargo.toml"}),
+                            invalid_json: None,
+                            provider_meta: Some(json!({"thoughtSignature": "sig_valid_123"})),
+                            origin: Some(same_origin),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_foreign".into(),
+                            name: "Read".into(),
+                            input: json!({"path": "README.md"}),
+                            invalid_json: None,
+                            provider_meta: Some(json!({"thoughtSignature": "sig_foreign_999"})),
+                            origin: Some(foreign_origin),
+                        },
+                    ],
+                }),
+            ],
+            checkpoint_index: None,
+            max_output_tokens: 2048,
+            effort: ReasoningEffort::High,
+            cache_ttl: CacheTtl::Short,
+            skip_tail_cache_write: false,
+            native_web: NativeWebConfig::default(),
+            ephemeral_tail_notes: vec![],
+        };
+
+        let direct = GoogleProvider::from_spec(
+            make_spec("https://mock-gemini.example.internal/v1beta"),
+            false,
+        );
+        let body = direct.build_body(&req);
+        assert_eq!(
+            body.pointer("/systemInstruction/parts/0/text"),
+            Some(&json!("SYS_GEMINI")),
+            "systemInstruction must carry static prompt"
+        );
+        let model_parts = body["contents"][1]["parts"]
+            .as_array()
+            .expect("model parts");
+        assert_eq!(
+            model_parts[0].get("thoughtSignature"),
+            Some(&json!("sig_valid_123")),
+            "same-origin thoughtSignature must be preserved"
+        );
+        assert!(
+            model_parts[1].get("thoughtSignature").is_none(),
+            "foreign-origin thoughtSignature must be stripped"
+        );
+
+        let mut cc_spec = make_spec("https://mock-cloudcode.example.internal");
+        cc_spec.api = "google-cloudcode".into();
+        cc_spec.project_id = Some("proj-123".into());
+        let cc = GoogleProvider::from_spec(cc_spec, true);
+        let cc_body = cc.build_body(&req);
+        assert_eq!(
+            cc_body["project"],
+            json!("proj-123"),
+            "cloudcode envelope must include project"
+        );
+        assert_eq!(
+            cc_body["model"],
+            json!("gemini-3-pro"),
+            "cloudcode envelope must include model"
+        );
+        assert!(
+            cc_body.get("request").is_some_and(Value::is_object),
+            "cloudcode envelope must wrap inner request"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_parses_thoughts_function_calls_thought_signature_and_safety_refusal() {
+        use carnot_core::NativeWebConfig;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let sse = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"reasoning...\"},{\"text\":\"Done.\"},{\"functionCall\":{\"name\":\"Read\",\"args\":{\"path\":\"a.rs\"}},\"thoughtSignature\":\"sig_xyz\"}]},\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":500,\"cachedContentTokenCount\":300,\"candidatesTokenCount\":25,\"thoughtsTokenCount\":10}}\n\n";
+        let http_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+            sse.len()
+        );
+        let srv = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(http_resp.as_bytes()).await;
+            }
+        });
+
+        let provider =
+            GoogleProvider::from_spec(make_spec(&format!("http://{addr}/v1beta")), false);
+        let req = ProviderRequest {
+            model: "gemini-3-pro".into(),
+            static_system_prompt: "SYS".into(),
+            tools: vec![],
+            prefix_hash: "ph".into(),
+            session_id: "s".into(),
+            messages: vec![Arc::new(Message::user_text("hi"))],
+            checkpoint_index: None,
+            max_output_tokens: 1024,
+            effort: ReasoningEffort::Medium,
+            cache_ttl: CacheTtl::Short,
+            skip_tail_cache_write: false,
+            native_web: NativeWebConfig::default(),
+            ephemeral_tail_notes: vec![],
+        };
+
+        let mut rx = provider
+            .stream(req, CancellationToken::new())
+            .await
+            .expect("stream");
+        let mut done_ev = None;
+        while let Some(ev) = rx.recv().await {
+            if let StreamEvent::Done {
+                message,
+                usage,
+                stop_reason,
+                ..
+            } = ev
+            {
+                done_ev = Some((message, usage, stop_reason));
+            }
+        }
+        let (msg, usage, stop_reason) = done_ev.expect("must emit Done event");
+        assert_eq!(
+            stop_reason,
+            StopReason::Refusal,
+            "SAFETY finishReason must map to StopReason::Refusal"
+        );
+        assert_eq!(
+            usage.cache_read_tokens, 300,
+            "cachedContentTokenCount must map"
+        );
+        assert_eq!(usage.input_tokens, 200, "uncached input = 500 - 300");
+        assert_eq!(usage.reasoning_tokens, 10, "thoughtsTokenCount must map");
+        assert!(
+            msg.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolUse { name, provider_meta: Some(meta), .. }
+                    if name == "Read" && meta.get("thoughtSignature") == Some(&json!("sig_xyz"))
+            )),
+            "functionCall thoughtSignature must be captured in provider_meta"
+        );
+        let _ = srv.await;
     }
 }
