@@ -213,7 +213,7 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "carnot"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "carnot-agent",
  "carnot-ai",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "carnot-ai",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "carnot-core",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-cas"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "carnot-core",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "carnot",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "carnot-cas",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-claude-plugins"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "carnot-core",
  "carnot-ext",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-codemode"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blake3",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-goal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "carnot-agent",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-hooks"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "carnot-core",
  "carnot-ext",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "carnot-core",
  "carnot-ext",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "carnot-cas",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-subagent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "carnot-agent",
  "carnot-ai",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-ext-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "carnot-cas",
  "carnot-core",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blake3",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "carnot-agent",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-sandbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "landlock",
  "serde",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "carnot-core",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blake3",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "carnot-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "carnot",
  "carnot-ext",

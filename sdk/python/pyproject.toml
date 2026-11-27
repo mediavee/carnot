@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "carnot-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "Zero-dependency async Python SDK and drop-in extension helper for Carnot"
 requires-python = ">=3.12"
 license = { text = "MIT OR Apache-2.0" }

@@ -1,6 +1,6 @@
 {
   "name": "@mediavee/carnot-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Zero-dependency TypeScript HTTP/SSE SDK for Carnot",
   "license": "MIT OR Apache-2.0",
