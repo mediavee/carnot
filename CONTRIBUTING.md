@@ -1,17 +1,15 @@
-# Contributing to Carnot
+# Contributing
 
-Thank you for your interest in contributing to Carnot!
+## Rules
 
-## Architectural Principles
+1. **No `unsafe` Rust.** Every workspace crate inherits `unsafe_code = "forbid"` from `Cargo.toml`.
+2. **No hardcoded providers.** Provider URLs, headers, auth env vars, and `model_routes` live in [`crates/carnot-ai/catalog/providers.json`](crates/carnot-ai/catalog/providers.json) (enforced by `ci_gate_zero_hardcoded_providers_outside_data_catalog`).
+3. **Invariant static prefix.** Do not put dates, working directories, or dynamic tool lists in the static system prompt. Verify with `carnot audit-prefix`.
+4. **Fail closed.** Sandbox denials, path confinement, `.git` write guards, SSRF checks, and HTTP auth/CSRF checks must fail closed.
 
-1. **Zero `unsafe` Rust**: All crates inherit `unsafe_code = "forbid"` from the workspace `Cargo.toml`.
-2. **Zero hardcoded providers**: Concrete provider URLs, headers, auth env vars, and `model_routes` belong strictly in [`crates/carnot-ai/catalog/providers.json`](crates/carnot-ai/catalog/providers.json) (enforced by `ci_gate_zero_hardcoded_providers_outside_data_catalog`).
-3. **Byte-identical static prefix**: Never inject volatile timestamps, working directories, or dynamic tool lists into the static prefix. Always verify with `carnot audit-prefix`.
-4. **Fail-closed security**: OS sandbox denials, path confinement, `.git` write protection, SSRF validation, and HTTP auth/CSRF checks must fail closed.
+## Checks
 
-## Local Verification
-
-Requires Rust **1.90+** (edition 2024):
+Requires Rust 1.90+ (edition 2024):
 
 ```bash
 cargo fmt --all -- --check
@@ -21,15 +19,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --lib
 cargo test --workspace --all-features
+python3 scripts/validate_catalog.py
 ```
 
-To verify the Python SDK against a local build:
+Python SDK test against a local build:
 
 ```bash
 cargo build --bin carnot
 CARNOT_BIN="$PWD/target/debug/carnot" python3 -m unittest discover -s sdk/python -v
 ```
 
-## Licensing
+## License
 
-By submitting a contribution, you agree that your contribution will be dual-licensed under **MIT OR Apache-2.0**, as specified in [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).
+Contributions are dual-licensed under MIT or Apache-2.0 ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE)).

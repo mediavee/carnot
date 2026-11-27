@@ -1,16 +1,21 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="Carnot">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#1C2029"/>
-      <stop offset="100%" stop-color="#0D1017"/>
+      <stop offset="0%" stop-color="#141822"/>
+      <stop offset="100%" stop-color="#0B0E14"/>
     </linearGradient>
-    <linearGradient id="ember" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#FFB156"/>
-      <stop offset="100%" stop-color="#EE4B1F"/>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="0.6">
+      <stop offset="0%" stop-color="#FF9A3E"/>
+      <stop offset="55%" stop-color="#FF4D1C"/>
+      <stop offset="100%" stop-color="#E11D48"/>
+    </linearGradient>
+    <linearGradient id="cold" x1="1" y1="1" x2="0" y2="0.4">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#818CF8"/>
     </linearGradient>
   </defs>
   <rect width="96" height="96" rx="22" fill="url(#bg)"/>
   <rect x="0.75" y="0.75" width="94.5" height="94.5" rx="21.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="1.5"/>
-  <path d="M68 31.5 L48 20 L24 34 L24 62 L48 76 L68 64.5" fill="none" stroke="#F4F6FA" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <polygon points="56,37 68,48 56,59 44,48" fill="url(#ember)"/>
+  <path d="M 28 21 C 45 20, 62 24, 75 34 L 64 67 C 61 54, 59 44, 62 35 C 51 30, 39 29, 25 30 Z" fill="url(#hot)"/>
+  <path d="M 68 75 C 51 76, 34 72, 21 62 L 32 29 C 35 42, 37 52, 34 61 C 45 66, 57 67, 71 66 Z" fill="url(#cold)"/>
 </svg>

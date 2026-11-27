@@ -5,66 +5,139 @@
 <h1 align="center">Carnot</h1>
 
 <p align="center">
-  A fast, safe Rust coding-agent harness — maximum work, minimum wasted tokens.
+  A small, fast Rust coding-agent harness built to be embedded.
 </p>
 
 <p align="center">
+  <a href="#footprint">Footprint</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#providers--configuration">Providers</a> ·
-  <a href="#benchmarks">Benchmarks</a> ·
-  <a href="#surfaces--extensions">Surfaces</a> ·
+  <a href="#interfaces--extensions">Interfaces</a> ·
+  <a href="#providers">Providers</a> ·
+  <a href="#platforms">Platforms</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="SECURITY.md">Security</a>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-2024%20(MSRV%201.90)-e54d2e?style=flat-square&logo=rust&logoColor=white" alt="Rust 2024" />
-  <img src="https://img.shields.io/badge/unsafe-forbid-10b981?style=flat-square" alt="unsafe forbid" />
+  <img src="https://img.shields.io/badge/carnot%20crates-forbid(unsafe__code)-10b981?style=flat-square" alt="forbid unsafe_code" />
   <img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-6366f1?style=flat-square" alt="MIT / Apache-2.0" />
 </p>
 
 <br />
 
-Carnot compiles to a single native binary (`#![forbid(unsafe_code)]`, all built-in extensions included) with a **7.4 ms** median startup to first HTTP request, **10.3 MiB** peak RSS, a **986-char (~247-token)** cross-directory invariant static system prompt (+ 5 compact core tool schemas), and fail-closed OS sandboxing.
+Carnot is a Rust coding-agent runtime and CLI designed to run inside IDEs (ACP), desktop or web apps (HTTP/SSE, Rust/Python/TS SDKs), CI jobs, and multi-agent fleets. It ships as a single 16.5 MB native binary with a 986-char static system prompt, prompt-cache invariance across directories, and fail-closed OS sandboxing.
+
+> All Carnot crates set `unsafe_code = "forbid"`. Optional C bindings exist in `tree-sitter` syntax parsers (`carnot-tools` default feature) and the opt-in QuickJS `ext-codemode` extension (excluded from default `carnot-cli` builds).
+
+## Footprint
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="assets/benchmarks-light.svg" />
+  <img alt="Carnot cold start, peak RSS, installed size, and static prefix comparison" src="assets/benchmarks-light.svg" width="100%" />
+</picture>
+
+<details>
+<summary>Exact numbers &amp; reproduction command (15 runs + 3 warmups, Darwin arm64, $0 local mock API)</summary>
+
+| Harness | Startup (med) | Peak RSS | Installed Size | Static Prefix | Cross-CWD Invariant |
+| :--- | ---: | ---: | ---: | ---: | :---: |
+| **Carnot (core, 5 tools)** | **14.8 ms** | **12.5 MiB** | **16.5 MB** | **960 tok** | **Yes** |
+| **Carnot (full, 13 tools)** | **23.3 ms** | **13.2 MiB** | **16.5 MB** | **2 627 tok** | **Yes** |
+| Codex CLI | 78.1 ms | 132.4 MiB | 284.4 MB | 9 730 tok | No |
+| Claude Code | 456.5 ms | 216.9 MiB | 347.0 MB | 19 210 tok | No |
+| OpenCode | 652.4 ms | 737.2 MiB | 215.3 MB | 9 644 tok | No |
+
+Reproduce locally:
+
+```bash
+cargo build --release --bin carnot
+python3 benchmarks/compare_harnesses.py > /tmp/carnot_footprint.json
+python3 benchmarks/render_footprint_svg.py /tmp/carnot_footprint.json assets
+```
+
+</details>
 
 ## Quick Start
 
+### CLI & headless automation
+
 ```bash
-# Build from source (TUI + all built-in extensions enabled by default)
 cargo build --release --bin carnot
 
-# Launch the interactive TUI (auto-detects your configured provider)
 export ANTHROPIC_API_KEY=...
-carnot
-
-# Run a one-shot task (supports piped stdin & multimodal --image)
-carnot -p "Fix the failing tests and summarize the root cause"
+carnot -p "Fix the failing tests and summarize the root cause" --goal-cmd "cargo test --workspace"
 git diff | carnot -p "Review this diff" --image ui.png
 
-# Resume the latest workspace session, or run as an IDE / RPC / HTTP server
+# Interactive TUI or resume latest session
+carnot
 carnot -c
+```
+
+### IDE backend (ACP) & local HTTP/SSE server
+
+```bash
+# Multi-session Agent Client Protocol over stdio
 carnot --mode acp
+
+# Authenticated localhost HTTP/1.1 + SSE server (powered by hyper)
 CARNOT_HTTP_TOKEN=secret carnot serve --addr 127.0.0.1:7744
 ```
 
-> Standalone `carnot` enables `web`, `lsp`, `subagent`, and `memory` out of the box with zero static prefix-cache cost. Override with CLI flags (`--no-web`, `--profile minimal`, `--cache-ttl short|hybrid|long`) or run `carnot doctor` to inspect your environment.
+### Embed from Rust or Python
 
-## Highlights
+```rust
+use carnot::CarnotBuilder;
 
-- **Instant startup & tiny footprint** — `7.4 ms` median to first HTTP request and `10.3 MiB` peak RSS.
-- **Provider-agnostic prompt-cache optimization** — byte-identical static prefix across workspaces (`carnot audit-prefix`), `CacheTtl` retention tiers (`short`, `hybrid`, `long` — with `5m`/`1h`/`24h` aliases), real `prefix_retention_rate` & runtime cache-break detection (`/cache`), smart subagent cache retention, and cache-warm semantic compaction.
-- **5 surgical core tools** — `Read` (multimodal + tree-sitter outlines), `Edit` (atomic + fuzzy patch + CAS undo), `Write`, `.gitignore`-aware `Grep`, and `Bash` with BLAKE3 output shaping.
-- **Fail-closed OS sandbox** — macOS Seatbelt and Linux `bwrap` with automatic Landlock (ABI v1–v6) fallback inside containers, plus in-process `.git` write protection.
-- **21 zero-hardcode providers (+ offline `faux`) & full MCP** — driven purely by [`providers.json`](crates/carnot-ai/catalog/providers.json) with declarative multi-protocol `model_routes` and OAuth 2.0 (`carnot auth login`), plus MCP `2026-07-28`, `2025-11-25`, and legacy SSE.
+let agent = CarnotBuilder::new("./my-repo")
+    .provider_name("anthropic")
+    .sandbox(true)
+    .build()
+    .await?;
 
-## Providers & Configuration
+let outcome = agent.prompt("Audit Cargo.toml for unused dependencies").await?;
+```
 
-All **21 built-in providers** (+ offline `faux` for CI) live strictly as data in [`providers.json`](crates/carnot-ai/catalog/providers.json) (overlayable via `~/.carnot/providers.json` or `--provider-config`):
+```python
+from carnot_sdk import CarnotClient
 
-- **Frontier & Multi-Protocol**: Anthropic (`claude-*`), OpenAI Completions & Stateless Responses (`gpt-5.4`, `o3`, `o4-mini`), Google Gemini & Cloud Code (`gemini-*`), **Grok / xAI** (`grok-4.7` Responses API with sticky `x-grok-conv-id` cache routing), **Muse / Meta** (`muse-wonder-1.0`, `muse-spark-1.3`, `muse-ember-1.0` on `api.meta.ai/v1`), **Mistral** (`mistral-large-4`, `magistral`, `devstral`, `codestral` with strict `alnum9` tool IDs & structured thinking), **OpenCode Zen** (`opencode`) & **OpenCode Go** (`opencode-go`) with automatic multi-protocol routing under `OPENCODE_API_KEY`.
-- **Inference & Local**: OpenRouter (PKCE OAuth + `cache_control`), DeepSeek, Kimi/Moonshot, Qwen/DashScope, Groq, Fireworks, Together, Cerebras, Ollama, LM Studio, vLLM, and offline `faux` for CI.
+async with CarnotClient(cwd="./my-repo") as client:
+    res = await client.prompt("Summarize recent git changes")
+```
 
-Persist personal defaults in `~/.carnot/config.toml` (override path with `CARNOT_CONFIG`):
+Run `carnot doctor` to inspect your environment and active sandbox backend, or `carnot audit-prefix` to verify prefix invariance.
+
+## Core Design
+
+- **Static prompt-cache prefix.** The 986-char system prompt and canonical tool schemas stay byte-identical across working directories, dates, and sessions (`carnot audit-prefix`). Dates are injected once in Turn 1 instead of the system prompt. Supports configurable cache TTLs (`short`, `hybrid`, `long`) and cache-warm compaction.
+- **5 core tools.** `Read` (multimodal + optional tree-sitter outlines), `Edit` (atomic fuzzy & `ReadTracker`-anchored line-range patching with undo), `Write` (unread/stale guard + `.git` protection), `.gitignore`-aware `Grep`, and sandboxed `Bash` (PTY mode + BLAKE3 output spilling with secret redaction).
+- **Fail-closed OS sandbox.** `Bash` runs under macOS Seatbelt or Linux `bwrap` (with Landlock ABI v1-v6 fallback inside containers). Outbound network is off by default, credentials are blocked, and `.git` stays read-only under Seatbelt and `bwrap`.
+- **Opt-in workspace trust.** Workspace-local `.mcp.json`, hooks, and drop-in extensions never execute unless explicitly enabled (`--trust-workspace-mcp`, `--trust-workspace-ext`, `--trust-workspace-hooks`).
+
+## Interfaces & Extensions
+
+| Interface | Entry point | Notes |
+| :--- | :--- | :--- |
+| **Rust SDK** | `carnot::CarnotBuilder` | Direct embedding with custom `Arc<dyn Module>` and `Arc<dyn Tool>` |
+| **ACP (IDE)** | `carnot --mode acp` | Multi-session multimodal Agent Client Protocol over stdio |
+| **RPC & Python SDK** | `carnot --mode rpc` ([`sdk/python`](sdk/python/carnot_sdk.py)) | Bidirectional JSON-RPC 2.0 + zero-dep async Python client |
+| **HTTP/SSE & TS SDK** | `carnot serve` ([`sdk/ts`](sdk/ts/src/index.ts)) | `hyper` HTTP/1.1 + SSE with Bearer auth, CSRF checks, and `Last-Event-ID` replay |
+| **Terminal TUI / REPL** | `carnot` / `carnot --plain` | Ratatui TUI with mid-turn steer, `/context`, `/cache`, `/goal`, `/fleet`, `/fork`, `/undo` |
+
+Built-in extensions (8 crates, all optional on the `carnot` library crate):
+- Included in default `carnot-cli` builds: `web`, `lsp`, `subagent`, `memory`, `goal`, `hooks`, `claude-plugins`.
+- Opt-in (`--features ext-codemode` or `--features all-ext`): `codemode` (QuickJS async sandbox via `rquickjs`).
+- Drop-in file extensions: place executable scripts in `~/.carnot/extensions/` or pass `--ext ./my_ext.py` (`carnot-ext/1` JSON-RPC).
+
+## Providers
+
+Wire protocols are compiled Rust adapters; concrete providers live as data in [`crates/carnot-ai/catalog/providers.json`](crates/carnot-ai/catalog/providers.json) (overlayable with `~/.carnot/providers.json` or `--provider-config`):
+
+- **Wire protocols:** `anthropic-messages`, `openai-responses` (stateless with encrypted reasoning), `openai-completions`, `google-generative`, `google-cloudcode`, `subprocess-jsonl`, and offline `faux`.
+- **21 built-in presets (+ `faux`):** Anthropic, OpenAI (`openai`, `openai-responses`), Gemini, Cloud Code (`antigravity`), Grok / xAI, Meta Muse, Mistral, OpenCode Zen & Go, OpenRouter, DeepSeek, Kimi, Qwen, Groq, Fireworks, Together, Cerebras, Ollama, LM Studio, and vLLM.
+
+User defaults live in `~/.carnot/config.toml` (override with `CARNOT_CONFIG`):
 
 ```toml
 provider = "anthropic"
@@ -80,63 +153,15 @@ subagent = true
 memory = true
 ```
 
-Useful CLI utilities: `carnot providers`, `carnot models --all`, `carnot models --resolve <spec>`, `carnot auth login|status|refresh|logout`, `carnot mcp list|inspect`, `carnot modules`, `carnot audit-prefix`, `carnot doctor`.
+CLI helpers: `carnot providers`, `carnot models --all`, `carnot auth login|status|refresh|logout`, `carnot mcp list|inspect`, `carnot modules`, `carnot audit-prefix`, `carnot doctor`.
 
-## Benchmarks
+## Platforms
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset="assets/benchmarks-light.svg" />
-  <img alt="Carnot cold-start latency and peak RSS memory benchmarks" src="assets/benchmarks-light.svg" width="100%" />
-</picture>
-
-<br />
-
-| Benchmark | Result | Source |
-| :--- | :--- | :--- |
-| **Cold start / RAM / Prefix** | `7.4 ms` · `10.3 MiB` RSS · `986 chars` static system prompt + 5 tools (`carnot audit-prefix`) | [`harness_overhead.json`](benchmarks/harness_overhead.json) |
-| **Terminal-Bench 4** (`Opus 5.5`, `max`) | `63.2%` (`24/38` valid tasks on a 41-task subset; `58.5%` incl. 3 refusals), `97.6%` cache hit, `100%` first-try `Edit`, `-18.5%` cost vs Claude Code | [`terminal_bench_4.json`](benchmarks/terminal_bench_4.json) |
-| **Cache-Warm Compaction A/B** | `14/14` recall (0 amnesia), `-66.7%` post-compaction cost, `22.5×` context compression | [`compaction_ab.json`](benchmarks/compaction_ab.json) |
-
-<details>
-<summary>Full harness comparison &amp; compaction breakdown</summary>
-
-#### Harness Overhead (15 runs + 3 warmups · Darwin arm64)
-
-| Harness | Startup (med) | Peak RSS | Binary | Static Prefix | Cross-CWD Inv. |
-| :--- | ---: | ---: | ---: | ---: | :---: |
-| **Carnot (Rust)** | **7.4 ms** | **10.3 MiB** | **15.7 MB** | **1 173 tok** | **Yes** |
-| Unharnessed (Rust) | 7.6 ms | 81.7 MiB | 26.8 MB | 1 035 tok | No |
-| Codex CLI | 41.4 ms | 133.7 MiB | 284.4 MB | 9 730 tok | No |
-| Claude Code | 249.9 ms | 216.0 MiB | 343.6 MB | 19 210 tok | No |
-| Pi (Node) | 462.5 ms | 159.4 MiB | 238.1 MB | 1 399 tok | No |
-| OpenCode (Bun) | 545.9 ms | 528.7 MiB | 215.3 MB | 9 644 tok | No |
-
-#### Two-Tier Cache-Warm Compaction A/B (`claude-sonnet-5-5`, 4-phase resumed session)
-
-| Metric | No Compaction | Carnot Compaction | Delta |
-| :--- | ---: | ---: | ---: |
-| Verification score | `14 / 14` | **`14 / 14`** | `0 amnesia` |
-| Total net cost | `$0.7475` | **`$0.5593`** | **`-25.2%`** |
-| Post-compaction cost (Phases 2–4) | `$0.2196` | **`$0.0732`** | **`-66.7%`** |
-| Context size | `74,112` peak | **`68,775 → 3,059`** | **`-95.6%`** |
-
-</details>
-
-## Surfaces & Extensions
-
-| Surface | How to use | Notes |
-| :--- | :--- | :--- |
-| **Terminal TUI / REPL** | `carnot` (or `carnot --plain`) | Streaming Markdown, live mid-turn steer (`Enter`) & follow-up (`Alt+Enter`), `^P` model picker, `/context`, `/cache`, `/fleet`, `/fork`, `/undo`, interactive approvals & `AskUser` |
-| **IDE (ACP stdio)** | `carnot --mode acp` | Multi-session multimodal Agent Client Protocol with live model, effort & `cache_ttl` config options |
-| **Host RPC & Python SDK** | `carnot --mode rpc` ([`sdk/python`](sdk/python/carnot_sdk.py)) | Bidirectional JSON-RPC (`--host-extension` for dynamic tools/gates/hooks) + zero-dep async Python client |
-| **HTTP / SSE & TS SDK** | `carnot serve` ([`sdk/ts`](sdk/ts/src/index.ts)) | Bearer-authenticated REST + SSE with `Last-Event-ID` replay, `/v1/metrics` breakdown & `/v1/cache-ttl` |
-| **Rust SDK** | `carnot::CarnotBuilder` | Embed directly in Rust apps with custom `Arc<dyn Module>` and `Arc<dyn Tool>` |
-
-**Extensions** come in two zero-prefix-bloat tiers:
-
-- **Built-in Rust extensions** (enabled by default in `carnot-cli`, opt-in via `--features all-ext` on library crate `carnot`): `web` (native + local search/fetch), `lsp` (warm diagnostics + `LspQuery`), `subagent` (isolated worktree delegation), `memory` (BM25 cross-session memory), `hooks` (Claude Code compatible), and `claude-plugins`.
-- **Drop-in file extensions**: place any executable script or binary in `~/.carnot/extensions/` or pass `--ext ./my_ext.py` (speaks `carnot-ext/1` JSON-RPC; Python helper in [`sdk/python/carnot_sdk.py`](sdk/python/carnot_sdk.py)).
+| Platform | CI Status | OS Sandbox (`Bash`) | Notes |
+| :--- | :--- | :--- | :--- |
+| **macOS** | Full test suite | Seatbelt (`sandbox-exec`) | Fail-closed, offline by default, `.git` read-only |
+| **Linux** | Full test suite | `bwrap`, fallback to Landlock (ABI v1-v6) | See [`SECURITY.md`](SECURITY.md) for Landlock container caveats |
+| **Windows** | Compile check only | None (`--no-sandbox` required) | In-process path confinement & `.git` write guard remain active |
 
 ## Architecture
 
@@ -147,41 +172,39 @@ Useful CLI utilities: `carnot providers`, `carnot models --all`, `carnot models 
 </picture>
 
 <details>
-<summary>Workspace crate map (13 workspace crates + 6 extensions)</summary>
+<summary>Workspace crates (13 core crates + 8 extensions)</summary>
 
 | Crate | Role |
 | :--- | :--- |
-| `carnot-cli` | Thin CLI binary, plain REPL, `doctor`, `audit-prefix`, `models`, `providers`, `auth`, `mcp`, `modules` (optional `tui` feature) |
-| `carnot-tui` | Optional interactive full-screen Ratatui TUI (`state`, `commands`, `input`, `render`, `markdown`, `editor`, `theme`) |
-| `carnot` | Ergonomic Rust SDK facade (`CarnotBuilder`) |
-| `carnot-protocol` | ACP stdio, Host RPC stdio, HTTP/SSE server, interaction brokers |
-| `carnot-agent` | Async turn loop, effect-parallel scheduler, lossless `EventLog`, compaction |
-| `carnot-ext` | Core modules (`ExecMicroSkills`, `PrefixGuard`, `PolicyGuard`, `AskUser`) & drop-in host |
-| `carnot-mcp` | MCP `2026-07-28` / `2025-11-25` / legacy SSE client with lazy schema caching |
-| `carnot-tools` | `Read`, `Edit`, `Write`, `Grep`, `Bash`, optional tree-sitter outlines & `ReadTracker` |
-| `carnot-ai` | Data-driven `ProviderRegistry`, wire adapters, `model_routes`, OAuth, retry & `webpki` TLS |
-| `carnot-session` | Crash-safe branching JSONL v2 journal & canonical prefix hashing |
-| `carnot-sandbox` | Fail-closed macOS Seatbelt, Linux `bwrap`, and safe Linux Landlock fallback |
-| `carnot-cas` | Zero-I/O BLAKE3 content store with pre-spill secret redaction & semantic compressors |
-| `carnot-core` | Leaf types (`Message`, `ToolEffects`, `Usage`, `SessionMetrics`, `ContextBreakdown`, `CarnotConfig`) |
+| `carnot-cli` | CLI binary, plain REPL, subcommands (`doctor`, `audit-prefix`, `models`, `providers`, `auth`, `mcp`, `modules`) |
+| `carnot-tui` | Optional Ratatui TUI |
+| `carnot` | Rust SDK facade (`CarnotBuilder`) |
+| `carnot-protocol` | ACP stdio, JSON-RPC stdio, `hyper` HTTP/SSE server, interaction brokers |
+| `carnot-agent` | Async turn loop, parallel tool scheduler, event log, compaction |
+| `carnot-ext` | Core modules (`ExecMicroSkills`, `PrefixGuard`, `PolicyGuard`, `AskUser`) and drop-in host |
+| `carnot-mcp` | MCP client (`2026-07-28`, `2025-11-25`, legacy SSE) with SSRF checks |
+| `carnot-tools` | `Read`, `Edit`, `Write`, `Grep`, `Bash`, optional tree-sitter outlines, `ReadTracker` |
+| `carnot-ai` | `ProviderRegistry`, wire adapters, `model_routes`, OAuth, retries |
+| `carnot-session` | Branching JSONL v2 session store and prefix hashing |
+| `carnot-sandbox` | macOS Seatbelt, Linux `bwrap`, and Linux Landlock fallback |
+| `carnot-cas` | BLAKE3 spill store with secret redaction and output compressors |
+| `carnot-core` | Leaf domain types (`Message`, `ToolEffects`, `Usage`, `SessionMetrics`, `CarnotConfig`) |
+| `extensions/carnot-ext-*` | `web`, `lsp`, `subagent`, `memory`, `goal`, `hooks`, `claude-plugins`, `codemode` |
 
 </details>
 
-## Security
+## Development
 
-See [`SECURITY.md`](SECURITY.md) for the full threat model: fail-closed OS sandboxing, filesystem confinement, `.git` write protection, pre-spill secret redaction, SSRF protection, and workspace trust boundaries.
-
-## Development & Contributing
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). All PRs must pass:
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`benchmarks/README.md`](benchmarks/README.md).
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --lib
 cargo test --workspace --all-features
+python3 scripts/validate_catalog.py
 ```
 
 ## License
 
-Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
+Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
