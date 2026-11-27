@@ -17,23 +17,23 @@
     <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (core)</text>
     <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
     <rect x="112" y="51" width="4.5" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">14.8 ms</text>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">9.0 ms</text>
     <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (full)</text>
     <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="81" width="6.4" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">23.3 ms</text>
+    <rect x="112" y="81" width="4.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">9.7 ms</text>
     <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#94A3B8">Codex CLI</text>
     <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="111" width="21.3" height="12" rx="4" fill="#334155"/>
-    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">78.1 ms</text>
+    <rect x="112" y="111" width="14.5" height="12" rx="4" fill="#334155"/>
+    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">37.8 ms</text>
     <text x="16" y="151" class="font" font-size="12" font-weight="500" fill="#94A3B8">Claude Code</text>
     <rect x="112" y="141" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="141" width="124.6" height="12" rx="4" fill="#334155"/>
-    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">456 ms</text>
+    <rect x="112" y="141" width="65.1" height="12" rx="4" fill="#334155"/>
+    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">170 ms</text>
     <text x="16" y="181" class="font" font-size="12" font-weight="500" fill="#94A3B8">OpenCode</text>
     <rect x="112" y="171" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
     <rect x="112" y="171" width="178.0" height="12" rx="4" fill="#334155"/>
-    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">652 ms</text>
+    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">465 ms</text>
   </g>
   <g transform="translate(422,14)">
     <rect width="392" height="212" rx="12" fill="#131722" stroke="rgba(255,255,255,0.09)" stroke-width="1"/>
@@ -42,23 +42,23 @@
     <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (core)</text>
     <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
     <rect x="112" y="51" width="4.5" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">12.5 MiB</text>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">11.0 MiB</text>
     <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (full)</text>
     <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
     <rect x="112" y="81" width="4.5" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">13.2 MiB</text>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">11.4 MiB</text>
     <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#94A3B8">Codex CLI</text>
     <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="111" width="32.0" height="12" rx="4" fill="#334155"/>
-    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">132 MiB</text>
+    <rect x="112" y="111" width="47.9" height="12" rx="4" fill="#334155"/>
+    <text x="376" y="121" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">140 MiB</text>
     <text x="16" y="151" class="font" font-size="12" font-weight="500" fill="#94A3B8">Claude Code</text>
     <rect x="112" y="141" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="141" width="52.4" height="12" rx="4" fill="#334155"/>
-    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">217 MiB</text>
+    <rect x="112" y="141" width="72.5" height="12" rx="4" fill="#334155"/>
+    <text x="376" y="151" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">211 MiB</text>
     <text x="16" y="181" class="font" font-size="12" font-weight="500" fill="#94A3B8">OpenCode</text>
     <rect x="112" y="171" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
     <rect x="112" y="171" width="178.0" height="12" rx="4" fill="#334155"/>
-    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">737 MiB</text>
+    <text x="376" y="181" text-anchor="end" class="mono" font-size="11.5" font-weight="500" fill="#CBD5E1">519 MiB</text>
   </g>
   <g transform="translate(14,242)">
     <rect width="392" height="212" rx="12" fill="#131722" stroke="rgba(255,255,255,0.09)" stroke-width="1"/>
@@ -66,12 +66,12 @@
     <text x="376" y="27" text-anchor="end" class="mono" font-size="10.5" fill="#8B95A7">lower is better</text>
     <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (core)</text>
     <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="51" width="8.5" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">16.5 MB</text>
+    <rect x="112" y="51" width="5.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">10.7 MB</text>
     <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (full)</text>
     <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="81" width="8.5" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">16.5 MB</text>
+    <rect x="112" y="81" width="5.5" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">10.7 MB</text>
     <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#94A3B8">OpenCode</text>
     <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
     <rect x="112" y="111" width="110.4" height="12" rx="4" fill="#334155"/>
@@ -91,12 +91,12 @@
     <text x="376" y="27" text-anchor="end" class="mono" font-size="10.5" fill="#8B95A7">lower is better</text>
     <text x="16" y="61" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (core)</text>
     <rect x="112" y="51" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="51" width="8.9" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">960 tok</text>
+    <rect x="112" y="51" width="7.7" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="61" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">836 tok</text>
     <text x="16" y="91" class="font" font-size="12" font-weight="700" fill="#FFFFFF">Carnot (full)</text>
     <rect x="112" y="81" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
-    <rect x="112" y="81" width="24.3" height="12" rx="4" fill="url(#carnotGrad)"/>
-    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">2 627 tok</text>
+    <rect x="112" y="81" width="17.3" height="12" rx="4" fill="url(#carnotGrad)"/>
+    <text x="376" y="91" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#FF8C42">1 866 tok</text>
     <text x="16" y="121" class="font" font-size="12" font-weight="500" fill="#94A3B8">OpenCode</text>
     <rect x="112" y="111" width="178" height="12" rx="4" fill="rgba(255,255,255,0.06)"/>
     <rect x="112" y="111" width="89.4" height="12" rx="4" fill="#334155"/>

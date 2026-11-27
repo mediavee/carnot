@@ -6,7 +6,7 @@ Initial release.
 
 ### Core runtime
 - Async turn loop with effect-based parallel tool scheduling, live tool progress events, and a branching JSONL session log (`carnot-agent`, `carnot-session`).
-- Static 986-char system prompt and 5 core tool schemas (`Read`, `Edit`, `Write`, `Grep`, `Bash`) kept byte-identical across directories, dates, and sessions (`carnot audit-prefix`).
+- Static 757-char system prompt and 5 core tool schemas (`Read`, `Edit`, `Write`, `Grep`, `Bash`) kept byte-identical across directories, dates, and sessions (`carnot audit-prefix`).
 - Configurable prompt-cache TTL (`short`, `hybrid`, `long`) and two-tier compaction that reuses the warm prefix.
 - Content-addressed BLAKE3 spill store (`carnot-cas`) with secret redaction before writing to disk and deterministic output compressors for common test/build tools.
 

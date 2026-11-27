@@ -26,7 +26,7 @@
 
 <br />
 
-Carnot is a Rust coding-agent runtime and CLI designed to run inside IDEs (ACP), desktop or web apps (HTTP/SSE, Rust/Python/TS SDKs), CI jobs, and multi-agent fleets. It ships as a single 16.5 MB native binary with a 986-char static system prompt, prompt-cache invariance across directories, and fail-closed OS sandboxing.
+Carnot is a Rust coding-agent runtime and CLI designed to run inside IDEs (ACP), desktop or web apps (HTTP/SSE, Rust/Python/TS SDKs), CI jobs, and multi-agent fleets. It ships as a single 10.7 MB native binary with a 757-char static system prompt, prompt-cache invariance across directories, and fail-closed OS sandboxing.
 
 > All Carnot crates set `unsafe_code = "forbid"`. Optional C bindings exist in `tree-sitter` syntax parsers (`carnot-tools` default feature) and the opt-in QuickJS `ext-codemode` extension (excluded from default `carnot-cli` builds).
 
@@ -43,11 +43,11 @@ Carnot is a Rust coding-agent runtime and CLI designed to run inside IDEs (ACP),
 
 | Harness | Startup (med) | Peak RSS | Installed Size | Static Prefix | Cross-CWD Invariant |
 | :--- | ---: | ---: | ---: | ---: | :---: |
-| **Carnot (core, 5 tools)** | **14.8 ms** | **12.5 MiB** | **16.5 MB** | **960 tok** | **Yes** |
-| **Carnot (full, 13 tools)** | **23.3 ms** | **13.2 MiB** | **16.5 MB** | **2 627 tok** | **Yes** |
-| Codex CLI | 78.1 ms | 132.4 MiB | 284.4 MB | 9 730 tok | No |
-| Claude Code | 456.5 ms | 216.9 MiB | 347.0 MB | 19 210 tok | No |
-| OpenCode | 652.4 ms | 737.2 MiB | 215.3 MB | 9 644 tok | No |
+| **Carnot (core, 5 tools)** | **9.0 ms** | **11.0 MiB** | **10.7 MB** | **836 tok** | **Yes** |
+| **Carnot (full, 13 tools)** | **9.7 ms** | **11.4 MiB** | **10.7 MB** | **1 866 tok** | **Yes** |
+| Codex CLI | 37.8 ms | 139.5 MiB | 284.4 MB | 9 730 tok | No |
+| Claude Code | 170.2 ms | 211.1 MiB | 347.0 MB | 19 210 tok | No |
+| OpenCode | 465.2 ms | 518.6 MiB | 215.3 MB | 9 644 tok | No |
 
 Reproduce locally:
 
@@ -110,7 +110,7 @@ Run `carnot doctor` to inspect your environment and active sandbox backend, or `
 
 ## Core Design
 
-- **Static prompt-cache prefix.** The 986-char system prompt and canonical tool schemas stay byte-identical across working directories, dates, and sessions (`carnot audit-prefix`). Dates are injected once in Turn 1 instead of the system prompt. Supports configurable cache TTLs (`short`, `hybrid`, `long`) and cache-warm compaction.
+- **Static prompt-cache prefix.** The 757-char system prompt and canonical tool schemas stay byte-identical across working directories, dates, and sessions (`carnot audit-prefix`). Dates are injected once in Turn 1 instead of the system prompt. Supports configurable cache TTLs (`short`, `hybrid`, `long`) and cache-warm compaction.
 - **5 core tools.** `Read` (multimodal + optional tree-sitter outlines), `Edit` (atomic fuzzy & `ReadTracker`-anchored line-range patching with undo), `Write` (unread/stale guard + `.git` protection), `.gitignore`-aware `Grep`, and sandboxed `Bash` (PTY mode + BLAKE3 output spilling with secret redaction).
 - **Fail-closed OS sandbox.** `Bash` runs under macOS Seatbelt or Linux `bwrap` (with Landlock ABI v1-v6 fallback inside containers). Outbound network is off by default, credentials are blocked, and `.git` stays read-only under Seatbelt and `bwrap`.
 - **Opt-in workspace trust.** Workspace-local `.mcp.json`, hooks, and drop-in extensions never execute unless explicitly enabled (`--trust-workspace-mcp`, `--trust-workspace-ext`, `--trust-workspace-hooks`).
