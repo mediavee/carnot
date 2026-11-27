@@ -164,6 +164,7 @@ async fn serve_conn(
         .max_buf_size(MAX_HEADER_BUF_BYTES)
         .timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(REQUEST_READ_TIMEOUT_SECS))
+        .half_close(true)
         .keep_alive(true);
     let _ = builder.serve_connection(io, service).await;
 }

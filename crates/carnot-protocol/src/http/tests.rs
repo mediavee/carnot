@@ -367,18 +367,33 @@ async fn http_server_handles_fragmented_tcp_writes_csrf_origins_oversized_header
         .write_all(sse_req.as_bytes())
         .await
         .expect("write sse");
-    let mut sse_buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(Duration::from_secs(2), sse_s.read(&mut sse_buf))
-        .await
-        .expect("sse read timeout")
-        .expect("sse read");
-    let sse_head = String::from_utf8_lossy(&sse_buf[..n]);
+    let expected_id = format!("id: {last_seq}\n");
+    let mut sse_buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(deadline - now, sse_s.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                sse_buf.extend_from_slice(&chunk[..n]);
+                if String::from_utf8_lossy(&sse_buf).contains(&expected_id) {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("sse read error: {e}"),
+        }
+    }
+    let sse_head = String::from_utf8_lossy(&sse_buf);
     assert!(
         sse_head.starts_with("HTTP/1.1 200"),
         "GET /v1/events must return 200, got: {sse_head}"
     );
     assert!(
-        sse_head.contains(&format!("id: {last_seq}\n")),
+        sse_head.contains(&expected_id),
         "SSE replay must include event {last_seq}, got: {sse_head}"
     );
     assert!(
