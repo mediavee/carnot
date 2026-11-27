@@ -224,7 +224,76 @@ async fn sparse_date_note_emitted_once_preserved_across_compaction_and_absent_fr
     ];
     assert_eq!(
         last_date_tag_in_messages(&spoofed_msgs).as_deref(),
-        Some("2020-01-01")
+        Some("2020-01-01"),
+        "assistant date tag must be ignored"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn empty_refusal_halts_cleanly_without_persisting_empty_assistant_message() {
+    use carnot_ai::Provider;
+    use carnot_ai::faux::{FauxProvider, ScriptedTurn};
+    use carnot_cas::CasStore;
+    use carnot_core::{CarnotConfig, Role, StopReason};
+    use carnot_tools::ToolRegistry;
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("carnot-refusal-test-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&dir);
+    let mut cfg = CarnotConfig::new(dir.clone());
+    cfg.modules.sandbox = false;
+    let cas = Arc::new(CasStore::open(&dir).expect("cas"));
+    let tools = ToolRegistry::with_canonical_lid_tools(&cfg, cas);
+    let faux = Arc::new(FauxProvider::new(vec![
+        ScriptedTurn {
+            blocks: Vec::new(),
+            stop_reason: StopReason::Refusal,
+            output_tokens: 0,
+        },
+        ScriptedTurn::text("recovered after retry"),
+    ]));
+    let agent = Agent::new(
+        cfg,
+        Arc::clone(&faux) as Arc<dyn Provider>,
+        tools,
+        Vec::new(),
+        false,
+    )
+    .expect("agent");
+
+    let outcome = agent.prompt("sensitive prompt").await.expect("run result");
+    assert_eq!(
+        outcome.halted_reason.as_deref(),
+        Some("stopped: Refusal"),
+        "refusal must halt with explicit halted_reason"
+    );
+    assert!(
+        outcome.final_text.is_empty(),
+        "empty refusal must not synthesize final_text"
+    );
+    let msgs = agent.active_messages().await;
+    assert_eq!(
+        msgs.len(),
+        1,
+        "empty refusal must not persist an empty assistant message into SessionStore"
+    );
+    assert_eq!(
+        msgs[0].role,
+        Role::User,
+        "only the user prompt should remain in active messages"
+    );
+
+    // Follow-up prompt or continue_run must still work cleanly after an empty refusal.
+    let continued = agent
+        .continue_run()
+        .await
+        .expect("continue_run")
+        .expect("resumable after empty refusal");
+    assert_eq!(
+        continued.final_text, "recovered after retry",
+        "continue_run should cleanly re-run from the unanswered user prompt"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

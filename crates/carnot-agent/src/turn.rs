@@ -693,7 +693,12 @@ impl Agent {
             {
                 let mut s = self.session.lock().await;
                 s.record_usage(turn_num, usage.clone())?;
-                s.push_message(assistant_msg.clone())?;
+                // Avoid persisting an empty `content: []` assistant message when a provider
+                // triggers an immediate 0-token refusal classifier; usage and TurnEnd are still
+                // recorded so the session remains cleanly resumable.
+                if !(stop_reason == StopReason::Refusal && assistant_msg.content.is_empty()) {
+                    s.push_message(assistant_msg.clone())?;
+                }
             }
             self.events.push(AgentEvent::UsageRecorded {
                 turn: turn_num,
